@@ -22,6 +22,7 @@ if str(project_root) not in sys.path:
 # Import koder_agent file tools
 try:
     from koder_agent.tools.file import (
+        _file_state,
         _generate_diff_output,
         append_file,
         apply_diff,
@@ -33,6 +34,14 @@ try:
     )
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError(f"Failed to import koder_agent modules: {e}") from e
+
+
+@pytest.fixture(autouse=True)
+def _reset_file_state():
+    """Clear the global file state tracker between tests."""
+    _file_state.clear()
+    yield
+    _file_state.clear()
 
 
 @pytest.fixture
@@ -206,6 +215,8 @@ async def test_write_file_creates_new_file(temp_dir):
 @pytest.mark.asyncio
 async def test_write_file_overwrites_existing(sample_file):
     """write_file overwrites existing file content."""
+    # Must read before writing to an existing file
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
     new_content = "Completely new content"
 
     result = await write_file.on_invoke_tool(
@@ -275,6 +286,7 @@ async def test_append_file_creates_new_file(temp_dir):
 @pytest.mark.asyncio
 async def test_edit_file_simple_diff(sample_file):
     """edit_file successfully applies a simple unified diff."""
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
     diff = """--- a/sample.txt
 +++ b/sample.txt
 @@ -2,3 +2,3 @@
@@ -311,6 +323,7 @@ async def test_edit_file_diff_not_match(temp_dir):
     """edit_file returns error when diff doesn't match file content."""
     file_path = temp_dir / "test.txt"
     file_path.write_text("actual content\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,1 +1,1 @@
 -wrong content
@@ -329,6 +342,7 @@ async def test_edit_file_diff_not_match(temp_dir):
 @pytest.mark.asyncio
 async def test_edit_file_preserves_other_content(sample_file):
     """edit_file only changes the lines specified in the diff."""
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
     diff = """@@ -2,3 +2,3 @@
  line2
 -line3
@@ -355,6 +369,7 @@ async def test_edit_file_multiline_diff(temp_dir):
     """edit_file handles multiline changes in diff."""
     file_path = temp_dir / "multiline.txt"
     file_path.write_text("start\nmiddle\nend\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,4 @@
 -start
@@ -378,6 +393,7 @@ async def test_edit_file_multiline_diff(temp_dir):
 @pytest.mark.asyncio
 async def test_edit_file_delete_lines(sample_file):
     """edit_file can delete lines using diff."""
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
     diff = """@@ -2,3 +2,2 @@
  line2
 -line3
@@ -400,6 +416,7 @@ async def test_edit_file_add_lines(temp_dir):
     """edit_file can add new lines using diff."""
     file_path = temp_dir / "add.txt"
     file_path.write_text("line1\nline2\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,4 @@
  line1
@@ -423,6 +440,7 @@ async def test_edit_file_multiple_hunks(temp_dir):
     """edit_file can apply multiple hunks in one diff."""
     file_path = temp_dir / "multi.txt"
     file_path.write_text("a\nb\nc\nd\ne\nf\ng\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,2 @@
 -a
@@ -790,6 +808,7 @@ async def test_write_file_diff_shows_changes_for_existing_file(temp_dir):
     """write_file shows deletions and additions for existing file."""
     file_path = temp_dir / "existing.txt"
     file_path.write_text("old content\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     result = await write_file.on_invoke_tool(
         None, json.dumps({"path": str(file_path), "content": "new content\n"})
@@ -805,6 +824,7 @@ async def test_write_file_multiline_diff(temp_dir):
     """write_file generates correct diff for multiline changes."""
     file_path = temp_dir / "multi.txt"
     file_path.write_text("a\nb\nc\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     result = await write_file.on_invoke_tool(
         None, json.dumps({"path": str(file_path), "content": "x\ny\nz\n"})
@@ -871,6 +891,7 @@ async def test_append_file_multiline_append(temp_dir):
 @pytest.mark.asyncio
 async def test_edit_file_returns_diff_in_output(sample_file):
     """edit_file returns the applied diff in its output."""
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
     diff = """@@ -2,3 +2,3 @@
  line2
 -line3
@@ -892,6 +913,7 @@ async def test_edit_file_git_style_diff_header(temp_dir):
     """edit_file works with full git-style diff header."""
     file_path = temp_dir / "git_style.txt"
     file_path.write_text("hello\nworld\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """diff --git a/git_style.txt b/git_style.txt
 --- a/git_style.txt
@@ -916,6 +938,7 @@ async def test_edit_file_only_additions(temp_dir):
     """edit_file works with diff that only adds lines."""
     file_path = temp_dir / "add_only.txt"
     file_path.write_text("start\nend\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,4 @@
  start
@@ -939,6 +962,7 @@ async def test_edit_file_only_deletions(temp_dir):
     """edit_file works with diff that only deletes lines."""
     file_path = temp_dir / "del_only.txt"
     file_path.write_text("keep\ndelete_me\nalso_delete\nkeep_too\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,4 +1,2 @@
  keep
@@ -964,6 +988,7 @@ async def test_edit_file_empty_diff_fails(temp_dir):
     """edit_file fails gracefully with empty diff."""
     file_path = temp_dir / "empty_diff.txt"
     file_path.write_text("content\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     result = await edit_file.on_invoke_tool(
         None,
@@ -978,6 +1003,7 @@ async def test_edit_file_whitespace_preservation(temp_dir):
     """edit_file preserves whitespace correctly."""
     file_path = temp_dir / "whitespace.txt"
     file_path.write_text("    indented\n\ttabbed\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,2 @@
      indented
@@ -1033,6 +1059,7 @@ async def test_edit_file_unicode_diff(temp_dir):
     """edit_file handles unicode in diff correctly."""
     file_path = temp_dir / "unicode_edit.txt"
     file_path.write_text("Hello\n世界\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,2 +1,2 @@
  Hello
@@ -1054,6 +1081,7 @@ async def test_edit_file_special_characters(temp_dir):
     """edit_file handles special regex characters in content."""
     file_path = temp_dir / "special.txt"
     file_path.write_text("test $var\n[array]\n{object}\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     diff = """@@ -1,3 +1,3 @@
  test $var

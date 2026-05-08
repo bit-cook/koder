@@ -42,7 +42,7 @@ if str(project_root) not in sys.path:
 
 from koder_agent.agentic.agent import _get_skills_metadata  # noqa: E402
 from koder_agent.config.models import KoderConfig, SkillsConfig  # noqa: E402
-from koder_agent.tools.skill import SkillLoader  # noqa: E402
+from koder_agent.tools.skill import SkillLoader, build_skills_metadata_prompt  # noqa: E402
 
 ENCODING = tiktoken.get_encoding("cl100k_base")
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "skills"
@@ -239,3 +239,50 @@ class TestRealWorldScenarios:
         assert session_tokens <= eager_tokens
         savings = 1.0 - (session_tokens / eager_tokens)
         assert savings > 0.20, f"Expected noticeable savings, got {savings:.2%}"
+
+
+class TestMetadataBudgeting:
+    def test_skill_descriptions_are_capped_per_entry(self):
+        skills = {
+            "demo": type(
+                "SkillStub",
+                (),
+                {
+                    "name": "demo",
+                    "description": "x" * 500,
+                    "disable_model_invocation": False,
+                    "paths": None,
+                },
+            )()
+        }
+        prompt = build_skills_metadata_prompt(skills)
+        line = next(entry for entry in prompt.splitlines() if entry.startswith("- demo:"))
+        assert len(line) <= len("- demo: ") + 250
+
+    def test_skill_metadata_budget_respects_environment_override(self, monkeypatch):
+        skills = {
+            "alpha": type(
+                "SkillStub",
+                (),
+                {
+                    "name": "alpha",
+                    "description": "a" * 200,
+                    "disable_model_invocation": False,
+                    "paths": None,
+                },
+            )(),
+            "beta": type(
+                "SkillStub",
+                (),
+                {
+                    "name": "beta",
+                    "description": "b" * 200,
+                    "disable_model_invocation": False,
+                    "paths": None,
+                },
+            )(),
+        }
+        monkeypatch.setenv("SLASH_COMMAND_TOOL_CHAR_BUDGET", "40")
+        prompt = build_skills_metadata_prompt(skills)
+        assert "alpha" in prompt
+        assert "beta" not in prompt

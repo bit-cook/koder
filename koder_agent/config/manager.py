@@ -9,10 +9,42 @@ import yaml
 from .models import KoderConfig
 
 
+def _migrate_legacy_voice_fields(data: dict) -> dict:
+    """Promote legacy harness.voice_* fields into top-level voice config."""
+    if not isinstance(data, dict):
+        return data
+
+    harness = data.get("harness")
+    voice = data.get("voice")
+    if not isinstance(harness, dict):
+        return data
+
+    enabled = harness.pop("voice_enabled", None)
+    provider = harness.pop("voice_provider", None)
+    if enabled is None and provider is None:
+        return data
+
+    if not isinstance(voice, dict):
+        voice = {}
+    if enabled is not None and "enabled" not in voice:
+        voice["enabled"] = enabled
+    if provider is not None and "provider" not in voice:
+        voice["provider"] = provider
+    data["voice"] = voice
+    return data
+
+
 class ConfigManager:
     """Manages loading and saving of YAML configuration."""
 
-    DEFAULT_CONFIG_PATH = Path.home() / ".koder" / "config.yaml"
+    DEFAULT_CONFIG_PATH: Optional[Path] = None
+
+    @classmethod
+    def default_config_path(cls) -> Path:
+        override = cls.DEFAULT_CONFIG_PATH
+        if override is not None:
+            return Path(override)
+        return Path.home() / ".koder" / "config.yaml"
 
     def __init__(self, config_path: Optional[Path] = None):
         """Initialize the configuration manager.
@@ -21,7 +53,7 @@ class ConfigManager:
             config_path: Optional custom path to the config file.
                         Defaults to ~/.koder/config.yaml
         """
-        self.config_path = config_path or self.DEFAULT_CONFIG_PATH
+        self.config_path = config_path or self.default_config_path()
         self._config: Optional[KoderConfig] = None
 
     def load(self) -> KoderConfig:
@@ -36,9 +68,14 @@ class ConfigManager:
         if self.config_path.exists():
             with open(self.config_path, "r") as f:
                 data = yaml.safe_load(f) or {}
-            self._config = KoderConfig(**data)
+            data = _migrate_legacy_voice_fields(data)
+            from koder_agent.harness.config.schema import RuntimeConfig
+
+            self._config = RuntimeConfig(**data)
         else:
-            self._config = KoderConfig()
+            from koder_agent.harness.config.schema import RuntimeConfig
+
+            self._config = RuntimeConfig()
 
         return self._config
 
@@ -48,7 +85,12 @@ class ConfigManager:
         Args:
             config: Optional config to save. Uses cached config if not provided.
         """
-        config = config or self._config or KoderConfig()
+        if config is None and self._config is None:
+            from koder_agent.harness.config.schema import RuntimeConfig
+
+            config = RuntimeConfig()
+        else:
+            config = config or self._config
 
         # Ensure directory exists
         self.config_path.parent.mkdir(parents=True, exist_ok=True)

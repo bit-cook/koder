@@ -1,5 +1,6 @@
 """Tests for streaming display functionality, particularly diff extraction and formatting."""
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -379,3 +380,139 @@ def test_full_display_flow_write_file(display_manager):
     content = display_manager.get_display_content()
 
     assert content is not None
+
+
+def test_reasoning_summary_renders_but_is_excluded_from_final_text(display_manager):
+    """Reasoning sections should be visible without becoming assistant text."""
+
+    display_manager.handle_reasoning_delta(
+        "rs_1",
+        0,
+        "Inspecting the request.",
+        kind="summary",
+        part_index=0,
+    )
+    display_manager.handle_text_delta(1, "Done.")
+
+    final_display = display_manager.get_final_display()
+
+    assert "reasoning summary" in final_display
+    assert "Inspecting the request." in final_display
+    assert display_manager.get_final_text() == "Done."
+
+
+def test_reasoning_done_replaces_partial_delta(display_manager):
+    """Done events provide the final reasoning text without duplicating deltas."""
+
+    display_manager.handle_reasoning_delta(
+        "rs_1",
+        0,
+        "Inspect",
+        kind="summary",
+        part_index=0,
+    )
+    display_manager.handle_reasoning_done(
+        "rs_1",
+        0,
+        "Inspecting the request.",
+        kind="summary",
+        part_index=0,
+    )
+
+    final_display = display_manager.get_final_display()
+
+    assert "Inspecting the request." in final_display
+    assert "InspectInspecting" not in final_display
+
+
+def test_reasoning_item_full_mode_renders_summary_and_text(display_manager):
+    """Final reasoning items can backfill summary and raw text sections."""
+
+    class Summary:
+        text = "Summary text."
+
+    class Content:
+        text = "Raw reasoning text."
+
+    class RawItem:
+        id = "rs_1"
+        summary = [Summary()]
+        content = [Content()]
+        encrypted_content = "encrypted"
+
+    assert display_manager.handle_reasoning_item(RawItem(), mode="full") is True
+
+    final_display = display_manager.get_final_display()
+
+    assert "Summary text." in final_display
+    assert "Raw reasoning text." in final_display
+    assert "encrypted" not in final_display
+
+
+def test_todo_write_renders_plan_update_style(display_manager):
+    """todo_write should render as a compact plan instead of a generic tool call."""
+    todos = [
+        {
+            "content": "校对 review 每条是否成立并定位最小修正点",
+            "status": "completed",
+            "priority": "high",
+            "id": "1",
+        },
+        {
+            "content": "修复 LiteLLM cost map 安装为集中且幂等，保留自定义 entries",
+            "status": "in_progress",
+            "priority": "high",
+            "id": "2",
+        },
+        {
+            "content": "更新测试覆盖 review 指出的语义",
+            "status": "pending",
+            "priority": "medium",
+            "id": "3",
+        },
+    ]
+
+    class MockToolCallItem:
+        class RawItem:
+            name = "todo_write"
+            arguments = json.dumps({"todos": todos}, ensure_ascii=False)
+            call_id = "todo-123"
+
+        raw_item = RawItem()
+
+    class MockToolOutputItem:
+        output = "Updated Plan\n  └ ✔ done\n    □ active\n    □ pending"
+        tool_call_id = "todo-123"
+
+        class RawItem:
+            pass
+
+        raw_item = RawItem()
+
+    display_manager.handle_tool_called(MockToolCallItem())
+    display_manager.handle_tool_output(MockToolOutputItem())
+
+    final_display = display_manager.get_final_display()
+
+    assert "• Updated Plan" in final_display
+    assert "  └ ✔ 校对 review 每条是否成立并定位最小修正点" in final_display
+    assert "    □ 修复 LiteLLM cost map 安装为集中且幂等，保留自定义 entries" in final_display
+    assert "    □ 更新测试覆盖 review 指出的语义" in final_display
+    assert "todo_write" not in final_display
+    assert "╰─" not in final_display
+
+
+def test_todo_list_formatter_uses_plan_markers():
+    """todo tool output should use the same text markers as the TUI renderer."""
+    from koder_agent.tools.todo import _format_todo_list
+
+    output = _format_todo_list(
+        [
+            {"content": "done", "status": "completed"},
+            {"content": "active", "status": "in_progress"},
+            {"content": "later", "status": "pending"},
+        ],
+        title="Updated Plan",
+    )
+
+    assert output == "Updated Plan\n  └ ✔ done\n    □ active\n    □ later"

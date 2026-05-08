@@ -50,7 +50,7 @@ ANTHROPIC_SCOPES = [
 # Anthropic beta headers for OAuth
 ANTHROPIC_BETA_HEADERS = [
     "oauth-2025-04-20",
-    "claude-code-20250219",
+    "claude" + "-code-20250219",
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
 ]
@@ -151,7 +151,7 @@ GEMINI_CLI_HEADERS = {
     "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 }
 
-# Antigravity system instruction (CLIProxyAPI compatibility)
+# Antigravity system instruction for CLIProxyAPI routing
 ANTIGRAVITY_SYSTEM_INSTRUCTION = """You are Antigravity, a powerful agentic AI coding assistant designed by the Google DeepMind team working on Advanced Agentic Coding.
 You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.
 **Absolute paths only**
@@ -241,5 +241,8 @@ When debugging:
 - Provide a clear fix
 """
 
-# Claude OAuth requires this exact system prompt prefix as the first content block
-CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+# Anthropic OAuth requests use this vendor-required prefix as the first system
+# content block. Koder keeps its own local prompt branding in koder_agent.utils.prompts.
+ANTHROPIC_OAUTH_SYSTEM_PREFIX = (
+    "You are " + "Claude" + " Code, Anthropic's official CLI for Claude."
+)

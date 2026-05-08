@@ -177,6 +177,12 @@ def get_adaptive_prompt_style():
             "status-context-ok": "#228B22",  # Forest green for < 70%
             "status-context-warn": "#FF8C00",  # Dark orange for 70-90%
             "status-context-critical": "#DC143C",  # Crimson for > 90%
+            # PR review status styles
+            "status-pr-approved": "#228B22",  # Green
+            "status-pr-pending": "#B8860B",  # Dark goldenrod (visible on light)
+            "status-pr-changes-requested": "#DC143C",  # Crimson / red
+            "status-pr-draft": "#888888",  # Gray
+            "status-pr-merged": "#7B2D8B",  # Purple
         }
     elif theme == "dark":
         # Dark theme: light text on dark background
@@ -195,6 +201,12 @@ def get_adaptive_prompt_style():
             "status-context-ok": "#32CD32",  # Lime green for < 70%
             "status-context-warn": "#FFA500",  # Orange for 70-90%
             "status-context-critical": "#FF6347",  # Tomato red for > 90%
+            # PR review status styles
+            "status-pr-approved": "#32CD32",  # Green
+            "status-pr-pending": "#FFD700",  # Gold / yellow
+            "status-pr-changes-requested": "#FF6347",  # Tomato / red
+            "status-pr-draft": "#888888",  # Gray
+            "status-pr-merged": "#BB86FC",  # Light purple
         }
     else:
         # Auto/unknown theme: use system defaults where possible
@@ -213,6 +225,12 @@ def get_adaptive_prompt_style():
             "status-context-ok": "#32CD32",  # Green
             "status-context-warn": "#FFA500",  # Orange
             "status-context-critical": "#FF6347",  # Red
+            # PR review status styles
+            "status-pr-approved": "#32CD32",  # Green
+            "status-pr-pending": "#FFA500",  # Orange / yellow
+            "status-pr-changes-requested": "#FF6347",  # Red
+            "status-pr-draft": "#888888",  # Gray
+            "status-pr-merged": "#BB86FC",  # Purple
         }
 
     return Style.from_dict(style_dict)

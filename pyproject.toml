@@ -1,6 +1,6 @@
 [project]
 name = "koder"
-version = "0.4.13"
+version = "0.5.0"
 description = "An intuitive AI coding assistant and interactive CLI tool that boosts developer productivity with intelligent automation and context-aware support."
 authors = [{ name = "Pengfei Ni" }]
 readme = "README.md"
@@ -25,7 +25,7 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "pydantic>=2.12.5",
     "httpx[socks]>=0.28.1",
-    "openai>=2.15.0",
+    "openai==2.15.0",
     "rich>=14.3.1",
     "google-cloud-aiplatform>=1.132.0",
     "prompt-toolkit>=3.0.52",
@@ -40,6 +40,8 @@ dependencies = [
     "pynacl>=1.6.2",
     "websockets>=15.0.1",
     "pyyaml>=6.0.3",
+    "jsonschema>=4.25.1",
+    "sounddevice>=0.5.1",
     "whatthepatch>=1.0.7",
     "anthropic>=0.76.0",
 ]
@@ -57,6 +59,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+python-preference = "only-managed"
 dev-dependencies = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -73,6 +76,9 @@ target-version = "py310"
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402", "N806", "N818"]
+
 [tool.black]
 line-length = 100
 target-version = ['py310']
@@ -85,12 +91,12 @@ ignore_missing_imports = true
 exclude = [".venv", "build", "dist"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "strict"
-asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     # Ignore asyncio subprocess transport cleanup warnings - harmless race condition
     # when event loop closes before GC runs on subprocess transports
     "ignore:Exception ignored in.*BaseSubprocessTransport.__del__:pytest.PytestUnraisableExceptionWarning",
+    # litellm's deepeval integration uses class-based Pydantic config (third-party, can't fix)
+    "ignore:Support for class-based `config` is deprecated:DeprecationWarning:pydantic",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -98,7 +104,7 @@ packages = ["koder_agent"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
-    ".claude/",
+    ".koder/",
     ".github/",
     ".uv-cache/",
     "scripts/",

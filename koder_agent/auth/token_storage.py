@@ -2,6 +2,7 @@
 
 Stores OAuth tokens in plain JSON files under ~/.koder/tokens/
 with file permissions set to 0600 for basic security.
+On macOS, attempts to use Keychain when available.
 """
 
 import json
@@ -12,6 +13,7 @@ from typing import Dict, List, Optional
 
 from koder_agent.auth.base import OAuthTokens
 from koder_agent.auth.constants import SUPPORTED_PROVIDERS
+from koder_agent.auth.secure_storage import SecureStorage
 
 
 class TokenStorage:
@@ -32,6 +34,9 @@ class TokenStorage:
             base_dir = Path.home() / ".koder" / "tokens"
         self.base_dir = Path(base_dir)
         self._ensure_directory()
+        # Try to use secure storage (macOS Keychain) when available
+        self._secure_storage = SecureStorage()
+        self._use_keychain = self._secure_storage.is_available()
 
     def _ensure_directory(self) -> None:
         """Ensure the tokens directory exists with proper permissions."""
@@ -49,6 +54,16 @@ class TokenStorage:
         Args:
             tokens: OAuth tokens to save
         """
+        # Try keychain first if available
+        if self._use_keychain:
+            try:
+                token_json = json.dumps(tokens.to_dict())
+                if self._secure_storage.store("koder-oauth", tokens.provider, token_json):
+                    return  # Successfully stored in keychain
+            except Exception:
+                pass  # Fall back to file storage
+
+        # Fall back to file storage
         token_path = self._get_token_path(tokens.provider)
 
         # Write tokens to file
@@ -67,6 +82,17 @@ class TokenStorage:
         Returns:
             OAuthTokens if found, None otherwise
         """
+        # Try keychain first if available
+        if self._use_keychain:
+            try:
+                token_json = self._secure_storage.retrieve("koder-oauth", provider)
+                if token_json:
+                    data = json.loads(token_json)
+                    return OAuthTokens.from_dict(data)
+            except Exception:
+                pass  # Fall back to file storage
+
+        # Fall back to file storage
         token_path = self._get_token_path(provider)
 
         if not token_path.exists():

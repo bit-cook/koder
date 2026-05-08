@@ -11,6 +11,7 @@ The restriction model uses UNION semantics:
 Pattern syntax for allowed_tools:
 - "read_file"           - Exact tool name match
 - "run_shell:git *"     - Shell commands matching glob pattern
+- "run_powershell:Get-*" - PowerShell commands matching glob pattern
 - "run_shell:*"         - All shell commands allowed
 - "*"                   - Wildcard, all tools allowed
 
@@ -46,6 +47,7 @@ class SkillRestrictions:
     Pattern syntax for allowed_tools:
     - "read_file"           - Exact tool name match
     - "run_shell:git *"     - Shell commands matching glob pattern
+    - "run_powershell:Get-*" - PowerShell commands matching glob pattern
     - "run_shell:*"         - All shell commands allowed
     - "*"                   - Wildcard, all tools allowed
     """
@@ -68,6 +70,7 @@ class SkillRestrictions:
         - Exact match: "read_file" matches tool_name="read_file"
         - Wildcard: "*" matches any tool
         - Command pattern: "run_shell:git *" matches run_shell with command starting with "git "
+        - Command pattern: "run_powershell:Get-*" matches run_powershell commands
 
         Args:
             tool_name: The name of the tool to check
@@ -116,8 +119,8 @@ class SkillRestrictions:
             if pattern_tool != tool_name:
                 return False
 
-            # For run_shell, match against the command argument
-            if tool_name == "run_shell" and tool_args:
+            # For shell tools, match against the command argument
+            if tool_name in {"run_shell", "run_powershell"} and tool_args:
                 return self._matches_shell_command(command_pattern, tool_args)
 
             # For git_command, match against the args argument

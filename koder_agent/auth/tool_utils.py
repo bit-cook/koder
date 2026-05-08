@@ -1796,7 +1796,7 @@ def convert_tools_to_claude_format(
         inject_signatures: Whether to inject parameter signatures into descriptions
 
     Returns:
-        Claude-style tool definitions with cleaned schemas
+        Anthropic-style tool definitions with cleaned schemas
     """
     if not tools:
         return []
@@ -2357,7 +2357,7 @@ def remap_function_call_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, 
 
     # read/read_file tools: path→file_path
     elif name_lower in ("read", "read_file", "cat", "view_file"):
-        # Remap path → file_path (Claude Code schema uses file_path)
+        # Remap path → file_path (canonical schema uses file_path)
         if "path" in result and "file_path" not in result:
             result["file_path"] = result.pop("path")
         # Remap filename → file_path

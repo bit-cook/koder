@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate bundled Codex prompt module from upstream releases.
+"""Generate bundled Codex prompt module from published releases.
 
 This script fetches prompt files from the openai/codex repo and writes a
 Python module with embedded prompt strings for offline/runtime use.

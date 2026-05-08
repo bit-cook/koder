@@ -183,3 +183,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.tmp/
+.tmp-team-members/
+.koder/
+/.mcp.json
+agent-output/

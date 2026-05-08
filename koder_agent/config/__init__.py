@@ -9,8 +9,10 @@ from .manager import (
 from .models import (
     CLIConfig,
     KoderConfig,
+    MCPLocalProjectConfigYaml,
     MCPServerConfigYaml,
     ModelConfig,
+    VoiceConfig,
 )
 
 __all__ = [
@@ -23,5 +25,7 @@ __all__ = [
     "KoderConfig",
     "ModelConfig",
     "CLIConfig",
+    "MCPLocalProjectConfigYaml",
     "MCPServerConfigYaml",
+    "VoiceConfig",
 ]

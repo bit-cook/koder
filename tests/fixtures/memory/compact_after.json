@@ -1,0 +1,15 @@
+{
+  "config": {
+    "max_messages": 4
+  },
+  "result": {
+    "summary": "Compacted 3 earlier messages across roles: system, tool.",
+    "kept_messages": [
+      {"role": "user", "content": "Open the failing test suite."},
+      {"role": "assistant", "content": "Inspecting the repo and collecting failures."},
+      {"role": "user", "content": "Patch the regression and re-run tests."},
+      {"role": "assistant", "content": "Applying the patch and running focused verification."}
+    ],
+    "original_count": 7
+  }
+}

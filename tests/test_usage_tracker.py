@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from koder_agent.core.usage_tracker import SessionUsage, UsageTracker
+from koder_agent.core.usage_tracker import SessionUsage, UsageTracker, usage_snapshot_path
 
 
 class TestSessionUsage:
@@ -56,6 +56,12 @@ class TestUsageTracker:
             _ = tracker.model
             _ = tracker.model  # Second call should use cache
             assert mock.call_count == 1  # Only called once due to caching
+
+
+def test_usage_snapshot_path_escapes_session_ids(tmp_path):
+    path = usage_snapshot_path("session/with spaces", home=tmp_path)
+
+    assert path == tmp_path / ".koder" / "usage" / "session%2Fwith%20spaces.json"
 
 
 class TestGetModelCosts:

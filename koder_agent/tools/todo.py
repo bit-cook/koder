@@ -54,22 +54,16 @@ def todo_read() -> str:
     return _format_todo_list(_store.todos)
 
 
-def _format_todo_list(todos: List[dict]) -> str:
-    """Format todo list with emoji indicators."""
-    result = []
-    for todo in todos:
+def _format_todo_list(todos: List[dict], *, title: str = "Current Plan") -> str:
+    """Format todo list in a compact plan style."""
+    result = [title]
+    for index, todo in enumerate(todos):
         status = todo.get("status", "pending")
         content = todo.get("content", "")
+        prefix = "  └ " if index == 0 else "    "
+        marker = "✔" if status == "completed" else "□"
 
-        if status == "completed":
-            # Completed: green checkmark
-            result.append(f"✅ {content}")
-        elif status == "in_progress":
-            # In progress: spinning/working indicator
-            result.append(f"🔄 {content}")
-        else:
-            # Pending: waiting/todo indicator
-            result.append(f"⏳ {content}")
+        result.append(f"{prefix}{marker} {content}")
 
     return "\n".join(result)
 
@@ -83,4 +77,4 @@ def todo_write(todos: List[TodoItem]) -> str:
     if not _store.todos:
         return "Todo list cleared."
 
-    return _format_todo_list(_store.todos)
+    return _format_todo_list(_store.todos, title="Updated Plan")

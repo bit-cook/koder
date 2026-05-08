@@ -1,8 +1,34 @@
 """Tests for _capture_usage fallback logic in AgentScheduler."""
 
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# Stub optional deps before importing koder_agent modules in patched paths
+if "litellm" not in sys.modules:
+    litellm_stub = types.ModuleType("litellm")
+    litellm_stub.model_cost = {}
+    sys.modules["litellm"] = litellm_stub
+
+if "ddgs" not in sys.modules:
+    ddgs_stub = types.ModuleType("ddgs")
+
+    class _StubDDGS:
+        def text(self, *_args, **_kwargs):
+            return []
+
+    ddgs_stub.DDGS = _StubDDGS
+    sys.modules["ddgs"] = ddgs_stub
+
+    ddgs_exceptions = types.ModuleType("ddgs.exceptions")
+
+    class DDGSException(Exception):
+        pass
+
+    ddgs_exceptions.DDGSException = DDGSException
+    sys.modules["ddgs.exceptions"] = ddgs_exceptions
 
 
 class TestCaptureUsage:
@@ -45,9 +71,11 @@ class TestCaptureUsage:
         await mock_scheduler._capture_usage(result)
 
         # Should record the API-provided usage
-        mock_scheduler.usage_tracker.record_usage.assert_called_once_with(
-            500, 200, context_tokens=None
-        )
+        call_args = mock_scheduler.usage_tracker.record_usage.call_args
+        assert call_args[0] == (500, 200)
+        # Context display uses the larger current-session estimate, not just
+        # the request delta returned by providers.
+        assert call_args[1]["context_tokens"] == 1000
 
     @pytest.mark.asyncio
     async def test_capture_usage_with_context_tokens(self, mock_scheduler):
@@ -63,9 +91,52 @@ class TestCaptureUsage:
 
         await mock_scheduler._capture_usage(result)
 
-        mock_scheduler.usage_tracker.record_usage.assert_called_once_with(
-            500, 200, context_tokens=700
-        )
+        call_args = mock_scheduler.usage_tracker.record_usage.call_args
+        assert call_args[0] == (500, 200)
+        assert call_args[1]["context_tokens"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_capture_usage_uses_static_and_session_floor_for_small_api_usage(
+        self, mock_scheduler
+    ):
+        """Provider usage can be smaller than the effective next-turn context."""
+        result = MagicMock()
+        result.context_wrapper = MagicMock()
+        result.context_wrapper.usage = MagicMock()
+        result.context_wrapper.usage.input_tokens = 800
+        result.context_wrapper.usage.output_tokens = 97
+        result.context_wrapper.usage.request_usage_entries = None
+
+        mock_scheduler.session._estimate_tokens.return_value = 1500
+        mock_scheduler._estimate_static_context_tokens = MagicMock(return_value=9000)
+
+        await mock_scheduler._capture_usage(result)
+
+        call_args = mock_scheduler.usage_tracker.record_usage.call_args
+        assert call_args[0] == (800, 97)
+        assert call_args[1]["context_tokens"] == 10500
+
+    @pytest.mark.asyncio
+    async def test_capture_usage_keeps_larger_api_context(self, mock_scheduler):
+        """When provider usage includes the full prompt, keep that higher number."""
+        result = MagicMock()
+        result.context_wrapper = MagicMock()
+        result.context_wrapper.usage = MagicMock()
+        result.context_wrapper.usage.input_tokens = 50_000
+        result.context_wrapper.usage.output_tokens = 5_000
+        result.context_wrapper.usage.cache_read_input_tokens = 2_000
+        result.context_wrapper.usage.cache_creation_input_tokens = 1_000
+        result.context_wrapper.usage.request_usage_entries = None
+
+        mock_scheduler.session._estimate_tokens.return_value = 1500
+        mock_scheduler._estimate_static_context_tokens = MagicMock(return_value=9000)
+
+        await mock_scheduler._capture_usage(result)
+
+        call_args = mock_scheduler.usage_tracker.record_usage.call_args
+        assert call_args[1]["context_tokens"] == 58_000
+        assert call_args[1]["cache_read_tokens"] == 2_000
+        assert call_args[1]["cache_write_tokens"] == 1_000
 
     @pytest.mark.asyncio
     async def test_capture_usage_fallback_when_api_returns_zero(self, mock_scheduler):

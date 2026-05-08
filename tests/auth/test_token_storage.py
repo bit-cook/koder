@@ -5,6 +5,7 @@ import stat
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -21,8 +22,14 @@ def temp_storage_dir():
 
 @pytest.fixture
 def storage(temp_storage_dir):
-    """Create a TokenStorage instance with temp directory."""
-    return TokenStorage(base_dir=temp_storage_dir)
+    """Create a TokenStorage instance with temp directory.
+
+    SecureStorage (macOS Keychain) is disabled so all tests exercise the
+    plain-JSON file path without side-effects on the real keychain.
+    """
+    with patch("koder_agent.auth.token_storage.SecureStorage") as MockSecure:
+        MockSecure.return_value.is_available.return_value = False
+        yield TokenStorage(base_dir=temp_storage_dir)
 
 
 @pytest.fixture

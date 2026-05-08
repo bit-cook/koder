@@ -71,6 +71,13 @@ class MCPServerConfigYaml(BaseModel):
     blocked_tools: Optional[List[str]] = Field(default=None, description="Blocked tools blacklist")
 
 
+class MCPLocalProjectConfigYaml(BaseModel):
+    """Per-project private MCP servers stored in the user config."""
+
+    project_root: str = Field(..., description="Absolute project root for local-scope MCP servers")
+    servers: List[MCPServerConfigYaml] = Field(default_factory=list)
+
+
 class SkillsConfig(BaseModel):
     """Skills configuration settings for progressive disclosure."""
 
@@ -83,10 +90,28 @@ class SkillsConfig(BaseModel):
     )
 
 
+class VoiceConfig(BaseModel):
+    """Voice dictation configuration."""
+
+    enabled: bool = Field(default=False, description="Enable interactive voice dictation")
+    provider: Optional[str] = Field(
+        default=None,
+        description="Voice provider override (openai, chatgpt, google, gemini)",
+    )
+    model: Optional[str] = Field(default=None, description="Voice transcription model override")
+    api_key: Optional[str] = Field(default=None, description="Voice provider API key override")
+    base_url: Optional[str] = Field(default=None, description="Voice provider base URL override")
+    api_version: Optional[str] = Field(
+        default=None, description="Voice provider API version override"
+    )
+
+
 class KoderConfig(BaseModel):
     """Root configuration model for Koder CLI."""
 
     model: ModelConfig = Field(default_factory=ModelConfig)
     cli: CLIConfig = Field(default_factory=CLIConfig)
     mcp_servers: List[MCPServerConfigYaml] = Field(default_factory=list)
+    mcp_local_projects: List[MCPLocalProjectConfigYaml] = Field(default_factory=list)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)

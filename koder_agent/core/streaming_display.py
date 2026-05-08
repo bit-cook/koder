@@ -9,11 +9,14 @@ from rich.console import Console, Group
 from rich.syntax import Syntax
 from rich.text import Text
 
+TODO_TOOL_NAMES = {"todo_read", "todo_write"}
+
 
 class OutputType(Enum):
     """Types of output sections."""
 
     TEXT = "text"
+    REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_OUTPUT = "tool_output"
 
@@ -36,6 +39,8 @@ class OutputSection:
     type: OutputType
     content: str = ""
     tool_tracker: Optional[ToolCallTracker] = None
+    reasoning_key: Optional[str] = None
+    reasoning_kind: str = "summary"
     complete: bool = False
 
 
@@ -50,6 +55,7 @@ class StreamingDisplayManager:
         self.sections: List[OutputSection] = []  # All output sections in order
         self.current_text_section: Optional[OutputSection] = None
         self.active_tool_calls: Dict[str, ToolCallTracker] = {}  # Track by call_id
+        self.reasoning_sections: Dict[str, OutputSection] = {}
 
         # Text streaming by output_index
         self.text_streams: Dict[int, str] = {}
@@ -81,6 +87,107 @@ class StreamingDisplayManager:
                 return False
 
         return False
+
+    def handle_reasoning_delta(
+        self,
+        item_id: Optional[str],
+        output_index: int,
+        delta_text: str,
+        *,
+        kind: str = "summary",
+        part_index: int = 0,
+    ) -> bool:
+        """Handle streaming reasoning deltas. Returns True if display should update."""
+
+        if not delta_text:
+            return False
+
+        section = self._ensure_reasoning_section(
+            item_id,
+            output_index,
+            kind=kind,
+            part_index=part_index,
+        )
+        section.content += delta_text
+        return True
+
+    def handle_reasoning_done(
+        self,
+        item_id: Optional[str],
+        output_index: int,
+        text: str,
+        *,
+        kind: str = "summary",
+        part_index: int = 0,
+    ) -> bool:
+        """Finalize a reasoning section with the provider's completed text."""
+
+        if not text:
+            return False
+
+        section = self._ensure_reasoning_section(
+            item_id,
+            output_index,
+            kind=kind,
+            part_index=part_index,
+        )
+        section.content = text
+        section.complete = True
+        return True
+
+    def handle_reasoning_item(self, raw_item: Any, *, mode: str = "summary") -> bool:
+        """Render final reasoning item content when no useful deltas were displayed."""
+
+        if raw_item is None or mode == "off":
+            return False
+
+        item_id = (
+            raw_item.get("id") if isinstance(raw_item, dict) else getattr(raw_item, "id", None)
+        )
+        changed = False
+
+        summary_parts = (
+            raw_item.get("summary")
+            if isinstance(raw_item, dict)
+            else getattr(raw_item, "summary", None)
+        )
+        for index, part in enumerate(summary_parts or []):
+            text = part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+            text = text or ""
+            if text:
+                changed = (
+                    self.handle_reasoning_done(
+                        item_id,
+                        0,
+                        text,
+                        kind="summary",
+                        part_index=index,
+                    )
+                    or changed
+                )
+
+        if mode == "full":
+            content_parts = (
+                raw_item.get("content")
+                if isinstance(raw_item, dict)
+                else getattr(raw_item, "content", None)
+            )
+            for index, part in enumerate(content_parts or []):
+                text = part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                text = text or ""
+                if text:
+                    changed = (
+                        self.handle_reasoning_done(
+                            item_id,
+                            0,
+                            text,
+                            kind="text",
+                            part_index=index,
+                        )
+                        or changed
+                    )
+
+        return changed
 
     def handle_tool_called(self, tool_call_item, call_id: Optional[str] = None) -> bool:
         """
@@ -242,6 +349,26 @@ class StreamingDisplayManager:
             self.current_text_section = OutputSection(type=OutputType.TEXT)
             self.sections.append(self.current_text_section)
 
+    def _ensure_reasoning_section(
+        self,
+        item_id: Optional[str],
+        output_index: int,
+        *,
+        kind: str,
+        part_index: int,
+    ) -> OutputSection:
+        key = f"{kind}:{item_id or output_index}:{part_index}"
+        section = self.reasoning_sections.get(key)
+        if section is None:
+            section = OutputSection(
+                type=OutputType.REASONING,
+                reasoning_key=key,
+                reasoning_kind=kind,
+            )
+            self.reasoning_sections[key] = section
+            self.sections.append(section)
+        return section
+
     def get_display_content(self) -> Union[Group, Text]:
         """Generate the current display content as a string for Rich Live compatibility."""
         renderables = []
@@ -262,9 +389,30 @@ class StreamingDisplayManager:
                         # Fallback to plain text
                         renderables.append(Text(section.content.strip()))
 
+            elif section.type == OutputType.REASONING:
+                if section.content.strip():
+                    if renderables:
+                        renderables.append(Text())
+
+                    label = "reasoning" if section.reasoning_kind == "text" else "reasoning summary"
+                    header = Text()
+                    header.append("o ", style="dim cyan")
+                    header.append(label, style="dim cyan")
+                    renderables.append(header)
+
+                    for line in section.content.strip().split("\n"):
+                        if line.strip():
+                            body = Text()
+                            body.append("  ", style="dim")
+                            body.append(line, style="dim")
+                            renderables.append(body)
+
             elif section.type == OutputType.TOOL_CALL:
                 if section.tool_tracker:
                     tracker = section.tool_tracker
+                    if tracker.tool_name in TODO_TOOL_NAMES:
+                        continue
+
                     # Add spacing between sections
                     if renderables:
                         renderables.append(Text())
@@ -289,6 +437,16 @@ class StreamingDisplayManager:
             elif section.type == OutputType.TOOL_OUTPUT:
                 # Get tool name for summary generation
                 tool_name = section.tool_tracker.tool_name if section.tool_tracker else "unknown"
+
+                if tool_name in TODO_TOOL_NAMES:
+                    todo_renderables = self._format_todo_plan_output(
+                        tool_name, section.content, section.tool_tracker
+                    )
+                    if todo_renderables:
+                        if renderables:
+                            renderables.append(Text())
+                        renderables.extend(todo_renderables)
+                    continue
 
                 if section.content:
                     summary = self._generate_smart_summary(tool_name, section.content)
@@ -445,6 +603,115 @@ class StreamingDisplayManager:
 
         return "\n\n".join(text_parts) if text_parts else ""
 
+    def _format_todo_plan_output(
+        self,
+        tool_name: str,
+        output: str,
+        tracker: Optional[ToolCallTracker],
+    ) -> List[Text]:
+        """Render todo tools like a compact Codex-style plan update."""
+        clean_output = output.strip()
+        if not clean_output:
+            return []
+
+        title = "Updated Plan" if tool_name == "todo_write" else "Current Plan"
+        items = self._todo_items_from_tracker(tracker)
+        if not items and "Todo list cleared" not in clean_output:
+            items = self._parse_todo_output(clean_output)
+
+        header = Text()
+        header.append("• ", style="dim")
+        header.append(title, style="bold")
+
+        renderables = [header]
+        if not items:
+            empty_line = Text()
+            empty_line.append("  └ ", style="dim")
+            empty_line.append("(empty)", style="dim")
+            renderables.append(empty_line)
+            return renderables
+
+        for index, item in enumerate(items):
+            renderables.append(self._format_todo_plan_item(index, item))
+
+        return renderables
+
+    def _todo_items_from_tracker(self, tracker: Optional[ToolCallTracker]) -> List[Dict[str, str]]:
+        if not tracker or not isinstance(tracker.inputs, dict):
+            return []
+
+        todos = tracker.inputs.get("todos")
+        if not isinstance(todos, list):
+            return []
+
+        items = []
+        for todo in todos:
+            if not isinstance(todo, dict):
+                continue
+
+            content = str(todo.get("content", "")).strip()
+            if not content:
+                continue
+
+            items.append(
+                {
+                    "content": content,
+                    "status": str(todo.get("status", "pending")),
+                }
+            )
+
+        return items
+
+    def _parse_todo_output(self, output: str) -> List[Dict[str, str]]:
+        items = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line or line in {"Updated Plan", "Current Plan"}:
+                continue
+            if line.startswith("└ "):
+                line = line[2:].strip()
+
+            parsed_item = self._parse_todo_line(line)
+            if parsed_item:
+                items.append(parsed_item)
+
+        return items
+
+    def _parse_todo_line(self, line: str) -> Optional[Dict[str, str]]:
+        markers = {
+            "✔": "completed",
+            "✅": "completed",
+            "□": "pending",
+            "☐": "pending",
+            "⏳": "pending",
+            "🔄": "in_progress",
+        }
+        for marker, status in markers.items():
+            if line.startswith(marker):
+                return {"content": line[len(marker) :].strip(), "status": status}
+
+        return None
+
+    def _format_todo_plan_item(self, index: int, item: Dict[str, str]) -> Text:
+        status = item.get("status", "pending")
+        content = item.get("content", "")
+
+        line = Text()
+        line.append("  ")
+        line.append("└ " if index == 0 else "  ", style="dim")
+
+        if status == "completed":
+            line.append("✔ ", style="green")
+            line.append(content, style="dim strike")
+        elif status == "in_progress":
+            line.append("□ ", style="bold green")
+            line.append(content, style="bold green")
+        else:
+            line.append("□ ", style="dim")
+            line.append(content, style="dim")
+
+        return line
+
     def get_final_display(self) -> str:
         """Get the final display content including tools as plain text."""
         from io import StringIO
@@ -572,10 +839,13 @@ class StreamingDisplayManager:
                 else:
                     return f"Output {len(lines)} lines"
 
-        # Handle edit_file tool (diff-based editing)
+        # Handle edit_file tool (string-replacement or diff-based editing)
         elif tool_name == "edit_file":
-            if "Successfully applied diff" in clean_output:
-                # Extract just the success message, diff content is shown separately
+            if "Successfully edited" in clean_output:
+                # String-replacement mode success
+                return "Edit applied"
+            elif "Successfully applied diff" in clean_output:
+                # Diff mode success
                 return "Diff applied"
             elif "Failed to apply diff" in clean_output:
                 # Show error message

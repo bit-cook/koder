@@ -1,5 +1,6 @@
 """OpenAI client setup with configuration support."""
 
+import logging
 import os
 import uuid
 from typing import Optional
@@ -13,6 +14,8 @@ from agents import (
 from openai import AsyncOpenAI
 
 from ..config import get_config, get_config_manager
+from .model_deprecation import check_model_deprecation
+from .model_info import resolve_model_alias
 
 # Suppress debug info from litellm
 litellm.suppress_debug_info = True
@@ -176,6 +179,10 @@ def _resolve_model_settings():
     model_from_env = env_model is not None
 
     raw_model = config_manager.get_effective_value(config.model.name, "KODER_MODEL")
+
+    # Resolve model aliases (e.g., 'sonnet' → 'claude-sonnet-4-6')
+    raw_model = resolve_model_alias(raw_model)
+
     provider = config.model.provider.lower()
 
     # Only extract provider from model string if it came from environment variable
@@ -362,18 +369,55 @@ def _compute_effective_model(config, config_manager, provider, raw_model, model_
     return _normalize_model_name(provider, raw_model, model_from_env), False, api_key
 
 
-def get_model_name():
-    """Get the appropriate model name with priority: ENV > Config > Default."""
+def _resolve_completion_settings(model_override: Optional[str] = None):
+    """Resolve provider/model settings for a completion call, honoring overrides."""
     config, config_manager, provider, raw_model, model_from_env = _resolve_model_settings()
+
+    if model_override is not None:
+        # Resolve aliases in overrides (e.g., 'sonnet' → 'claude-sonnet-4-6')
+        raw_model = resolve_model_alias(model_override)
+        override_provider, _, _ = _split_model_identifier(raw_model)
+        if override_provider is not None:
+            provider = override_provider
+            model_from_env = True
+        else:
+            model_from_env = False
+
+    return config, config_manager, provider, raw_model, model_from_env
+
+
+def get_model_name(model_override: Optional[str] = None):
+    """Get the appropriate model name with priority: ENV > Config > Default."""
+    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
+        model_override
+    )
+    model, _, _ = _compute_effective_model(
+        config, config_manager, provider, raw_model, model_from_env
+    )
+    # Check for model deprecation and warn if applicable
+    try:
+        warning = check_model_deprecation(raw_model)
+        if warning:
+            logging.warning(warning)
+    except Exception:
+        pass  # Don't fail if deprecation check fails
+    return model
+
+
+def resolve_model_override_name(raw_model: str) -> str:
+    """Resolve a model override into the actual call model name."""
+    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
+        raw_model
+    )
     model, _, _ = _compute_effective_model(
         config, config_manager, provider, raw_model, model_from_env
     )
     return model
 
 
-def get_api_key():
+def get_api_key(model_override: Optional[str] = None):
     """Get API key with priority: KODER_API_KEY > OAuth > ENV > Config."""
-    config, config_manager, provider, _, _ = _resolve_model_settings()
+    config, config_manager, provider, _, _ = _resolve_completion_settings(model_override)
     return _get_provider_api_key(config, config_manager, provider)
 
 
@@ -399,9 +443,9 @@ def _resolve_base_url(config, config_manager, provider: str) -> Optional[str]:
     return config_manager.get_effective_value(base_url_config, base_url_env_var)
 
 
-def get_base_url():
+def get_base_url(model_override: Optional[str] = None):
     """Get base URL with priority: KODER_BASE_URL > ENV > Config."""
-    config, config_manager, provider, _, _ = _resolve_model_settings()
+    config, config_manager, provider, _, _ = _resolve_completion_settings(model_override)
     return _resolve_base_url(config, config_manager, provider)
 
 
@@ -432,13 +476,15 @@ def _get_oauth_extra_headers(provider: str) -> Optional[dict]:
     return None
 
 
-def get_litellm_model_kwargs() -> dict:
+def get_litellm_model_kwargs(model_override: Optional[str] = None) -> dict:
     """Get kwargs for creating a LitellmModel instance.
 
     Returns a dict with 'model', 'api_key', 'base_url', and retry configuration
     that can be passed directly to LitellmModel constructor.
     """
-    config, config_manager, provider, raw_model, model_from_env = _resolve_model_settings()
+    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
+        model_override
+    )
 
     # Get normalized model name for LiteLLM
     model = _normalize_model_name(provider, raw_model, model_from_env)
@@ -464,9 +510,26 @@ def get_litellm_model_kwargs() -> dict:
     return kwargs
 
 
-def is_native_openai_provider() -> bool:
+def get_model_client_snapshot(model_override: Optional[str] = None) -> dict:
+    """Return a stable snapshot of the currently resolved client settings."""
+    config = get_config()
+    config_manager = get_config_manager()
+    return {
+        "model_name": get_model_name(model_override),
+        "api_key": get_api_key(model_override),
+        "base_url": get_base_url(model_override),
+        "litellm_kwargs": get_litellm_model_kwargs(model_override),
+        "native_openai": is_native_openai_provider(model_override),
+        "reasoning_effort": config_manager.get_effective_value(
+            config.model.reasoning_effort,
+            "KODER_REASONING_EFFORT",
+        ),
+    }
+
+
+def is_native_openai_provider(model_override: Optional[str] = None) -> bool:
     """Check if the current provider should use native OpenAI client."""
-    config, config_manager, provider, raw_model, _ = _resolve_model_settings()
+    config, config_manager, provider, raw_model, _ = _resolve_completion_settings(model_override)
     api_key = _get_provider_api_key(config, config_manager, provider)
 
     return (
@@ -497,23 +560,33 @@ async def llm_completion(messages: list, model: Optional[str] = None) -> str:
         The completion response content as string
     """
 
-    config, config_manager, provider, raw_model, model_from_env = _resolve_model_settings()
+    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
+        model
+    )
 
     # Ensure provider env vars are set (for litellm to pick up)
     _setup_provider_env_vars(config, provider)
 
     # Get model name and API key
-    if model is None:
-        model, _, api_key = _compute_effective_model(
-            config, config_manager, provider, raw_model, model_from_env
-        )
-    else:
-        api_key = _get_provider_api_key(config, config_manager, provider)
+    model, use_native, api_key = _compute_effective_model(
+        config, config_manager, provider, raw_model, model_from_env
+    )
 
-    # Get base URL if configured
-    base_url_env_var = PROVIDER_ENV_VARS.get(provider, {}).get("base_url", "OPENAI_BASE_URL")
-    base_url_config = config.model.base_url if config.model.provider.lower() == provider else None
-    base_url = config_manager.get_effective_value(base_url_config, base_url_env_var)
+    # When the model is OpenAI-native but llm_completion goes through litellm,
+    # ensure the model has a provider prefix so litellm can route it correctly.
+    # Without this, newer OpenAI models (e.g. gpt-5.4) that litellm doesn't
+    # recognize by name will fail with "LLM Provider NOT provided".
+    if use_native and not model.startswith(("openai/", "azure/")):
+        model = f"openai/{model}"
+
+    # Strip the 'litellm/' prefix since litellm.acompletion doesn't expect it
+    # (_compute_effective_model returns litellm-prefixed names for non-native models)
+    if model.startswith("litellm/"):
+        model = model[len("litellm/") :]
+
+    # Use the same base URL priority as the main agent path:
+    # KODER_BASE_URL > provider-specific environment > config.
+    base_url = _resolve_base_url(config, config_manager, provider)
 
     # Build kwargs for litellm with retry configuration
     kwargs = {

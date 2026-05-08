@@ -17,6 +17,11 @@ from pathlib import Path
 import requests
 
 PYPROJECT = Path("pyproject.toml")
+USAGE = """Usage: uv run scripts/upgrade_dependency.py [--help]
+
+Check pyproject.toml dependencies against PyPI and update pinned versions in place.
+Run from the repository root, then run 'uv lock' after a successful update.
+""".strip()
 
 
 def parse_dep(dep: str) -> tuple[str, str, str]:
@@ -101,5 +106,17 @@ def update_pyproject() -> None:
     print("Run 'uv lock' to update the lockfile.")
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if any(arg in {"-h", "--help"} for arg in args):
+        print(USAGE)
+        return 0
+    if args:
+        print("Usage: uv run scripts/upgrade_dependency.py [--help]")
+        return 2
     update_pyproject()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,4 +1,10 @@
-"""Tool engine for managing and executing tools."""
+"""Tool engine for managing and executing tools.
+
+Concurrent execution: ToolOrchestrator from tools/orchestration.py provides
+read/write batching for concurrent tool execution. Currently the openai-agents
+SDK handles tool execution sequentially. When batch execution support is added,
+the orchestrator can be integrated here to run read-only tools concurrently.
+"""
 
 import asyncio
 from typing import Any, Dict, Type
@@ -8,8 +14,25 @@ from rich.console import Console
 from rich.panel import Panel
 
 from ..core.security import SecurityGuard
+from .orchestration import ToolOrchestrator
 
 console = Console()
+
+
+def get_orchestrator() -> ToolOrchestrator:
+    """Get a ToolOrchestrator instance for concurrent read-only batching.
+
+    Example usage when SDK supports batch execution:
+        orchestrator = get_orchestrator()
+        results = await orchestrator.execute_batch(
+            calls=[
+                {"tool": "read_file", "args": {"path": "file1.py"}},
+                {"tool": "read_file", "args": {"path": "file2.py"}},
+            ],
+            executor=lambda name, args: tool_engine.call(name, **args),
+        )
+    """
+    return ToolOrchestrator()
 
 
 class ToolEngine:
@@ -74,7 +97,7 @@ class ToolEngine:
             )
             return result
 
-        elif name == "run_shell":
+        elif name in {"run_shell", "run_powershell"}:
             error = SecurityGuard.validate_command(kw.get("command", ""))
             if error:
                 console.print(
@@ -111,9 +134,11 @@ class ToolEngine:
             "append_file",
             "edit_file",
             "run_shell",
+            "run_powershell",
             "web_search",
             "glob_search",
             "grep_search",
+            "code_intelligence",
             "list_directory",
             "todo_read",
             "todo_write",
@@ -121,6 +146,10 @@ class ToolEngine:
             "task_delegate",
             "get_skill",
             "git_command",
+            "agent_tool",
+            "send_message",
+            "team_create",
+            "team_delete",
         }
         return name in allowed_tools
 

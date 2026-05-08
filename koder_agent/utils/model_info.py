@@ -8,6 +8,50 @@ import litellm
 # Default fallback context window size
 FALLBACK_CONTEXT_WINDOW_SIZE = 32000
 
+# Model aliases: short names → full model IDs
+# Updated to latest models as of 2026-04
+MODEL_ALIASES: dict[str, str] = {
+    # Claude family
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+    "best": "claude-opus-4-6",
+    # 1M context variants
+    "sonnet[1m]": "claude-sonnet-4-6",  # Sonnet doesn't have separate 1M ID
+    "opus[1m]": "claude-opus-4-6[1m]",
+    # GPT family shortcuts
+    "gpt4o": "gpt-4o",
+    "gpt5": "gpt-5.1-codex",
+    "o3": "o3",
+    "o4-mini": "o4-mini",
+}
+
+
+def resolve_model_alias(model: str) -> str:
+    """Resolve a model alias to its full model ID.
+
+    Supports short aliases like 'sonnet', 'opus', 'haiku', 'best'.
+    Also supports [1m] suffix for 1M context variants.
+    Unknown model names pass through unchanged.
+    """
+    # Try exact match (case-insensitive)
+    lower = model.lower()
+    if lower in MODEL_ALIASES:
+        return MODEL_ALIASES[lower]
+
+    # Try with [1m] suffix
+    if lower.endswith("[1m]"):
+        base = lower[:-4]  # Remove [1m]
+        if base in MODEL_ALIASES:
+            base_model = MODEL_ALIASES[base]
+            # Append [1m] to the resolved model if not already there
+            if not base_model.endswith("[1m]"):
+                return f"{base_model}[1m]"
+            return base_model
+
+    # Pass through unknown model names unchanged
+    return model
+
 
 def get_model_name_variants_for_lookup(model: str) -> list[str]:
     """

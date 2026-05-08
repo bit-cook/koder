@@ -1,6 +1,7 @@
 """Agent definitions and hooks for Koder."""
 
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,19 +22,51 @@ from rich.console import Console
 
 from ..auth.tool_utils import clean_json_schema
 from ..config import get_config
-from ..mcp import load_mcp_servers
-from ..tools.skill import SkillLoader
+from ..harness.agents.definitions import get_agent_definitions
+from ..harness.reasoning_display import normalize_reasoning_display_mode
+from ..mcp import MCPServerFactory, load_mcp_servers
+from ..tools.skill import build_skills_metadata_prompt, discover_merged_skills
 from ..utils.client import (
     LITELLM_RETRYABLE_ERRORS,
-    get_litellm_model_kwargs,
-    get_model_name,
-    is_native_openai_provider,
+    get_model_client_snapshot,
 )
 from ..utils.model_info import get_maximum_output_tokens, should_use_reasoning_param
 from ..utils.prompts import KODER_SYSTEM_PROMPT
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def _log_api_error_on_retry(details):
+    """Log user-friendly error messages before retry attempts.
+
+    Called by backoff decorator before each retry.
+    """
+    from ..agentic.api_errors import classify_api_error
+
+    exc_info = details.get("exception")
+    if exc_info is None:
+        return
+
+    # Extract status code if available
+    status_code = None
+    if hasattr(exc_info, "status_code"):
+        status_code = exc_info.status_code
+    elif hasattr(exc_info, "response") and hasattr(exc_info.response, "status_code"):
+        status_code = exc_info.response.status_code
+
+    classified = classify_api_error(exc_info, status_code=status_code)
+
+    # Log user-friendly message
+    if classified.should_retry:
+        logger.info(
+            "API error (will retry): %s [attempt %d/%d]",
+            classified.user_message,
+            details.get("tries", 0),
+            details.get("max_tries", 0),
+        )
+    else:
+        logger.error("API error (not retryable): %s", classified.user_message)
 
 
 class RetryingLitellmModel(LitellmModel):
@@ -171,6 +204,7 @@ class RetryingLitellmModel(LitellmModel):
         LITELLM_RETRYABLE_ERRORS,
         max_tries=3,
         jitter=backoff.full_jitter,
+        on_backoff=_log_api_error_on_retry,
     )
     async def get_response(
         self,
@@ -255,6 +289,7 @@ class RetryingLitellmModel(LitellmModel):
         LITELLM_RETRYABLE_ERRORS,
         max_tries=5,
         jitter=backoff.full_jitter,
+        on_backoff=_log_api_error_on_retry,
     )
     async def stream_response(
         self,
@@ -353,48 +388,103 @@ def _get_skills_metadata(config) -> str:
     Priority: project skills directory > user skills directory.
     Skills with the same name in project dir override user dir.
     """
+    if os.environ.get("KODER_SIMPLE") == "1":
+        return "Skills are disabled in bare mode."
     if not config.skills.enabled:
         return "Skills are disabled."
 
-    all_skills = {}
-
-    # Load user skills first (lower priority)
-    user_dir = Path(config.skills.user_skills_dir).expanduser()
-    if user_dir.exists():
-        user_loader = SkillLoader(user_dir)
-        for skill in user_loader.discover_skills():
-            all_skills[skill.name] = skill
-
-    # Load project skills (higher priority - overrides user skills)
-    project_dir = Path(config.skills.project_skills_dir)
-    if project_dir.exists():
-        project_loader = SkillLoader(project_dir)
-        for skill in project_loader.discover_skills():
-            all_skills[skill.name] = skill
+    all_skills = discover_merged_skills(
+        cwd=Path.cwd(),
+        user_dir=config.skills.user_skills_dir,
+        project_dir=config.skills.project_skills_dir,
+    )
 
     if not all_skills:
         return "No skills are currently available."
 
-    lines = ["Available skills:", ""]
-    for skill in sorted(all_skills.values(), key=lambda s: s.name.lower()):
-        description = skill.description.strip()
-        lines.append(f"- {skill.name}: {description}")
+    return build_skills_metadata_prompt(all_skills)
 
+
+def _get_agents_metadata() -> str:
+    if os.environ.get("KODER_SIMPLE") == "1":
+        return "Agents metadata is disabled in bare mode."
+    try:
+        definitions = get_agent_definitions(cwd=Path.cwd())
+    except Exception:
+        return "No agents are currently available."
+
+    if not definitions.active_agents:
+        return "No agents are currently available."
+
+    lines = ["Available agents:", ""]
+    for agent in sorted(definitions.active_agents, key=lambda item: item.agent_type.lower()):
+        lines.append(f"- {agent.agent_type}: {agent.when_to_use}")
     return "\n".join(lines)
 
 
-async def create_dev_agent(tools) -> Agent:
-    """Create the main development agent with MCP servers."""
+async def create_dev_agent(
+    tools,
+    *,
+    name: str = "Koder",
+    instructions_override: str | None = None,
+    instructions_append: str | None = None,
+    model_override: str | None = None,
+    extra_mcp_server_configs=None,
+) -> Agent:
+    """Create the main development agent or an overridden subagent with MCP servers."""
     config = get_config()
-    mcp_servers = await load_mcp_servers()
+    if os.environ.get("KODER_SIMPLE") == "1":
+        mcp_servers = []
+    else:
+        mcp_servers = await load_mcp_servers()
+    if extra_mcp_server_configs:
+        if MCPServerFactory is None:
+            raise RuntimeError("MCP transport dependencies are unavailable")
+        mcp_servers = [
+            *mcp_servers,
+            *await MCPServerFactory.create_servers_from_configs(extra_mcp_server_configs),
+        ]
 
-    # Determine the model to use: native OpenAI string or LitellmModel instance
-    if is_native_openai_provider():
+    # Populate ToolSearch deferred tools registry with all available tools.
+    # KODER_ENABLE_TOOL_SEARCH controls deferred loading behaviour:
+    #   unset/true  — MCP tools deferred (names only), discovered via ToolSearch
+    #   false       — all MCP tools loaded upfront, no deferral
+    #   auto        — threshold mode: upfront if ≤10% of context, deferred otherwise
+    #   auto:N      — threshold mode with custom % (e.g. auto:5)
+    from koder_agent.tools.tool_search import _set_deferred_tools
+
+    tool_search_mode = (
+        (
+            os.environ.get("KODER_ENABLE_TOOL_SEARCH")
+            or os.environ.get("ENABLE_TOOL_SEARCH")
+            or "true"
+        )
+        .strip()
+        .lower()
+    )
+
+    all_deferred = list(tools)  # Start with regular tools
+    for server in mcp_servers:
+        try:
+            server_tools = await server.list_tools()
+            all_deferred.extend(server_tools)
+        except Exception:
+            pass  # Server may not support list_tools or may not be connected yet
+    _set_deferred_tools(all_deferred if tool_search_mode != "false" else None)
+
+    model_override_value = None if model_override in (None, "", "inherit") else str(model_override)
+    model_client = get_model_client_snapshot(model_override_value)
+    effective_model_name = model_client["model_name"]
+
+    # Determine the model to use: native OpenAI string or LitellmModel instance.
+    resolved_extra_headers = None
+    if model_client["native_openai"]:
         # Use string model name for native OpenAI providers (handled by default client)
-        model = get_model_name()
+        model = effective_model_name
     else:
         # Use LitellmModel with explicit base_url and api_key
-        litellm_kwargs = get_litellm_model_kwargs()
+        litellm_kwargs = model_client["litellm_kwargs"]
+        resolved_extra_headers = litellm_kwargs.get("extra_headers")
         model = RetryingLitellmModel(
             model=litellm_kwargs["model"],
             base_url=litellm_kwargs["base_url"],
@@ -402,23 +492,45 @@ async def create_dev_agent(tools) -> Agent:
         )
 
     # Build model_settings with reasoning if configured
-    model_name_str = get_model_name()  # Always get string name for max_tokens lookup
+    model_name_str = effective_model_name
     model_settings = ModelSettings(
         metadata={"source": "koder"},
         max_tokens=get_maximum_output_tokens(model_name_str),
     )
-    # Only set reasoning parameter for native OpenAI providers
-    # LiteLLM-based providers (GitHub Copilot, Anthropic, etc.) don't support the Reasoning object
-    if config.model.reasoning_effort is not None and should_use_reasoning_param():
-        effort = None if config.model.reasoning_effort == "none" else config.model.reasoning_effort
-        model_settings.reasoning = Reasoning(effort=effort, summary="detailed")
+    reasoning_display = normalize_reasoning_display_mode(
+        os.environ.get("KODER_REASONING_DISPLAY")
+        or getattr(getattr(config, "harness", None), "reasoning_display", "off")
+    )
+    # Only set reasoning parameters for native OpenAI providers. LiteLLM-based providers
+    # can expose reasoning through their own deltas, but the OpenAI Reasoning object can
+    # cause schema validation errors when routed through LiteLLM.
+    if (
+        config.model.reasoning_effort is not None or reasoning_display != "off"
+    ) and should_use_reasoning_param():
+        reasoning_kwargs: dict[str, Any] = {"summary": "detailed"}
+        if config.model.reasoning_effort is not None:
+            reasoning_kwargs["effort"] = (
+                None if config.model.reasoning_effort == "none" else config.model.reasoning_effort
+            )
+        model_settings.reasoning = Reasoning(**reasoning_kwargs)
+    if resolved_extra_headers:
+        model_settings.extra_headers = dict(resolved_extra_headers)
 
     # Build system prompt with skills metadata (Progressive Disclosure Level 1)
     skills_metadata = _get_skills_metadata(config)
-    system_prompt = KODER_SYSTEM_PROMPT.replace("{SKILLS_METADATA}", skills_metadata)
+    agents_metadata = _get_agents_metadata()
+    system_prompt = (
+        instructions_override
+        if instructions_override is not None
+        else KODER_SYSTEM_PROMPT.replace("{SKILLS_METADATA}", skills_metadata).replace(
+            "{AGENTS_METADATA}", agents_metadata
+        )
+    )
+    if instructions_append:
+        system_prompt = f"{system_prompt.rstrip()}\n\n{instructions_append.strip()}"
 
     dev_agent = Agent(
-        name="Koder",
+        name=name,
         model=model,
         instructions=system_prompt,
         tools=tools,

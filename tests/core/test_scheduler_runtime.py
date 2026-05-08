@@ -1,0 +1,612 @@
+"""Tests for scheduler runtime wiring: tool call counting, auto-compact, session memory."""
+
+import inspect
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from koder_agent.harness.memory.auto_compact import AutoCompactManager
+from koder_agent.harness.memory.budget import estimate_messages_tokens
+from koder_agent.harness.memory.compact import CompactionResult
+from koder_agent.harness.memory.extraction import ExtractionResult
+from koder_agent.harness.memory.session_memory import SessionMemoryManager
+
+
+def test_streaming_output_does_not_clear_terminal_scrollback():
+    """Streaming turns must leave prior terminal history scrollable."""
+    from koder_agent.core.scheduler import AgentScheduler
+
+    source = inspect.getsource(AgentScheduler._handle_streaming)
+
+    assert "ClearScrollback" not in source
+    assert "\\033[3J" not in source
+    assert "ESC[3J" not in source
+
+
+def test_reasoning_stream_payload_respects_display_mode():
+    from koder_agent.core.scheduler import _reasoning_stream_payload
+
+    class Event:
+        type = "response.reasoning_summary_text.delta"
+        delta = "checking"
+        item_id = "rs_1"
+        output_index = 0
+        summary_index = 0
+
+    assert _reasoning_stream_payload(Event(), "off") is None
+
+    payload = _reasoning_stream_payload(Event(), "summary")
+
+    assert payload == {
+        "kind": "summary",
+        "text": "checking",
+        "done": False,
+        "item_id": "rs_1",
+        "output_index": 0,
+        "part_index": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_json_emits_reasoning_deltas_when_enabled(tmp_path, monkeypatch):
+    from agents import RawResponsesStreamEvent
+    from openai.types.responses.response_reasoning_summary_text_delta_event import (
+        ResponseReasoningSummaryTextDeltaEvent,
+    )
+    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("KODER_REASONING_DISPLAY", "summary")
+
+    class FakeResult:
+        final_output = "Visible answer."
+
+        async def stream_events(self):
+            yield RawResponsesStreamEvent(
+                data=ResponseReasoningSummaryTextDeltaEvent(
+                    delta="checking",
+                    item_id="rs_1",
+                    output_index=0,
+                    sequence_number=1,
+                    summary_index=0,
+                    type="response.reasoning_summary_text.delta",
+                )
+            )
+            yield RawResponsesStreamEvent(
+                data=ResponseTextDeltaEvent(
+                    content_index=0,
+                    delta="Visible answer.",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=1,
+                    sequence_number=2,
+                    type="response.output_text.delta",
+                )
+            )
+
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run_streamed", return_value=FakeResult()),
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.get_items = AsyncMock(return_value=[])
+        mock_session.db_path = ":memory:"
+        mock_session_cls.return_value = mock_session
+
+        from koder_agent.core.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(session_id="test-session")
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+        scheduler._refresh_magic_docs_after_turn = AsyncMock()
+        events = []
+
+        response = await scheduler.handle_stream_json(
+            "hello",
+            on_event=events.append,
+            include_partial_messages=True,
+        )
+
+    assert response == "Visible answer."
+    assert events[0]["event"]["delta"] == {
+        "type": "reasoning_summary_delta",
+        "text": "checking",
+    }
+    assert events[1]["event"]["delta"] == {
+        "type": "text_delta",
+        "text": "Visible answer.",
+    }
+
+
+class TestToolCallCounter:
+    """Verify _tool_call_count increments on tool output events."""
+
+    @pytest.fixture
+    def scheduler_with_mocks(self):
+        """Create a minimally patched AgentScheduler for testing."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test-session"
+            mock_session.get_items = AsyncMock(return_value=[])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test-session")
+            yield scheduler
+
+    def test_initial_tool_call_count_is_zero(self, scheduler_with_mocks):
+        assert scheduler_with_mocks._tool_call_count == 0
+
+    def test_tool_call_count_increments_directly(self, scheduler_with_mocks):
+        """Verify the counter attribute can be incremented (basic sanity)."""
+        scheduler_with_mocks._tool_call_count += 1
+        assert scheduler_with_mocks._tool_call_count == 1
+        scheduler_with_mocks._tool_call_count += 1
+        assert scheduler_with_mocks._tool_call_count == 2
+
+
+class TestMagicDocsRefresh:
+    """Verify Magic Docs refresh is wired after completed turns."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_magic_docs_after_turn_dispatches_best_effort_refresh(self, monkeypatch):
+        calls = []
+
+        def fake_refresh(user_input, response, *, cwd=None, **_kwargs):
+            calls.append((user_input, response, cwd))
+            return []
+
+        monkeypatch.setattr(
+            "koder_agent.harness.magic_docs.refresh_tracked_magic_docs",
+            fake_refresh,
+        )
+
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test-session"
+            mock_session.get_items = AsyncMock(return_value=[])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test-session")
+            await scheduler._refresh_magic_docs_after_turn("capture docs", "done")
+
+        assert calls
+        assert calls[0][0] == "capture docs"
+        assert calls[0][1] == "done"
+
+
+class TestAutoCompact:
+    """Verify auto-compaction is triggered and wired correctly."""
+
+    @pytest.fixture
+    def compact_manager(self):
+        """Create an AutoCompactManager with a low threshold for testing."""
+        return AutoCompactManager(context_window=50_000, max_output_tokens=10_000)
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compact_calls_llm_compact(self):
+        """Verify _run_auto_compact calls llm_compact_messages and rewrites history."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            # Set up session mock
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(
+                return_value=[
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi there"},
+                    {"role": "user", "content": "fix bug"},
+                    {"role": "assistant", "content": "done"},
+                ]
+            )
+            mock_session.clear_session = AsyncMock()
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            # Set up compact mock
+            mock_compact.return_value = CompactionResult(
+                summary="User greeted and asked to fix a bug.",
+                kept_messages=[
+                    {"role": "user", "content": "fix bug"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                token_count=100,
+                original_count=4,
+            )
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
+
+            # Mock add_items on the session (threshold bypass uses add_items)
+            mock_session.add_items = AsyncMock()
+            mock_session.summarization_threshold = None
+
+            await scheduler._run_auto_compact()
+
+            # Verify compaction was called
+            mock_compact.assert_called_once()
+            # Verify session was cleared then repopulated
+            mock_session.clear_session.assert_called_once()
+            mock_session.add_items.assert_called_once()
+            # Verify the compacted items include summary + kept messages
+            added_items = mock_session.add_items.call_args[0][0]
+            assert added_items[0]["content"].startswith("[Conversation compacted]")
+            assert len(added_items) == 3  # summary + 2 kept messages
+            # Verify circuit breaker success was recorded
+            assert scheduler._auto_compact._consecutive_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compact_refreshes_context_tokens_after_persist(self):
+        """Verify auto-compact updates status-line context tokens after rewriting history."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(
+                return_value=[
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "old answer"},
+                    {"role": "user", "content": "latest"},
+                    {"role": "assistant", "content": "latest answer"},
+                ]
+            )
+            mock_session.clear_session = AsyncMock()
+            mock_session.add_items = AsyncMock()
+            mock_session.summarization_threshold = None
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+            mock_compact.return_value = CompactionResult(
+                summary="Old turns summarized.",
+                kept_messages=[
+                    {"role": "user", "content": "latest"},
+                    {"role": "assistant", "content": "latest answer"},
+                ],
+                token_count=100,
+                original_count=4,
+            )
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
+            scheduler._estimate_static_context_tokens = MagicMock(return_value=17)
+
+            await scheduler._run_auto_compact()
+
+            compacted_items = mock_session.add_items.call_args[0][0]
+            expected = 17 + estimate_messages_tokens(compacted_items)
+            assert scheduler.usage_tracker.session_usage.current_context_tokens == expected
+
+    @pytest.mark.asyncio
+    async def test_repair_unreplayable_session_items_drops_unknown_role(self):
+        """Verify old poisoned compact output is removed before the next SDK run."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        ):
+            valid_item = {"role": "user", "content": "hello"}
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(
+                return_value=[valid_item, {"role": "unknown", "content": ""}]
+            )
+            mock_session.clear_session = AsyncMock()
+            mock_session.add_items = AsyncMock()
+            mock_session.summarization_threshold = None
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._estimate_static_context_tokens = MagicMock(return_value=0)
+
+            await scheduler._repair_unreplayable_session_items()
+
+            mock_session.clear_session.assert_called_once()
+            mock_session.add_items.assert_called_once_with([valid_item])
+            assert scheduler.usage_tracker.session_usage.current_context_tokens == (
+                estimate_messages_tokens([valid_item])
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compact_records_failure_on_error(self):
+        """Verify failure is recorded when llm_compact_messages raises."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch(
+                "koder_agent.core.scheduler.llm_compact_messages",
+                side_effect=RuntimeError("LLM unavailable"),
+            ),
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
+
+            await scheduler._run_auto_compact()
+
+            # Verify failure was recorded
+            assert scheduler._auto_compact._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compact_records_failure_on_no_summary(self):
+        """Verify failure is recorded when compaction returns no summary."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            mock_compact.return_value = CompactionResult(
+                summary=None,
+                kept_messages=[{"role": "user", "content": "hello"}],
+                token_count=10,
+                original_count=1,
+            )
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
+
+            await scheduler._run_auto_compact()
+
+            assert scheduler._auto_compact._consecutive_failures == 1
+
+
+class TestSessionMemoryExtraction:
+    """Verify session memory extraction is triggered and wired correctly."""
+
+    @pytest.mark.asyncio
+    async def test_run_session_memory_extraction_calls_llm(self):
+        """Verify extraction calls llm_extract_memories and persists results."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.llm_extract_memories") as mock_extract,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(
+                return_value=[
+                    {"role": "user", "content": "I prefer dark mode"},
+                    {"role": "assistant", "content": "Noted."},
+                ]
+            )
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            mock_extract.return_value = ExtractionResult(
+                memories=[
+                    {"type": "user", "content": "User prefers dark mode"},
+                ],
+                errors=[],
+            )
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+
+            # Mock the session memory manager to avoid filesystem operations
+            scheduler._session_memory = MagicMock(spec=SessionMemoryManager)
+            scheduler._session_memory.ensure_notes_file.return_value = "/tmp/test_notes.md"
+            scheduler._session_memory.record_extraction = MagicMock()
+
+            mock_open = MagicMock()
+            with patch("builtins.open", mock_open):
+                await scheduler._run_session_memory_extraction(
+                    context_tokens=15_000, tool_call_count=5
+                )
+
+            mock_extract.assert_called_once()
+            scheduler._session_memory.record_extraction.assert_called_once_with(15_000, 5)
+
+    @pytest.mark.asyncio
+    async def test_run_session_memory_extraction_handles_errors_gracefully(self):
+        """Verify extraction failure is caught and extraction is still recorded."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch(
+                "koder_agent.core.scheduler.llm_extract_memories",
+                side_effect=RuntimeError("LLM down"),
+            ),
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._session_memory = MagicMock(spec=SessionMemoryManager)
+            scheduler._session_memory.record_extraction = MagicMock()
+
+            # Should not raise
+            await scheduler._run_session_memory_extraction(
+                context_tokens=20_000, tool_call_count=10
+            )
+
+            # Extraction should still be recorded to avoid immediate retry
+            scheduler._session_memory.record_extraction.assert_called_once_with(20_000, 10)
+
+    @pytest.mark.asyncio
+    async def test_run_session_memory_extraction_skips_empty_history(self):
+        """Verify extraction is skipped when session has no messages."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.llm_extract_memories") as mock_extract,
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+
+            await scheduler._run_session_memory_extraction(context_tokens=15_000, tool_call_count=5)
+
+            # LLM should not be called for empty history
+            mock_extract.assert_not_called()
+
+
+class TestCaptureUsageIntegration:
+    """Verify _capture_usage triggers compaction and extraction at the right thresholds."""
+
+    @pytest.mark.asyncio
+    async def test_capture_usage_triggers_auto_compact(self):
+        """Verify that _capture_usage calls _run_auto_compact when threshold is met."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.get_model_name", return_value="gpt-4o"),
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+
+            # Set up auto-compact with a very low threshold
+            scheduler._auto_compact = AutoCompactManager(context_window=1000, max_output_tokens=100)
+            # Threshold will be (1000 - 100) - 13000 = negative, so ANY tokens should trigger
+            # Actually with a small context window the threshold is negative.
+            # Let's use a realistic scenario instead:
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=100_000, max_output_tokens=10_000
+            )
+            # Threshold = (100000 - 10000) - 13000 = 77000
+
+            # Mock the actual compact method
+            scheduler._run_auto_compact = AsyncMock()
+            scheduler._run_session_memory_extraction = AsyncMock()
+
+            # Create a mock result with usage exceeding the threshold
+            mock_result = MagicMock()
+            mock_result.context_wrapper.usage.input_tokens = 70_000
+            mock_result.context_wrapper.usage.output_tokens = 5_000
+            usage_entry = MagicMock()
+            usage_entry.total_tokens = 80_000  # Above 77000 threshold
+            mock_result.context_wrapper.usage.request_usage_entries = [usage_entry]
+
+            await scheduler._capture_usage(mock_result)
+
+            scheduler._run_auto_compact.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_capture_usage_triggers_session_memory(self):
+        """Verify that _capture_usage triggers extraction when conditions are met."""
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+            patch("koder_agent.core.scheduler.get_model_name", return_value="gpt-4o"),
+        ):
+            mock_session = AsyncMock()
+            mock_session.session_id = "test"
+            mock_session.get_items = AsyncMock(return_value=[])
+            mock_session.db_path = ":memory:"
+            mock_session_cls.return_value = mock_session
+
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+
+            # No auto-compact manager to avoid that path
+            scheduler._auto_compact = None
+
+            # Set tool call count high enough
+            scheduler._tool_call_count = 5
+
+            # Mock the extraction method
+            scheduler._run_session_memory_extraction = AsyncMock()
+
+            # Create a mock result with enough tokens to trigger extraction (>= 10000)
+            mock_result = MagicMock()
+            mock_result.context_wrapper.usage.input_tokens = 8_000
+            mock_result.context_wrapper.usage.output_tokens = 3_000
+            usage_entry = MagicMock()
+            usage_entry.total_tokens = 11_000
+            mock_result.context_wrapper.usage.request_usage_entries = [usage_entry]
+
+            await scheduler._capture_usage(mock_result)
+
+            scheduler._run_session_memory_extraction.assert_called_once_with(11_000, 5)

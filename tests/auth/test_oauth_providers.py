@@ -234,7 +234,7 @@ class TestClaudeOAuthProvider:
 
     @pytest.mark.asyncio
     async def test_exchange_code_success(self):
-        """Test successful Claude code exchange."""
+        """Test successful authorization code exchange."""
         provider = ClaudeOAuthProvider()
 
         mock_response = {

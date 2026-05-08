@@ -1,0 +1,11 @@
+{
+  "messages": [
+    {"role": "system", "content": "You are Koder."},
+    {"role": "user", "content": "Open the failing test suite."},
+    {"role": "assistant", "content": "Inspecting the repo and collecting failures."},
+    {"role": "tool", "content": "pytest output: 3 failures"},
+    {"role": "user", "content": "Patch the regression and re-run tests."},
+    {"role": "assistant", "content": "Applying the patch and running focused verification."},
+    {"role": "tool", "content": "pytest output: all green"}
+  ]
+}

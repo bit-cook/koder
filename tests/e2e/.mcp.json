@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "test-channel": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "../..",
+        "python",
+        "test_channel_server.py"
+      ],
+      "env": {
+        "CHANNEL_PORT": "18787"
+      }
+    }
+  }
+}

@@ -26,10 +26,10 @@ from koder_agent.auth.constants import (
     ANTHROPIC_BETA_HEADERS,
     ANTHROPIC_CLIENT_ID,
     ANTHROPIC_CREATE_API_KEY_URL,
+    ANTHROPIC_OAUTH_SYSTEM_PREFIX,
     ANTHROPIC_REDIRECT_URI,
     ANTHROPIC_SCOPES,
     ANTHROPIC_TOKEN_URL,
-    CLAUDE_CODE_SYSTEM_PREFIX,
 )
 from koder_agent.auth.tool_utils import merge_optional_params
 
@@ -273,8 +273,8 @@ class ClaudeOAuthLLM(CustomLLM):
     """Custom LiteLLM handler for Claude/Anthropic OAuth access.
 
     Uses Anthropic API with Bearer token authentication. Claude Pro/Max OAuth
-    requires the system field as an array of content blocks with the Claude Code
-    identification string as the first block.
+    requires the system field as an array of content blocks with the vendor
+    identity string as the first block.
     """
 
     def __init__(self):
@@ -407,13 +407,15 @@ class ClaudeOAuthLLM(CustomLLM):
             model_name = model.split("/")[-1]
 
         # Build system prompt as array of content blocks (required for Claude OAuth)
-        system_blocks: List[Dict[str, str]] = [{"type": "text", "text": CLAUDE_CODE_SYSTEM_PREFIX}]
+        system_blocks: List[Dict[str, str]] = [
+            {"type": "text", "text": ANTHROPIC_OAUTH_SYSTEM_PREFIX}
+        ]
 
         for part in system_parts:
-            if part.strip() == CLAUDE_CODE_SYSTEM_PREFIX.strip():
+            if part.strip() == ANTHROPIC_OAUTH_SYSTEM_PREFIX.strip():
                 continue
-            if part.startswith(CLAUDE_CODE_SYSTEM_PREFIX):
-                remainder = part[len(CLAUDE_CODE_SYSTEM_PREFIX) :].strip()
+            if part.startswith(ANTHROPIC_OAUTH_SYSTEM_PREFIX):
+                remainder = part[len(ANTHROPIC_OAUTH_SYSTEM_PREFIX) :].strip()
                 if remainder:
                     system_blocks.append({"type": "text", "text": remainder})
             else:

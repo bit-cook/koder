@@ -1,29 +1,24 @@
 """Task delegation operations."""
 
 import asyncio
-import uuid
+from pathlib import Path
 from typing import List, Union
 
-from agents import Agent, ModelSettings, RunConfig, Runner, function_tool
-from openai.types.shared import Reasoning
+from agents import RunConfig, Runner, function_tool
 from pydantic import BaseModel
-
-from ..config import get_config
-from ..mcp import load_mcp_servers
-from ..utils import get_model_name
 
 
 class TaskModel(BaseModel):
     description: str
     prompt: str
+    agent_type: str | None = None
 
 
 class TaskDelegateModel(BaseModel):
     tasks: Union[List[TaskModel], TaskModel]
 
 
-@function_tool
-async def task_delegate(tasks: Union[List[TaskModel], TaskModel]) -> str:
+async def _task_delegate_impl(tasks: Union[List[TaskModel], TaskModel]) -> str:
     """
     Delegate one or more tasks to specialized agents and return the aggregated results.
     If multiple tasks are provided, they will be run in parallel.
@@ -35,53 +30,61 @@ async def task_delegate(tasks: Union[List[TaskModel], TaskModel]) -> str:
         else:
             task_list = tasks
 
-        config = get_config()
-        mcp_servers = await load_mcp_servers()
-
-        # Import tools dynamically to avoid circular imports
-        from ..agentic import get_display_hooks
-        from . import get_all_tools
-
         async def run_single_task(task: TaskModel) -> tuple[str, str]:
             """Run a single task and return (description, result)."""
             try:
+                from ..agentic import create_dev_agent, get_display_hooks
+                from ..harness.agents.definitions import (
+                    build_agent_system_prompt,
+                    filter_tools_for_agent_definition,
+                    get_agent_definitions,
+                    resolve_agent_mcp_server_configs,
+                    resolve_agent_model,
+                )
+                from . import get_all_tools
+
+                agent_definitions = get_agent_definitions(cwd=Path.cwd())
+                selected_agent = None
+                if task.agent_type:
+                    selected_agent = next(
+                        (
+                            agent
+                            for agent in agent_definitions.active_agents
+                            if agent.agent_type == task.agent_type
+                        ),
+                        None,
+                    )
+                    if selected_agent is None:
+                        return task.description, f"Error: unknown agent type {task.agent_type}"
+
                 tools = get_all_tools()
-                # remove task_delegate tool
                 tools = [tool for tool in tools if tool.name != "task_delegate"]
+                if selected_agent is not None:
+                    tools = filter_tools_for_agent_definition(selected_agent, tools)
 
-                # Build model_settings with reasoning if configured
-                # Only set reasoning parameter for native OpenAI providers
-                # LiteLLM-based providers (GitHub Copilot, Anthropic, etc.) don't support it
-                from ..utils.model_info import should_use_reasoning_param
-
-                model_settings = ModelSettings()
-                if config.model.reasoning_effort is not None and should_use_reasoning_param():
-                    model_settings.reasoning = Reasoning(effort=config.model.reasoning_effort)
-
-                # Create agent for the delegated task
-                delegated_agent = Agent(
-                    name=f"Delegated Agent - {task.description[:30]}...",
-                    model=get_model_name(),
-                    instructions=f"""You are a task agent handling this task: {task.description}
+                delegated_agent = await create_dev_agent(
+                    tools,
+                    name=(
+                        selected_agent.agent_type
+                        if selected_agent
+                        else f"Delegated Agent - {task.description[:30]}..."
+                    ),
+                    instructions_override=(
+                        build_agent_system_prompt(selected_agent, cwd=Path.cwd())
+                        if selected_agent is not None
+                        else f"""You are a task agent handling this task: {task.description}
 
 You have access to tools to help complete this task effectively.
 Be concise and focused on the specific task at hand.
-Return your findings or results directly without unnecessary explanation.""",
-                    tools=tools,
-                    mcp_servers=mcp_servers,
-                    model_settings=model_settings,
+Return your findings or results directly without unnecessary explanation."""
+                    ),
+                    model_override=resolve_agent_model(selected_agent),
+                    extra_mcp_server_configs=(
+                        resolve_agent_mcp_server_configs(selected_agent)
+                        if selected_agent is not None
+                        else None
+                    ),
                 )
-                if "github_copilot" in get_model_name():
-                    delegated_agent.model_settings.extra_headers = {
-                        "copilot-integration-id": "vscode-chat",
-                        "editor-version": "vscode/1.98.1",
-                        "editor-plugin-version": "copilot-chat/0.26.7",
-                        "user-agent": "GitHubCopilotChat/0.26.7",
-                        "openai-intent": "conversation-panel",
-                        "x-github-api-version": "2025-04-01",
-                        "x-request-id": str(uuid.uuid4()),
-                        "x-vscode-user-agent-library-version": "electron-fetch",
-                    }
 
                 # Run the delegated agent
                 result = await Runner.run(
@@ -115,3 +118,8 @@ Return your findings or results directly without unnecessary explanation.""",
     except Exception as e:
         error_msg = f"Error delegating tasks: {e}"
         return error_msg
+
+
+@function_tool
+async def task_delegate(tasks: Union[List[TaskModel], TaskModel]) -> str:
+    return await _task_delegate_impl(tasks)

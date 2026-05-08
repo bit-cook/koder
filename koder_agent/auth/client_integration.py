@@ -230,3 +230,10 @@ def map_provider_to_oauth(model_provider: str) -> Optional[str]:
     oauth_providers = {"google", "claude", "chatgpt", "antigravity"}
     provider = model_provider.strip().lower()
     return provider if provider in oauth_providers else None
+
+
+def list_oauth_provider_ids() -> list[str]:
+    """Return the supported OAuth provider IDs from the current auth runtime."""
+    from koder_agent.auth.providers import list_providers
+
+    return list_providers()

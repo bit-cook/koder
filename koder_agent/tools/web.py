@@ -67,7 +67,15 @@ def web_search(query: str, max_results: int = 3) -> str:
 
 @function_tool
 def web_fetch(url: str, prompt: str) -> str:
-    """Fetch content from a URL and process with a prompt."""
+    """Fetch content from a URL and optionally filter/contextualize with a prompt.
+
+    Args:
+        url: The URL to fetch
+        prompt: Optional context for what to extract from the page
+
+    Returns:
+        Page content, optionally contextualized by the prompt
+    """
     try:
         # Validate URL
         parsed = urlparse(url)
@@ -114,11 +122,11 @@ def web_fetch(url: str, prompt: str) -> str:
             if len(text) > 50000:
                 text = text[:50000] + "\n... (truncated)"
 
-        # Simple prompt processing (in real implementation, this would use an AI model)
-        result = f"URL: {url}\n\n"
-        result += f"Content Type: {content_type}\n\n"
-        result += f"Prompt: {prompt}\n\n"
-        result += f"Content Preview:\n{text[:1000]}..."
+        # Build result with prompt context if provided
+        if prompt and prompt.strip():
+            result = f"Fetched {url} (context: {prompt})\n\n{text}"
+        else:
+            result = f"Fetched {url}\n\n{text}"
 
         return result
 

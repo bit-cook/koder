@@ -1,6 +1,7 @@
+import asyncio
 import copy
 
-from koder_agent.agentic.agent import RetryingLitellmModel
+from koder_agent.agentic.agent import RetryingLitellmModel, create_dev_agent
 
 _MISSING = object()
 
@@ -97,3 +98,63 @@ def test_clean_tools_handles_empty_list():
 
     assert result is tools
     assert result == []
+
+
+def test_create_dev_agent_uses_model_client_snapshot_for_litellm(monkeypatch):
+    seen = {}
+
+    def fake_snapshot(model_override):
+        seen["model_override"] = model_override
+        return {
+            "model_name": "litellm/claude/claude-sonnet-4-6",
+            "api_key": "oauth-access-token",
+            "base_url": None,
+            "native_openai": False,
+            "litellm_kwargs": {
+                "model": "claude/claude-sonnet-4-6",
+                "api_key": "oauth-access-token",
+                "base_url": None,
+                "extra_headers": {"x-oauth-provider": "claude"},
+            },
+        }
+
+    monkeypatch.setenv("KODER_SIMPLE", "1")
+    monkeypatch.setattr("koder_agent.agentic.agent.get_model_client_snapshot", fake_snapshot)
+
+    agent = asyncio.run(create_dev_agent([], model_override="inherit"))
+
+    assert seen["model_override"] is None
+    assert isinstance(agent.model, RetryingLitellmModel)
+    assert agent.model.model == "claude/claude-sonnet-4-6"
+    assert agent.model.api_key == "oauth-access-token"
+    assert agent.model_settings.extra_headers == {"x-oauth-provider": "claude"}
+
+
+def test_create_dev_agent_requests_reasoning_summary_when_display_enabled(monkeypatch):
+    from koder_agent.harness.config.schema import RuntimeConfig
+
+    config = RuntimeConfig()
+    config.model.name = "gpt-5"
+    config.model.provider = "openai"
+    config.harness.reasoning_display = "summary"
+
+    def fake_snapshot(_model_override):
+        return {
+            "model_name": "gpt-5",
+            "api_key": "sk-test",
+            "base_url": None,
+            "native_openai": True,
+            "litellm_kwargs": {},
+        }
+
+    monkeypatch.setenv("KODER_SIMPLE", "1")
+    monkeypatch.delenv("KODER_REASONING_DISPLAY", raising=False)
+    monkeypatch.setattr("koder_agent.agentic.agent.get_config", lambda: config)
+    monkeypatch.setattr("koder_agent.agentic.agent.get_model_client_snapshot", fake_snapshot)
+    monkeypatch.setattr("koder_agent.agentic.agent.should_use_reasoning_param", lambda: True)
+
+    agent = asyncio.run(create_dev_agent([]))
+
+    assert agent.model == "gpt-5"
+    assert agent.model_settings.reasoning.summary == "detailed"
+    assert agent.model_settings.reasoning.effort is None

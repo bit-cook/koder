@@ -10,14 +10,19 @@ Koder supports flexible configuration through three mechanisms (in order of prio
 
 - [Config File](#config-file)
 - [Environment Variables](#environment-variables)
+- [Settings Bundles](#settings-bundles)
+- [Managed Settings](#managed-settings)
 - [Provider Setup](#provider-setup)
 - [MCP Servers](#mcp-servers)
 - [Skills](#skills)
+- [Voice Mode](#voice-mode)
 - [Example Configurations](#example-configurations)
 
 ## Config File
 
 Koder uses a YAML config file at `~/.koder/config.yaml` for persistent settings.
+
+The `koder` executable enters through the product runtime entrypoint with config at `~/.koder/config.yaml`.
 
 ```yaml
 # ~/.koder/config.yaml
@@ -39,7 +44,32 @@ cli:
 
 # MCP servers for extended functionality
 mcp_servers: []
+
+# Voice dictation
+voice:
+  enabled: false               # Enable interactive voice dictation
+  provider: null               # openai, chatgpt, google, gemini, azure
+  model: null                  # Optional transcription model override
+  api_key: null                # Optional voice-specific API key
+  base_url: null               # Optional voice-specific base URL
+  api_version: null            # Optional API version (currently Azure)
+
+# Runtime harness settings
+harness:
+  reasoning_display: "off"     # off, summary, or full (default: off)
 ```
+
+## Voice Mode
+
+Voice dictation is configured with top-level `voice.*` settings in `~/.koder/config.yaml`.
+
+See [Voice Mode](voice-mode.md) for:
+
+- interactive usage
+- `/voice` commands
+- provider-specific configuration
+- Azure OpenAI examples
+- troubleshooting
 
 ## Environment Variables
 
@@ -53,6 +83,7 @@ These `KODER_*` variables work with any provider and override provider-specific 
 | `KODER_BASE_URL` | Custom API endpoint | `http://localhost:8080/v1` |
 | `KODER_MODEL` | Model selection | `gpt-4o`, `claude-opus-4-20250514` |
 | `KODER_REASONING_EFFORT` | Reasoning effort for reasoning models | `medium`, `high`, `low` |
+| `KODER_REASONING_DISPLAY` | Reasoning display mode | `off`, `summary`, `full` |
 | `EDITOR` | Editor for `koder config edit` | `vim`, `code` |
 
 **Priority:** `KODER_API_KEY` and `KODER_BASE_URL` override provider-specific variables (like `OPENAI_API_KEY`) and config file settings.
@@ -75,6 +106,31 @@ Use these if you need different keys for different providers:
 | Mistral | `MISTRAL_API_KEY` | - |
 | Cohere | `COHERE_API_KEY` | - |
 | Bedrock | `AWS_ACCESS_KEY_ID` | `AWS_SECRET_ACCESS_KEY` |
+
+## Settings Bundles
+
+Koder can export and import a local settings bundle for machine-to-machine setup or backup. Bundles include known Koder config, settings, keybindings, user memories, project memories, and project session notes. Token stores, model caches, transcripts, task records, plugin caches, and arbitrary files are not included.
+
+```bash
+koder config export ~/koder-settings.json
+koder config export ~/koder-project-settings.json --scope project
+koder config import ~/koder-settings.json --dry-run
+koder config import ~/koder-settings.json
+```
+
+Export and import scopes are `all`, `user`, and `project`. Import writes into the current `HOME` and current project, validates checksums, rejects unsafe relative paths, and creates timestamped backups before replacing existing files.
+
+## Managed Settings
+
+Koder reads an optional local managed policy file at `~/.koder/managed-settings.json`. It can define high-priority hook settings and sandbox policy keys such as `enabled`, `autoAllowBashIfSandboxed`, and `allowUnsandboxedCommands`.
+
+```bash
+koder /managed-settings
+koder /hooks
+koder /sandbox-toggle status
+```
+
+Managed settings are local files. Koder does not fetch a hosted managed-settings service, and `/managed-settings` only inspects the local policy file currently present on disk.
 
 ## Provider Setup
 
@@ -198,6 +254,15 @@ export OPENAI_BASE_URL="https://your-custom-endpoint.com/v1"
 export KODER_MODEL="openai/your-model-name"
 
 koder
+```
+
+Koder vendors LiteLLM's `model_prices_and_context_window.json` under
+`koder_agent/data/` and forces LiteLLM's local cost-map mode at startup. This avoids
+runtime fetches from GitHub when LiteLLM imports. Before publishing a release, refresh
+the vendored map with:
+
+```bash
+uv run scripts/update_litellm_model_cost_map.py
 ```
 
 ## MCP Servers

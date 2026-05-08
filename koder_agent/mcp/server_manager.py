@@ -1,31 +1,73 @@
-"""MCP server configuration management using YAML config file."""
+"""MCP server configuration management across user, local, and project scopes."""
+
+from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
 import aiosqlite
 
-from ..config import MCPServerConfigYaml, get_config_manager
-from .server_config import MCPServerConfig, MCPServerType
+from ..config import MCPLocalProjectConfigYaml, MCPServerConfigYaml, get_config_manager
+from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
+
+_PROJECT_MCP_FILENAME = ".mcp.json"
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 
 
 class MCPServerManager:
-    """Manages MCP server configurations in the YAML config file."""
+    """Manages MCP server configurations in runtime-owned config files."""
 
     def __init__(self):
-        """Initialize the MCP server manager."""
         self.config_manager = get_config_manager()
         self._migration_lock = asyncio.Lock()
         self._migration_completed = False
 
     @staticmethod
     def _legacy_db_path() -> Path:
-        """Path to the legacy SQLite database."""
         return Path.home() / ".koder" / "koder.db"
 
+    @staticmethod
+    def _cwd_path(cwd: str | Path | None = None) -> Path:
+        return Path(cwd or os.getcwd()).resolve()
+
+    @staticmethod
+    def _project_config_path(cwd: str | Path | None = None) -> Path:
+        return MCPServerManager._cwd_path(cwd) / _PROJECT_MCP_FILENAME
+
+    @staticmethod
+    def _normalize_scope(scope: MCPServerScope | str | None) -> MCPServerScope:
+        if scope is None:
+            return MCPServerScope.LOCAL
+        if isinstance(scope, MCPServerScope):
+            return scope
+        return MCPServerScope(scope)
+
+    @staticmethod
+    def _scope_source_path(scope: MCPServerScope, cwd: str | Path | None = None) -> str:
+        if scope == MCPServerScope.PROJECT:
+            return str(MCPServerManager._project_config_path(cwd))
+        return str(get_config_manager().config_path)
+
+    @staticmethod
+    def _project_candidate_paths(cwd: str | Path | None = None) -> list[Path]:
+        root = MCPServerManager._cwd_path(cwd)
+        candidates = [root, *root.parents]
+        candidates.reverse()
+        return [candidate / _PROJECT_MCP_FILENAME for candidate in candidates]
+
+    @staticmethod
+    def _path_contains(parent: Path, child: Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
     async def _ensure_legacy_migration(self) -> None:
-        """Import MCP servers from the legacy SQLite database if needed."""
         if self._migration_completed:
             return
 
@@ -51,7 +93,6 @@ class MCPServerManager:
                     data_cursor = await conn.execute("SELECT * FROM mcp_servers")
                     rows = await data_cursor.fetchall()
             except Exception:
-                # If we cannot read the legacy DB, skip migration silently
                 self._migration_completed = True
                 return
 
@@ -79,15 +120,13 @@ class MCPServerManager:
 
             self._migration_completed = True
 
-    def _yaml_to_mcp_config(self, yaml_config: MCPServerConfigYaml) -> MCPServerConfig:
-        """Convert YAML config model to MCPServerConfig.
-
-        Args:
-            yaml_config: The YAML configuration model.
-
-        Returns:
-            MCPServerConfig instance.
-        """
+    def _yaml_to_mcp_config(
+        self,
+        yaml_config: MCPServerConfigYaml,
+        *,
+        scope: MCPServerScope | None = None,
+        source_path: str | None = None,
+    ) -> MCPServerConfig:
         return MCPServerConfig(
             name=yaml_config.name,
             transport_type=MCPServerType(yaml_config.transport_type),
@@ -99,17 +138,11 @@ class MCPServerManager:
             cache_tools_list=yaml_config.cache_tools_list,
             allowed_tools=yaml_config.allowed_tools,
             blocked_tools=yaml_config.blocked_tools,
+            scope=scope,
+            source_path=source_path,
         )
 
     def _mcp_config_to_yaml(self, config: MCPServerConfig) -> MCPServerConfigYaml:
-        """Convert MCPServerConfig to YAML config model.
-
-        Args:
-            config: The MCPServerConfig instance.
-
-        Returns:
-            MCPServerConfigYaml instance.
-        """
         return MCPServerConfigYaml(
             name=config.name,
             transport_type=config.transport_type.value,
@@ -123,109 +156,349 @@ class MCPServerManager:
             blocked_tools=config.blocked_tools,
         )
 
-    async def add_server(self, config: MCPServerConfig) -> None:
-        """Add a new MCP server configuration.
-
-        Args:
-            config: The server configuration to add.
-        """
-        await self._ensure_legacy_migration()
+    def _local_scope_entry(
+        self,
+        cwd: str | Path | None,
+        *,
+        create: bool = False,
+    ) -> MCPLocalProjectConfigYaml | None:
         koder_config = self.config_manager.load()
-        yaml_config = self._mcp_config_to_yaml(config)
-        koder_config.mcp_servers.append(yaml_config)
-        self.config_manager.save(koder_config)
+        project_root = str(self._cwd_path(cwd))
+        for entry in koder_config.mcp_local_projects:
+            if Path(entry.project_root).resolve() == Path(project_root):
+                return entry
+        if not create:
+            return None
+        entry = MCPLocalProjectConfigYaml(project_root=project_root, servers=[])
+        koder_config.mcp_local_projects.append(entry)
+        return entry
 
-    async def get_server(self, name: str) -> Optional[MCPServerConfig]:
-        """Get an MCP server configuration by name.
-
-        Args:
-            name: The server name to look up.
-
-        Returns:
-            MCPServerConfig if found, None otherwise.
-        """
-        await self._ensure_legacy_migration()
+    def _load_user_servers(self) -> dict[str, MCPServerConfig]:
         koder_config = self.config_manager.load()
-        for server in koder_config.mcp_servers:
-            if server.name == name:
-                return self._yaml_to_mcp_config(server)
-        return None
+        return {
+            server.name: self._yaml_to_mcp_config(
+                server,
+                scope=MCPServerScope.USER,
+                source_path=str(self.config_manager.config_path),
+            )
+            for server in koder_config.mcp_servers
+        }
 
-    async def list_servers(self) -> List[MCPServerConfig]:
-        """List all MCP server configurations.
-
-        Returns:
-            List of all configured MCP servers.
-        """
-        await self._ensure_legacy_migration()
+    def _load_local_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
         koder_config = self.config_manager.load()
-        return [self._yaml_to_mcp_config(s) for s in koder_config.mcp_servers]
+        cwd_path = self._cwd_path(cwd)
+        matching_entries = [
+            entry
+            for entry in koder_config.mcp_local_projects
+            if self._path_contains(Path(entry.project_root).resolve(), cwd_path)
+        ]
+        matching_entries.sort(key=lambda entry: len(Path(entry.project_root).parts))
 
-    async def update_server(self, config: MCPServerConfig) -> bool:
-        """Update an existing MCP server configuration.
+        servers: dict[str, MCPServerConfig] = {}
+        for entry in matching_entries:
+            for server in entry.servers:
+                servers[server.name] = self._yaml_to_mcp_config(
+                    server,
+                    scope=MCPServerScope.LOCAL,
+                    source_path=str(self.config_manager.config_path),
+                )
+        return servers
 
-        Args:
-            config: The updated server configuration.
+    @staticmethod
+    def _expand_env_string(value: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            default = match.group(2)
+            resolved = os.environ.get(name)
+            if resolved is not None:
+                return resolved
+            if default is not None:
+                return default
+            raise ValueError(f"Missing required environment variable: {name}")
 
-        Returns:
-            True if server was found and updated, False otherwise.
-        """
+        return _ENV_VAR_PATTERN.sub(_replace, value)
+
+    @classmethod
+    def _expand_env_data(cls, value):
+        if isinstance(value, str):
+            return cls._expand_env_string(value)
+        if isinstance(value, list):
+            return [cls._expand_env_data(item) for item in value]
+        if isinstance(value, dict):
+            return {key: cls._expand_env_data(item) for key, item in value.items()}
+        return value
+
+    def _config_from_mapping(
+        self,
+        name: str,
+        mapping: dict,
+        *,
+        scope: MCPServerScope,
+        source_path: str,
+        expand_env: bool,
+    ) -> MCPServerConfig:
+        raw = self._expand_env_data(mapping) if expand_env else mapping
+        transport = raw.get("type")
+        if transport is None:
+            if raw.get("command"):
+                transport = MCPServerType.STDIO.value
+            elif raw.get("url"):
+                transport = MCPServerType.HTTP.value
+        if transport is None:
+            raise ValueError(f"MCP server '{name}' is missing a transport type")
+
+        return MCPServerConfig(
+            name=name,
+            transport_type=MCPServerType(transport),
+            command=raw.get("command"),
+            args=raw.get("args") or [],
+            env_vars=raw.get("env") or raw.get("env_vars") or {},
+            url=raw.get("url"),
+            headers=raw.get("headers") or {},
+            headers_helper=raw.get("headersHelper") or raw.get("headers_helper"),
+            oauth=raw.get("oauth"),
+            cache_tools_list=bool(
+                raw.get("cacheToolsList") or raw.get("cache_tools_list") or False
+            ),
+            allowed_tools=raw.get("allowedTools") or raw.get("allowed_tools"),
+            blocked_tools=raw.get("blockedTools") or raw.get("blocked_tools"),
+            scope=scope,
+            source_path=source_path,
+        )
+
+    def _read_project_config(self, path: Path) -> dict:
+        if not path.exists():
+            return {"mcpServers": {}}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid MCP config at {path}: expected an object")
+        raw_servers = raw.get("mcpServers")
+        if raw_servers is None:
+            return {"mcpServers": {}}
+        if not isinstance(raw_servers, dict):
+            raise ValueError(f"Invalid MCP config at {path}: mcpServers must be an object")
+        return {"mcpServers": raw_servers}
+
+    def _write_project_config(self, path: Path, servers: dict[str, dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"mcpServers": servers}
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _load_project_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
+        servers: dict[str, MCPServerConfig] = {}
+        for path in self._project_candidate_paths(cwd):
+            if not path.exists():
+                continue
+            raw = self._read_project_config(path)
+            for name, mapping in raw["mcpServers"].items():
+                servers[name] = self._config_from_mapping(
+                    name,
+                    mapping,
+                    scope=MCPServerScope.PROJECT,
+                    source_path=str(path),
+                    expand_env=True,
+                )
+        return servers
+
+    def _serialize_project_server(self, config: MCPServerConfig) -> dict:
+        payload: dict[str, object] = {"type": config.transport_type.value}
+        if config.command:
+            payload["command"] = config.command
+        if config.args:
+            payload["args"] = list(config.args)
+        if config.env_vars:
+            payload["env"] = dict(config.env_vars)
+        if config.url:
+            payload["url"] = config.url
+        if config.headers:
+            payload["headers"] = dict(config.headers)
+        if config.headers_helper:
+            payload["headersHelper"] = config.headers_helper
+        if config.oauth:
+            payload["oauth"] = dict(config.oauth)
+        if config.cache_tools_list:
+            payload["cacheToolsList"] = True
+        if config.allowed_tools:
+            payload["allowedTools"] = list(config.allowed_tools)
+        if config.blocked_tools:
+            payload["blockedTools"] = list(config.blocked_tools)
+        return payload
+
+    def _effective_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
+        merged = self._load_user_servers()
+        merged.update(self._load_project_servers(cwd))
+        merged.update(self._load_local_servers(cwd))
+        return merged
+
+    async def add_server(
+        self,
+        config: MCPServerConfig,
+        *,
+        scope: MCPServerScope | str = MCPServerScope.LOCAL,
+        cwd: str | Path | None = None,
+    ) -> None:
         await self._ensure_legacy_migration()
-        koder_config = self.config_manager.load()
-        yaml_config = self._mcp_config_to_yaml(config)
+        normalized_scope = self._normalize_scope(scope)
+        if normalized_scope == MCPServerScope.USER:
+            koder_config = self.config_manager.load()
+            if any(server.name == config.name for server in koder_config.mcp_servers):
+                raise ValueError(f"MCP server already exists in user scope: {config.name}")
+            koder_config.mcp_servers.append(self._mcp_config_to_yaml(config))
+            self.config_manager.save(koder_config)
+            return
 
-        for i, server in enumerate(koder_config.mcp_servers):
-            if server.name == config.name:
-                koder_config.mcp_servers[i] = yaml_config
+        if normalized_scope == MCPServerScope.LOCAL:
+            koder_config = self.config_manager.load()
+            entry = self._local_scope_entry(cwd, create=True)
+            assert entry is not None
+            if any(server.name == config.name for server in entry.servers):
+                raise ValueError(f"MCP server already exists in local scope: {config.name}")
+            entry.servers.append(self._mcp_config_to_yaml(config))
+            self.config_manager.save(koder_config)
+            return
+
+        project_path = self._project_config_path(cwd)
+        raw = self._read_project_config(project_path)
+        if config.name in raw["mcpServers"]:
+            raise ValueError(f"MCP server already exists in project scope: {config.name}")
+        raw["mcpServers"][config.name] = self._serialize_project_server(config)
+        self._write_project_config(project_path, raw["mcpServers"])
+
+    async def import_json_server(
+        self,
+        name: str,
+        json_payload: str,
+        *,
+        scope: MCPServerScope | str = MCPServerScope.LOCAL,
+        cwd: str | Path | None = None,
+    ) -> None:
+        mapping = json.loads(json_payload)
+        normalized_scope = self._normalize_scope(scope)
+        config = self._config_from_mapping(
+            name,
+            mapping,
+            scope=normalized_scope,
+            source_path=self._scope_source_path(normalized_scope, cwd),
+            expand_env=False,
+        )
+        await self.add_server(config, scope=normalized_scope, cwd=cwd)
+
+    async def get_server(
+        self,
+        name: str,
+        *,
+        cwd: str | Path | None = None,
+        scope: MCPServerScope | str | None = None,
+    ) -> Optional[MCPServerConfig]:
+        await self._ensure_legacy_migration()
+        if scope is None:
+            return self._effective_servers(cwd).get(name)
+
+        normalized_scope = self._normalize_scope(scope)
+        if normalized_scope == MCPServerScope.USER:
+            return self._load_user_servers().get(name)
+        if normalized_scope == MCPServerScope.LOCAL:
+            return self._load_local_servers(cwd).get(name)
+        return self._load_project_servers(cwd).get(name)
+
+    async def list_servers(
+        self,
+        *,
+        cwd: str | Path | None = None,
+        scope: MCPServerScope | str | None = None,
+    ) -> List[MCPServerConfig]:
+        await self._ensure_legacy_migration()
+        if scope is None:
+            servers = self._effective_servers(cwd)
+        else:
+            normalized_scope = self._normalize_scope(scope)
+            if normalized_scope == MCPServerScope.USER:
+                servers = self._load_user_servers()
+            elif normalized_scope == MCPServerScope.LOCAL:
+                servers = self._load_local_servers(cwd)
+            else:
+                servers = self._load_project_servers(cwd)
+        return [servers[name] for name in sorted(servers)]
+
+    async def update_server(
+        self,
+        config: MCPServerConfig,
+        *,
+        scope: MCPServerScope | str | None = None,
+        cwd: str | Path | None = None,
+    ) -> bool:
+        target_scope = scope or config.scope
+        if target_scope is None:
+            existing = await self.get_server(config.name, cwd=cwd)
+            if existing is None:
+                return False
+            target_scope = existing.scope
+        if not await self.remove_server(config.name, scope=target_scope, cwd=cwd):
+            return False
+        await self.add_server(config, scope=target_scope, cwd=cwd)
+        return True
+
+    async def remove_server(
+        self,
+        name: str,
+        *,
+        scope: MCPServerScope | str | None = None,
+        cwd: str | Path | None = None,
+    ) -> bool:
+        await self._ensure_legacy_migration()
+        target_scope = scope
+        if target_scope is None:
+            existing = await self.get_server(name, cwd=cwd)
+            if existing is None:
+                return False
+            target_scope = existing.scope
+        normalized_scope = self._normalize_scope(target_scope)
+
+        if normalized_scope == MCPServerScope.USER:
+            koder_config = self.config_manager.load()
+            initial_count = len(koder_config.mcp_servers)
+            koder_config.mcp_servers = [s for s in koder_config.mcp_servers if s.name != name]
+            if len(koder_config.mcp_servers) < initial_count:
                 self.config_manager.save(koder_config)
                 return True
-        return False
+            return False
 
-    async def remove_server(self, name: str) -> bool:
-        """Remove an MCP server configuration.
-
-        Args:
-            name: The name of the server to remove.
-
-        Returns:
-            True if server was found and removed, False otherwise.
-        """
-        await self._ensure_legacy_migration()
-        koder_config = self.config_manager.load()
-        initial_count = len(koder_config.mcp_servers)
-        koder_config.mcp_servers = [s for s in koder_config.mcp_servers if s.name != name]
-
-        if len(koder_config.mcp_servers) < initial_count:
+        if normalized_scope == MCPServerScope.LOCAL:
+            koder_config = self.config_manager.load()
+            entry = self._local_scope_entry(cwd, create=False)
+            if entry is None:
+                return False
+            initial_count = len(entry.servers)
+            entry.servers = [server for server in entry.servers if server.name != name]
+            if len(entry.servers) == initial_count:
+                return False
             self.config_manager.save(koder_config)
             return True
-        return False
 
-    async def server_exists(self, name: str) -> bool:
-        """Check if a server with the given name exists.
+        project_path = self._project_config_path(cwd)
+        raw = self._read_project_config(project_path)
+        if name not in raw["mcpServers"]:
+            return False
+        del raw["mcpServers"][name]
+        self._write_project_config(project_path, raw["mcpServers"])
+        return True
 
-        Args:
-            name: The server name to check.
+    async def server_exists(
+        self,
+        name: str,
+        *,
+        cwd: str | Path | None = None,
+        scope: MCPServerScope | str | None = None,
+    ) -> bool:
+        return await self.get_server(name, cwd=cwd, scope=scope) is not None
 
-        Returns:
-            True if server exists, False otherwise.
-        """
-        await self._ensure_legacy_migration()
-        koder_config = self.config_manager.load()
-        return any(s.name == name for s in koder_config.mcp_servers)
-
-    async def get_servers_by_type(self, transport_type: str) -> List[MCPServerConfig]:
-        """Get all servers of a specific transport type.
-
-        Args:
-            transport_type: The transport type to filter by (stdio, sse, http).
-
-        Returns:
-            List of servers matching the transport type.
-        """
-        await self._ensure_legacy_migration()
-        koder_config = self.config_manager.load()
-        return [
-            self._yaml_to_mcp_config(s)
-            for s in koder_config.mcp_servers
-            if s.transport_type == transport_type
-        ]
+    async def get_servers_by_type(
+        self,
+        transport_type: str,
+        *,
+        cwd: str | Path | None = None,
+        scope: MCPServerScope | str | None = None,
+    ) -> List[MCPServerConfig]:
+        normalized = MCPServerType(transport_type)
+        servers = await self.list_servers(cwd=cwd, scope=scope)
+        return [server for server in servers if server.transport_type == normalized]

@@ -9,6 +9,44 @@ from agents import function_tool
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
+from .file_state import ReadFileState
+
+_file_state = ReadFileState()
+
+# ---------------------------------------------------------------------------
+# Curly quote normalization for file editing
+# ---------------------------------------------------------------------------
+_LEFT_SINGLE_CURLY = "\u2018"  # '
+_RIGHT_SINGLE_CURLY = "\u2019"  # '
+_LEFT_DOUBLE_CURLY = "\u201c"  # "
+_RIGHT_DOUBLE_CURLY = "\u201d"  # "
+
+
+def _normalize_quotes(s: str) -> str:
+    """Convert curly quotes to straight quotes."""
+    return (
+        s.replace(_LEFT_SINGLE_CURLY, "'")
+        .replace(_RIGHT_SINGLE_CURLY, "'")
+        .replace(_LEFT_DOUBLE_CURLY, '"')
+        .replace(_RIGHT_DOUBLE_CURLY, '"')
+    )
+
+
+def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    """Find the actual string in file content, accounting for quote normalization."""
+    if search_string in file_content:
+        return search_string
+    normalized_search = _normalize_quotes(search_string)
+    normalized_file = _normalize_quotes(file_content)
+    idx = normalized_file.find(normalized_search)
+    if idx != -1:
+        return file_content[idx : idx + len(search_string)]
+    return None
+
+
+def get_file_state() -> ReadFileState:
+    """Get the global file state tracker."""
+    return _file_state
 
 
 class FileWriteModel(BaseModel):
@@ -168,6 +206,19 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
 
         content = "\n".join(numbered_lines)
 
+        # Track the read for staleness detection
+        is_partial = offset is not None or limit is not None
+        full_content = "".join(lines) if not is_partial else None
+        _file_state.record_read(str(p), content=full_content, is_partial=is_partial)
+
+        if p.suffix.lower() == ".md":
+            try:
+                from koder_agent.harness.magic_docs import register_magic_doc
+
+                register_magic_doc(p, "".join(lines))
+            except Exception:
+                pass
+
         # Apply token truncation if needed
         content = truncate_text_by_tokens(content)
 
@@ -245,6 +296,17 @@ def write_file(path: str, content: str) -> str:
 
         # Check if file exists and get old content for diff
         is_new_file = not p.exists()
+
+        # Enforce read-before-write for existing files
+        if not is_new_file:
+            if not _file_state.has_been_read(str(p)):
+                return "File has not been read yet. Read it first before writing to it."
+            if _file_state.is_stale(str(p)):
+                return (
+                    "File has been modified since it was last read. "
+                    "Read it again before attempting to write it."
+                )
+
         old_content = ""
         if not is_new_file:
             try:
@@ -254,6 +316,7 @@ def write_file(path: str, content: str) -> str:
 
         # Write the new content
         p.write_text(content, "utf-8")
+        _file_state.record_read(str(p), content=content)
 
         # Generate diff for display
         filename = p.name
@@ -303,51 +366,125 @@ def append_file(path: str, content: str) -> str:
         return f"Error appending to file: {str(e)}"
 
 
+def edit_file_by_replacement(
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> str:
+    """Edit a file using old_string/new_string replacement.
+
+    String replacement edit mode -- find old_string in the file
+    and replace it with new_string.  Supports curly quote normalization and
+    replace_all for multiple occurrences.
+    """
+    p = Path(path).resolve()
+
+    # Reject no-op edits
+    if old_string == new_string:
+        return "No changes to make: old_string and new_string are the same."
+
+    # Empty old_string = file creation
+    if old_string == "":
+        if p.exists() and p.read_text(encoding="utf-8").strip():
+            return "Cannot create new file — file already exists with content."
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(new_string, encoding="utf-8")
+        _file_state.record_read(str(p), content=new_string)
+        return f"Created {path} ({len(new_string)} bytes)"
+
+    # File must exist
+    if not p.exists():
+        return f"File not found: {path}"
+
+    content = p.read_text(encoding="utf-8")
+
+    # Find with quote normalization
+    actual_old = _find_actual_string(content, old_string)
+    if actual_old is None:
+        return f"String not found in file.\nString: {old_string}"
+
+    # Uniqueness check
+    match_count = content.count(actual_old)
+    if match_count > 1 and not replace_all:
+        return (
+            f"Found {match_count} matches of the string to replace, but "
+            f"replace_all is false. To replace all occurrences, set replace_all "
+            f"to true. To replace only one, provide more context to uniquely "
+            f"identify the instance.\nString: {old_string}"
+        )
+
+    # Apply the edit
+    if replace_all:
+        new_content = content.replace(actual_old, new_string)
+    else:
+        # When deleting (new_string is empty), also strip the trailing newline
+        if new_string == "" and actual_old + "\n" in content:
+            new_content = content.replace(actual_old + "\n", "", 1)
+        else:
+            new_content = content.replace(actual_old, new_string, 1)
+
+    if new_content == content:
+        return "No changes were applied."
+
+    p.write_text(new_content, encoding="utf-8")
+    _file_state.record_read(str(p), content=new_content)
+
+    diff_output = _generate_diff_output(content, new_content, p.name)
+    return f"Successfully edited {path}\n---DIFF---\n{diff_output}"
+
+
 @function_tool
-def edit_file(path: str, diff: str) -> str:
-    """Apply a unified diff patch to a file.
+def edit_file(
+    path: str,
+    old_string: Optional[str] = None,
+    new_string: Optional[str] = None,
+    replace_all: bool = False,
+    diff: Optional[str] = None,
+) -> str:
+    """Edit a file using string replacement or unified diff.
 
-    The diff parameter should contain a unified diff format patch. This is useful
-    for making targeted changes to specific lines in a file. The diff format uses:
-    - Lines starting with '-' are removed
-    - Lines starting with '+' are added
-    - Lines starting with ' ' (space) are context (unchanged)
-    - @@ -start,count +start,count @@ marks each hunk
-
-    Example diff:
-        @@ -1,3 +1,3 @@
-         line1
-        -old line2
-        +new line2
-         line3
+    Two modes:
+    1. String replacement (preferred): Provide old_string and new_string.
+       The old_string must be unique in the file unless replace_all is true.
+    2. Unified diff: Provide a diff parameter with a unified diff patch.
 
     You must read the file first before editing.
-
-    Args:
-        path: Path to the file to edit.
-        diff: Unified diff to apply.
     """
-    try:
-        p = Path(path).resolve()
-        if not p.exists():
-            return f"File not found: {path}"
+    if old_string is not None and new_string is not None:
+        return edit_file_by_replacement(path, old_string, new_string, replace_all)
 
-        content = p.read_text(encoding="utf-8")
+    if diff is not None:
+        # Existing diff-based path (keep current logic)
+        try:
+            p = Path(path).resolve()
+            if not p.exists():
+                return f"File not found: {path}"
 
-        new_content, error = apply_diff(content, diff)
-        if error:
-            return f"Failed to apply diff: {error}"
+            # Read-before-write enforcement
+            if not _file_state.has_been_read(str(p)):
+                return "File has not been read yet. Read it first before editing."
+            if _file_state.is_partial_view(str(p)):
+                return "File was only partially read. Read the full file before editing."
+            if _file_state.is_stale(str(p)):
+                return (
+                    "File has been modified since it was last read. "
+                    "Read it again before attempting to edit it."
+                )
 
-        p.write_text(new_content, encoding="utf-8")
+            content = p.read_text(encoding="utf-8")
+            new_content, error = apply_diff(content, diff)
+            if error:
+                return f"Failed to apply diff: {error}"
+            p.write_text(new_content, encoding="utf-8")
+            _file_state.record_read(str(p), content=new_content)
+            return f"Successfully applied diff to {path}\n---DIFF---\n{diff}"
+        except PermissionError as e:
+            return str(e)
+        except Exception as e:
+            return f"Error editing file: {str(e)}"
 
-        # Return success message with diff for display
-        # Format: success message followed by the diff content
-        return f"Successfully applied diff to {path}\n---DIFF---\n{diff}"
-
-    except PermissionError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error editing file: {str(e)}"
+    return "Either (old_string + new_string) or diff must be provided."
 
 
 @function_tool

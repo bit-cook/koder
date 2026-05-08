@@ -15,6 +15,14 @@ class MCPServerType(str, Enum):
     HTTP = "http"
 
 
+class MCPServerScope(str, Enum):
+    """Configuration scopes for MCP servers."""
+
+    LOCAL = "local"
+    PROJECT = "project"
+    USER = "user"
+
+
 class MCPServerConfig(BaseModel):
     """Configuration for an MCP server."""
 
@@ -34,6 +42,18 @@ class MCPServerConfig(BaseModel):
     url: Optional[str] = Field(None, description="URL for SSE/HTTP servers")
     headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="HTTP headers")
 
+    # Authentication
+    headers_helper: Optional[str] = Field(
+        default=None,
+        description="Shell command that outputs JSON headers for custom auth. "
+        "Runs at connection time with a 10-second timeout. "
+        "Dynamic headers override any static headers with the same name.",
+    )
+    oauth: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="OAuth configuration (clientId, callbackPort, authServerMetadataUrl).",
+    )
+
     # Optional configurations
     cache_tools_list: bool = Field(default=False, description="Whether to cache the tools list")
     allowed_tools: Optional[List[str]] = Field(
@@ -41,6 +61,12 @@ class MCPServerConfig(BaseModel):
     )
     blocked_tools: Optional[List[str]] = Field(
         None, description="List of blocked tools (blocklist)"
+    )
+    scope: Optional[MCPServerScope] = Field(
+        default=None, description="Resolved configuration scope for the server"
+    )
+    source_path: Optional[str] = Field(
+        default=None, description="Source file that defined the server"
     )
 
     @field_validator("command")
@@ -75,6 +101,8 @@ class MCPServerConfig(BaseModel):
             "env_vars": json.dumps(self.env_vars) if self.env_vars else None,
             "url": self.url,
             "headers": json.dumps(self.headers) if self.headers else None,
+            "headers_helper": self.headers_helper,
+            "oauth": json.dumps(self.oauth) if self.oauth else None,
             "cache_tools_list": int(self.cache_tools_list),
             "allowed_tools": json.dumps(self.allowed_tools) if self.allowed_tools else None,
             "blocked_tools": json.dumps(self.blocked_tools) if self.blocked_tools else None,
@@ -90,6 +118,9 @@ class MCPServerConfig(BaseModel):
         allowed_tools = json.loads(data["allowed_tools"]) if data["allowed_tools"] else None
         blocked_tools = json.loads(data["blocked_tools"]) if data["blocked_tools"] else None
 
+        oauth_raw = data.get("oauth")
+        oauth = json.loads(oauth_raw) if oauth_raw else None
+
         return cls(
             name=data["name"],
             transport_type=MCPServerType(data["transport_type"]),
@@ -98,6 +129,8 @@ class MCPServerConfig(BaseModel):
             env_vars=env_vars,
             url=data["url"],
             headers=headers,
+            headers_helper=data.get("headers_helper"),
+            oauth=oauth,
             cache_tools_list=bool(data["cache_tools_list"]),
             allowed_tools=allowed_tools,
             blocked_tools=blocked_tools,
@@ -114,6 +147,8 @@ class MCPAddRequest(BaseModel):
     env_vars: Dict[str, str] = Field(default_factory=dict)
     url: Optional[str] = None
     headers: Dict[str, str] = Field(default_factory=dict)
+    headers_helper: Optional[str] = None
+    oauth: Optional[Dict[str, Any]] = None
     cache_tools_list: bool = False
     allowed_tools: Optional[List[str]] = None
     blocked_tools: Optional[List[str]] = None
@@ -128,6 +163,8 @@ class MCPAddRequest(BaseModel):
             env_vars=self.env_vars,
             url=self.url,
             headers=self.headers,
+            headers_helper=self.headers_helper,
+            oauth=self.oauth,
             cache_tools_list=self.cache_tools_list,
             allowed_tools=self.allowed_tools,
             blocked_tools=self.blocked_tools,

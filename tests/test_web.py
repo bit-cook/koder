@@ -311,7 +311,6 @@ class TestWebFetch:
 
             # Check result contains expected content
             assert "https://example.com" in result
-            assert "text/html" in result
             assert "extract text" in result
             # Script and style content should be removed
             assert "console.log" not in result
@@ -333,7 +332,7 @@ class TestWebFetch:
                 None, json.dumps({"url": "https://api.example.com/data", "prompt": "parse json"})
             )
 
-            assert "application/json" in result
+            assert "api.example.com" in result
             assert "parse json" in result
 
     async def test_web_fetch_truncates_long_content(self):
@@ -366,6 +365,34 @@ class TestWebFetch:
 
             assert "Error fetching content" in result
             assert "Unexpected error" in result
+
+    async def test_web_fetch_prompt_contextualizes_output(self):
+        """Test web_fetch uses prompt parameter to contextualize output."""
+        html_content = "<html><body><h1>Test Content</h1></body></html>"
+
+        with patch("koder_agent.tools.web.requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.content = html_content.encode()
+            mock_response.text = html_content
+            mock_response.headers = {"content-type": "text/html"}
+            mock_get.return_value = mock_response
+
+            # With prompt
+            result_with_prompt = await web_fetch.on_invoke_tool(
+                None, json.dumps({"url": "https://example.com", "prompt": "extract title"})
+            )
+
+            # Without prompt (empty string)
+            result_without_prompt = await web_fetch.on_invoke_tool(
+                None, json.dumps({"url": "https://example.com", "prompt": ""})
+            )
+
+            # Results should differ - with prompt should include context
+            assert "extract title" in result_with_prompt
+            assert "context: extract title" in result_with_prompt
+            assert "extract title" not in result_without_prompt
+            assert "context:" not in result_without_prompt
 
 
 class TestWebSearchIntegration:

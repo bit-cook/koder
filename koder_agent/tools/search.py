@@ -1,7 +1,7 @@
 """File search operation tools."""
 
-import fnmatch
-import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -83,71 +83,214 @@ def glob_search(pattern: str, path: Optional[str] = None) -> str:
 
 
 @function_tool
-def grep_search(pattern: str, path: Optional[str] = None, include: Optional[str] = None) -> str:
-    """Search for pattern in file contents."""
+def grep_search(
+    pattern: str,
+    path: Optional[str] = None,
+    glob: Optional[str] = None,
+    include: Optional[str] = None,
+    output_mode: str = "files_with_matches",
+    context: Optional[int] = None,
+    type: Optional[str] = None,
+    head_limit: int = 250,
+    offset: int = 0,
+    multiline: bool = False,
+    case_insensitive: bool = False,
+    context_after: Optional[int] = None,
+    context_before: Optional[int] = None,
+    line_numbers: bool = True,
+) -> str:
+    """Search for pattern in file contents using ripgrep.
+
+    Args:
+        pattern: Regex pattern to search for
+        path: Base directory to search in (defaults to cwd)
+        glob: File pattern filter (e.g., "*.py")
+        include: Backward compat alias for glob
+        output_mode: "files_with_matches" (default), "content", or "count"
+        context: Number of context lines (-C flag)
+        type: File type filter (e.g., "py", "js")
+        head_limit: Maximum results to return (default 250)
+        offset: Skip first N results (for pagination)
+        multiline: Enable multiline mode
+        case_insensitive: Case-insensitive search (-i flag)
+        context_after: Lines of context after match (-A flag)
+        context_before: Lines of context before match (-B flag)
+        line_numbers: Show line numbers in content mode (default True)
+
+    Returns:
+        Formatted search results
+    """
     try:
+        # Find ripgrep
+        rg_path = shutil.which("rg")
+        if not rg_path:
+            return (
+                "Error: ripgrep (rg) is not installed.\n"
+                "Please install ripgrep: https://github.com/BurntSushi/ripgrep#installation\n"
+                "  macOS: brew install ripgrep\n"
+                "  Ubuntu/Debian: apt install ripgrep\n"
+                "  Windows: choco install ripgrep"
+            )
+
         base_path = Path(path) if path else Path.cwd()
 
         # Validate base path
         if not base_path.exists():
             return f"Path does not exist: {base_path}"
 
-        # Compile regex pattern
-        try:
-            regex = re.compile(pattern)
-        except re.error as e:
-            return f"Invalid regex pattern: {str(e)}"
+        # Build ripgrep command
+        cmd = [rg_path]
 
-        matches = []
-        files_searched = 0
+        # Basic flags
+        cmd.extend(["--hidden", "--max-columns", "500"])
 
-        # Search in files
-        for file_path in base_path.rglob("*"):
-            if not file_path.is_file():
-                continue
+        # Exclude VCS directories
+        for vcs_dir in [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"]:
+            cmd.extend(["--glob", f"!{vcs_dir}"])
 
-            # Apply include filter if specified
-            if include and not fnmatch.fnmatch(file_path.name, include):
-                continue
+        # Multiline mode
+        if multiline:
+            cmd.extend(["-U", "--multiline-dotall"])
 
-            # Skip binary files and large files
-            if file_path.stat().st_size > 1024 * 1024:  # 1MB limit
-                continue
+        # Case sensitivity
+        if case_insensitive:
+            cmd.append("-i")
 
-            files_searched += 1
-            if files_searched > 1000:  # Limit files searched
-                matches.append("... (search limited to 1000 files)")
-                break
+        # Output mode
+        if output_mode == "files_with_matches":
+            cmd.append("-l")
+        elif output_mode == "count":
+            cmd.append("-c")
+        elif output_mode == "content":
+            # Line numbers enabled by default in content mode unless explicitly disabled
+            if line_numbers:
+                cmd.append("-n")
 
-            try:
-                content = file_path.read_text(encoding="utf-8", errors="ignore")
-                if regex.search(content):
-                    rel_path = file_path.relative_to(base_path)
+        # Context lines - -C takes precedence over -A/-B
+        if context is not None:
+            cmd.extend(["-C", str(context)])
+        else:
+            if context_after is not None:
+                cmd.extend(["-A", str(context_after)])
+            if context_before is not None:
+                cmd.extend(["-B", str(context_before)])
 
-                    # Find matching lines
-                    lines = content.splitlines()
-                    matching_lines = []
-                    for i, line in enumerate(lines, 1):
-                        if regex.search(line):
-                            matching_lines.append(f"  {i}: {line.strip()}")
-                            if len(matching_lines) >= 3:  # Show max 3 lines per file
-                                matching_lines.append("  ...")
-                                break
+        # Type filter
+        if type:
+            cmd.extend(["--type", type])
 
-                    matches.append(f"\n{rel_path}:\n" + "\n".join(matching_lines))
+        # Glob filter (include is backward compat)
+        glob_pattern = glob or include
+        if glob_pattern:
+            cmd.extend(["--glob", glob_pattern])
 
-                    if len(matches) >= 50:  # Limit total results
-                        matches.append("\n... (results limited to 50 files)")
-                        break
+        # Pattern - use -e flag to prevent pattern injection when pattern starts with dash
+        if pattern.startswith("-"):
+            cmd.extend(["-e", pattern])
+        else:
+            cmd.append(pattern)
 
-            except (UnicodeDecodeError, PermissionError):
-                # Skip files that can't be read
-                continue
+        # Search path
+        cmd.append(str(base_path))
 
-        if not matches:
-            return f"No matches found (searched {files_searched} files)"
+        # Run ripgrep
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
-        return f"Pattern '{pattern}' found in {len(matches)} files:\n" + "\n".join(matches)
+        # Handle exit codes: 0 = matches, 1 = no matches, 2+ = error
+        if result.returncode >= 2:
+            return f"Grep search error: {result.stderr.strip()}"
 
+        if result.returncode == 1 or not result.stdout.strip():
+            return "No matches found"
+
+        output = result.stdout
+
+        # Process output based on mode
+        if output_mode == "files_with_matches":
+            # Sort by mtime (newest first) and relativize paths
+            file_lines = output.strip().split("\n")
+            files = []
+            for line in file_lines:
+                if line:
+                    file_path = Path(line)
+                    try:
+                        rel_path = file_path.relative_to(base_path)
+                        mtime = file_path.stat().st_mtime
+                        files.append((rel_path, mtime))
+                    except (ValueError, OSError):
+                        files.append((Path(line), 0))
+
+            # Sort by mtime, newest first
+            files.sort(key=lambda x: x[1], reverse=True)
+
+            # Apply offset and head_limit
+            files = files[offset : offset + head_limit]
+
+            if not files:
+                return "No matches found"
+
+            return "\n".join(str(f[0]) for f in files)
+
+        elif output_mode == "content":
+            # Relativize paths in content output
+            lines = output.split("\n")
+            relativized_lines = []
+            for line in lines:
+                if not line:
+                    continue
+                # Try to extract and relativize file path
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    file_part = parts[0]
+                    try:
+                        file_path = Path(file_part)
+                        if file_path.exists() and file_path.is_absolute():
+                            rel_path = file_path.relative_to(base_path)
+                            line = f"{rel_path}:{parts[1]}" if len(parts) > 1 else str(rel_path)
+                    except (ValueError, OSError):
+                        pass
+                relativized_lines.append(line)
+
+            # Apply offset and head_limit
+            output_lines = relativized_lines[offset : offset + head_limit]
+            return "\n".join(output_lines) if output_lines else "No matches found"
+
+        elif output_mode == "count":
+            # Parse count output (file:count format)
+            lines = output.strip().split("\n")
+            count_data = []
+
+            for line in lines:
+                if ":" in line:
+                    file_part, count_part = line.rsplit(":", 1)
+                    try:
+                        count = int(count_part)
+                        file_path = Path(file_part)
+                        try:
+                            rel_path = file_path.relative_to(base_path)
+                            count_data.append((str(rel_path), count))
+                        except ValueError:
+                            count_data.append((file_part, count))
+                    except ValueError:
+                        continue
+
+            # Apply offset and head_limit
+            count_data = count_data[offset : offset + head_limit]
+
+            if not count_data:
+                return "No matches found"
+
+            # Calculate total from sliced data only
+            total = sum(count for _, count in count_data)
+
+            result_lines = [f"{file}: {count}" for file, count in count_data]
+            result_lines.append(f"\nTotal matches: {total}")
+
+            return "\n".join(result_lines)
+
+        return output.strip()
+
+    except subprocess.TimeoutExpired:
+        return "Grep search error: Search timed out after 30 seconds"
     except Exception as e:
         return f"Grep search error: {str(e)}"

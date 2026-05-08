@@ -6,292 +6,48 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-An experimental, universal AI coding assistant for the terminal. Built in Python, Koder works with OpenAI, Anthropic, Google, GitHub Copilot, and 100+ providers via LiteLLM.
+Koder is an experimental AI coding assistant for the terminal. It combines a streaming TUI, persistent local sessions, repository-aware tools, extensible skills, MCP integrations, and multi-agent workflows in one Python runtime.
 
-🎯 **Status**: Alpha - This is a learning-focused project exploring AI agent development.
+Status: Alpha. Koder is a learning-focused project for exploring agentic coding systems. Expect rapid iteration and occasional sharp edges.
 
-## Features
+## Why Koder
 
-- **Universal AI Support** - Works with ChatGPT/Gemini/Claude subscriptions and API keys via OpenAI, Anthropic, Google, GitHub Copilot, and 100+ providers
-- **Smart Context** - Persistent sessions with SQLite storage and automatic token-aware compression
-- **Real-time Streaming** - Rich terminal displays with live output
-- **Comprehensive Tools** - File operations, search, shell, task delegation, todos, and skills
-- **MCP Integration** - Extensible tool ecosystem via Model Context Protocol
-- **Zero Config** - Automatic provider detection with sensible defaults
+Koder is designed for developers who want a local-first coding assistant that can work across model providers without changing their workflow.
+
+- Bring your own model: OpenAI, Anthropic, Google/Gemini, GitHub Copilot, Azure, OAuth-backed subscriptions, OpenRouter, and 100+ LiteLLM providers.
+- Stay in the terminal: use slash commands, file mentions, shell mode, history search, live usage output, and optional voice dictation.
+- Keep context local: sessions, transcripts, memories, task records, settings, skills, agents, and team state live under Koder-owned local paths.
+- Extend the runtime: add project skills, user skills, plugins, MCP servers, channels, and Magic Docs.
+- Delegate carefully: run background subagents and local teams while the main session stays responsible for integration.
+
+## Highlights
+
+| Area | What You Get |
+|---|---|
+| Interactive TUI | Streaming output, slash completion, shell mode, file mentions, status line, reverse history search, and multi-line prompts. |
+| Model routing | Universal `KODER_*` variables, provider-specific keys, custom base URLs, reasoning effort, and subscription-backed OAuth providers. |
+| Durable context | SQLite sessions, named sessions, resume, export, compaction, rewind, thinkback, local memories, and AutoDream consolidation. |
+| Coding tools | File operations, search, shell execution, git helpers, notebooks, web fetch/search, todos, and local code intelligence. |
+| Workflows | Review, security review, advisor, planning, commit readiness, PR comments, GitHub Actions setup, release notes, and verification summaries. |
+| Agents and teams | Project/user agents, `task_delegate`, `/fork`, `/peers`, in-process teammates, tmux teammates, mailbox routing, tasks, and team memory. |
+| Extensions | Skills, verifier skills, plugins, MCP servers, channels, and Magic Docs. |
+| Safety controls | Permission rules, sandbox policy, managed settings, workspace roots, privacy diagnostics, and local storage boundaries. |
 
 ## Installation
 
-### Using uv (Recommended)
+Install the published CLI with `uv`:
 
 ```bash
 uv tool install koder
 ```
 
-### Using pip
+Or use `pip`:
 
 ```bash
 pip install koder
 ```
 
-## Quick Start
-
-```bash
-# 1. Set your API key (works with any provider)
-export KODER_API_KEY="your-api-key"
-
-# 2. Run Koder
-koder
-```
-
-That's it! `KODER_API_KEY` works with any provider - no need to remember provider-specific variable names.
-
-### Basic Usage
-
-```bash
-# Interactive mode
-koder
-
-# Single prompt
-koder "create a Python function to calculate fibonacci numbers"
-
-# Named session (persists conversation)
-koder -s my-project "help me implement a new feature"
-
-# Use a different model
-KODER_MODEL="claude-opus-4-20250514" koder "your prompt"
-```
-
-## Configuration
-
-Koder can be configured via (in priority order):
-
-1. **CLI arguments** - Highest priority
-2. **Environment variables** - Universal `KODER_*` vars override everything
-3. **Config file** - `~/.koder/config.yaml`
-
-### Environment Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `KODER_API_KEY` | Universal API key (works with any provider) | `sk-...` |
-| `KODER_MODEL` | Model to use | `gpt-4o`, `claude-opus-4-20250514` |
-| `KODER_BASE_URL` | Custom API endpoint | `http://localhost:8080/v1` |
-| `KODER_REASONING_EFFORT` | For reasoning models | `low`, `medium`, `high` |
-
-`KODER_API_KEY` and `KODER_BASE_URL` take priority over provider-specific variables (like `OPENAI_API_KEY`) and config file settings.
-
-### Providers
-
-Use `KODER_API_KEY` for any provider, or provider-specific variables:
-
-| Provider | Environment Variable | Model Example |
-|----------|---------------------|---------------|
-| Any | `KODER_API_KEY` | Works with all providers |
-| OpenAI | `OPENAI_API_KEY` | `gpt-4o`, `gpt-4.1` |
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-opus-4-20250514` |
-| Google | `GOOGLE_API_KEY` | `gemini/gemini-2.5-pro` |
-| GitHub Copilot | *(device auth)* | `github_copilot/claude-sonnet-4` |
-| Azure | `AZURE_API_KEY` | `azure/gpt-4` |
-
-See [Configuration Guide](docs/configuration.md) for all 100+ providers.
-
-### OAuth Providers (Subscription-Based)
-
-Use your existing subscriptions (Claude Max, ChatGPT Plus/Pro, Google Gemini) without API keys:
-
-```bash
-# Authenticate with a provider
-koder auth login google      # Google/Gemini CLI (free with Google account)
-koder auth login claude      # Claude Max subscription
-koder auth login chatgpt     # ChatGPT Plus/Pro subscription
-koder auth login antigravity # Antigravity (Gemini/Claude models)
-
-# Check authentication status
-koder auth list              # List configured providers
-koder auth status            # Show detailed token status
-
-# Revoke access
-koder auth revoke google     # Remove stored tokens
-```
-
-**OAuth Providers:**
-
-| OAuth Provider | Subscription | Description |
-|----------------|--------------|-------------|
-| `google` | Google Gemini | Access to Gemini models via Google account |
-| `claude` | Claude Pro/Max | Access to Claude models via subscription |
-| `chatgpt` | ChatGPT Plus/Pro | Access to GPT models via subscription |
-| `antigravity` | Antigravity | Access to Gemini/Claude models |
-
-Available models are fetched from each provider's API after login and cached locally (1 day TTL).
-Use `koder auth list` to see all available models for your authenticated providers.
-
-**Usage after authentication:**
-
-```bash
-# Use OAuth-authenticated models (OAuth provider prefix required)
-KODER_MODEL="google/gemini-3-pro-preview" koder "your prompt"                # Google OAuth
-KODER_MODEL="claude/claude-opus-4-5-20250514" koder "your prompt"            # Claude Max
-KODER_MODEL="chatgpt/gpt-5.2" koder "your prompt"                            # ChatGPT OAuth
-KODER_MODEL="antigravity/gemini-3-pro-high" koder "your prompt"              # Antigravity (Gemini 3.0)
-KODER_MODEL="antigravity/claude-opus-4-5-thinking" koder "your prompt"       # Antigravity (Claude Opus 4.5)
-```
-
-OAuth tokens and cached models are stored in `~/.koder/tokens/` and automatically refreshed before expiry.
-
-### Config File Example
-
-```yaml
-# ~/.koder/config.yaml
-
-model:
-  name: "gpt-4o"
-  provider: "openai"
-  reasoning_effort: null    # For reasoning models: low, medium, high
-
-cli:
-  session: null             # Default session name
-  stream: true              # Enable streaming output
-
-mcp_servers: []             # MCP server configurations
-```
-
-### Commands
-
-```bash
-koder config show          # Show current config
-koder config edit          # Edit config file
-koder -s SESSION_NAME      # Use named session
-```
-
-## MCP Servers
-
-Model Context Protocol (MCP) servers extend Koder with additional tools.
-
-### CLI Commands
-
-```bash
-# Add servers
-koder mcp add myserver "python -m my_mcp_server"
-koder mcp add myserver "python -m server" -e API_KEY=xxx
-
-# HTTP/SSE transport
-koder mcp add webserver --transport http --url http://localhost:8000
-
-# Manage servers
-koder mcp list
-koder mcp get myserver
-koder mcp remove myserver
-```
-
-### Config Example
-
-```yaml
-# In ~/.koder/config.yaml
-mcp_servers:
-  # stdio transport (local command)
-  - name: "filesystem"
-    transport_type: "stdio"
-    command: "python"
-    args: ["-m", "mcp.server.filesystem"]
-    env_vars:
-      ROOT_PATH: "/home/user/projects"
-    cache_tools_list: true
-    allowed_tools:
-      - "read_file"
-      - "write_file"
-
-  # HTTP transport (remote server)
-  - name: "web-tools"
-    transport_type: "http"
-    url: "http://localhost:8000"
-    headers:
-      Authorization: "Bearer token123"
-
-  # SSE transport
-  - name: "streaming-server"
-    transport_type: "sse"
-    url: "http://localhost:9000/sse"
-```
-
-## Skills
-
-Skills provide specialized knowledge loaded on-demand, saving 90%+ tokens via progressive disclosure.
-
-### Directory Structure
-
-Skills are loaded from (project skills take priority):
-
-1. **Project**: `.koder/skills/`
-2. **User**: `~/.koder/skills/`
-
-```
-.koder/skills/
-├── api-design/
-│   └── SKILL.md
-├── code-review/
-│   ├── SKILL.md
-│   └── checklist.md
-└── testing/
-    └── SKILL.md
-```
-
-### Creating a Skill
-
-Create a `SKILL.md` with YAML frontmatter:
-
-```markdown
----
-name: api-design
-description: Best practices for designing RESTful APIs
-allowed_tools:
-  - read_file
-  - write_file
----
-
-# API Design Guidelines
-
-## RESTful Principles
-
-Use nouns for resources, HTTP verbs for actions...
-```
-
-### How Skills Work
-
-1. **Startup**: Only skill names and descriptions are loaded (minimal tokens)
-2. **On-demand**: Full content fetched when needed via `get_skill(name)`
-3. **Supplementary**: Skills can reference additional files
-
-## Architecture
-
-```
-koder_agent/
-├── agentic/        # Agent creation, hooks, and approval system
-├── cli.py          # Main CLI entry point
-├── config/         # Configuration management
-├── core/           # Scheduler, context, streaming, security
-├── mcp/            # Model Context Protocol integration
-├── tools/          # Tool implementations
-└── utils/          # Helpers and utilities
-```
-
-### Core Flow
-
-1. **CLI** (`cli.py`) parses arguments, initializes session
-2. **AgentScheduler** (`core/scheduler.py`) orchestrates execution with streaming
-3. **Agent** (`agentic/agent.py`) builds agent with tools, MCP servers, model settings
-4. **Tools** (`tools/engine.py`) register tools, validate inputs, filter output
-5. **Context** (`core/context.py`) persists conversations in SQLite
-
-### Data Storage
-
-- **Database**: `~/.koder/koder.db` (SQLite)
-- **Config**: `~/.koder/config.yaml`
-- **Skills**: `~/.koder/skills/` or `.koder/skills/`
-
-## Development
-
-### Setup
+For local development from this repository:
 
 ```bash
 git clone https://github.com/feiskyer/koder.git
@@ -300,39 +56,292 @@ uv sync
 uv run koder
 ```
 
-### Code Quality
+## Quick Start
+
+Set a model credential and start the interactive TUI:
 
 ```bash
-uv run black .              # Format
-uv run ruff check --fix     # Lint
-uv run pytest               # Test
+export KODER_API_KEY="your-api-key"
+export KODER_MODEL="gpt-4o"
+koder
 ```
 
-## Security
+Run a single prompt from the shell:
 
-- **API Keys**: Stored in environment variables, never in code
-- **Local Storage**: Sessions stored in `~/.koder/`
-- **No Telemetry**: Only API requests to your chosen provider
-- **Shell Commands**: Require explicit user confirmation
+```bash
+koder "summarize the current repository"
+```
+
+Use a named session when you want durable context for a project or feature:
+
+```bash
+koder -s billing-refactor
+koder -s billing-refactor "continue the failing test investigation"
+koder --resume
+```
+
+Good first commands inside the TUI:
+
+```bash
+/onboarding
+/status
+/model
+/files
+/permissions
+/help
+```
+
+## Common Usage
+
+| Task | Command |
+|---|---|
+| Open the TUI | `koder` |
+| Run one prompt | `koder "fix the failing test"` |
+| Print script-friendly output | `koder --print "summarize"` |
+| Use a named session | `koder -s my-project` |
+| Resume previous work | `koder --resume` or `koder --continue` |
+| Inspect runtime state | `/status`, `/summary`, `/stats`, `/doctor` |
+| Inspect context | `/files`, `/context`, `/ctx_viz` |
+| Review changes | `/diff`, `/review`, `/security-review` |
+| Check usage and cost | `/usage`, `/cost` |
+| Manage agents and teams | `/agents`, `/fork`, `/peers`, `/tasks` |
+| Manage extensions | `/skills`, `/plugin`, `/mcp`, `/channels` |
+| Manage permissions | `/permissions`, `/sandbox`, `/sandbox-toggle`, `/add-dir` |
+
+See the [Command Reference](docs/commands.md) for the complete slash-command catalog.
+
+## Model Configuration
+
+Koder resolves configuration in this order:
+
+1. CLI arguments
+2. Environment variables
+3. `~/.koder/config.yaml`
+4. Built-in defaults
+
+Universal environment variables work across providers:
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `KODER_API_KEY` | Universal API key | `sk-...` |
+| `KODER_MODEL` | Active model | `gpt-4o`, `claude-opus-4-20250514` |
+| `KODER_BASE_URL` | Custom OpenAI-compatible endpoint | `http://localhost:8080/v1` |
+| `KODER_REASONING_EFFORT` | Reasoning effort | `low`, `medium`, `high` |
+| `KODER_REASONING_DISPLAY` | Reasoning display mode | `off`, `summary`, `full` |
+
+Provider-specific examples:
+
+```bash
+OPENAI_API_KEY="sk-..." KODER_MODEL="gpt-4o" koder
+ANTHROPIC_API_KEY="..." KODER_MODEL="claude-opus-4-20250514" koder
+GOOGLE_API_KEY="..." KODER_MODEL="gemini/gemini-2.5-pro" koder
+KODER_BASE_URL="http://localhost:8080/v1" KODER_MODEL="openai/local-model" koder
+```
+
+Subscription-backed providers use local OAuth token stores:
+
+```bash
+koder auth login google
+koder auth login claude
+koder auth login chatgpt
+koder auth login antigravity
+koder auth list
+```
+
+After login, select an OAuth-backed model with its provider prefix:
+
+```bash
+KODER_MODEL="google/gemini-3-pro-preview" koder
+KODER_MODEL="claude/claude-opus-4-5-20250514" koder
+KODER_MODEL="chatgpt/gpt-5.2" koder
+```
+
+OAuth tokens and cached model lists are stored under `~/.koder/tokens/`.
+
+## Configuration File
+
+Persistent defaults live in `~/.koder/config.yaml`:
+
+```yaml
+model:
+  name: "gpt-4o"
+  provider: "openai"
+  reasoning_effort: null
+
+cli:
+  session: null
+  stream: true
+
+mcp_servers: []
+
+voice:
+  enabled: false
+  provider: null
+  model: null
+
+harness:
+  reasoning_display: "off"
+```
+
+Useful configuration commands:
+
+```bash
+koder config show
+koder config edit
+koder config export ~/koder-settings.json
+koder config import ~/koder-settings.json --dry-run
+```
+
+See the [Configuration Guide](docs/configuration.md) for provider setup, OAuth, settings bundles, managed settings, MCP configuration, and voice routing.
+
+## Extending Koder
+
+Koder can be extended at the project, user, and plugin levels.
+
+### Skills
+
+Skills are local instruction bundles loaded on demand:
+
+```text
+.koder/skills/api-review/SKILL.md
+~/.koder/skills/personal-style/SKILL.md
+```
+
+```markdown
+---
+name: api-review
+description: Review API changes for compatibility and error handling
+allowed_tools:
+  - read_file
+  - grep_search
+---
+
+Review public API changes for request shape, response shape, status codes, and migration notes.
+```
+
+Inspect skills with `/skills`. Create verifier skills with `/init-verifiers`.
+
+### MCP Servers
+
+MCP servers add external tools to the runtime:
+
+```bash
+koder mcp add filesystem "python -m mcp.server.filesystem" --scope project
+koder mcp add api --transport http --url http://localhost:8000
+koder mcp list
+```
+
+### Plugins And Channels
+
+Plugins can contribute skills, commands, MCP servers, channels, and dependencies:
+
+```bash
+koder plugin install ./my-plugin --scope project
+koder plugin list
+koder --channels server:my-channel
+koder --channels plugin:team-chat@local
+koder /channels
+```
+
+See [Skills, Plugins, and MCP](docs/extensions.md) for the full extension model.
+
+## Architecture
+
+```text
+koder_agent/
+├── agentic/        # Agent creation, hooks, guardrails, approvals
+├── auth/           # OAuth providers, token storage, provider-specific routing
+├── cli.py          # Main CLI entry point
+├── config/         # YAML, environment, and settings management
+├── core/           # Scheduler, sessions, streaming, security, TUI prompt
+├── harness/        # Runtime commands, plugins, memory, permissions, teams, UI scaffolding
+├── mcp/            # Model Context Protocol integration
+├── providers/      # Provider routing metadata
+├── tools/          # Tool implementations
+└── utils/          # Client setup, prompts, sessions, model info, terminal theme
+```
+
+Runtime flow:
+
+1. `cli.py` parses arguments and builds a runtime request.
+2. `HarnessRuntime` loads permissions and dispatches interactive, prompt, and subcommand modes.
+3. Session flow wires context, hooks, plugins, agents, slash commands, and scheduler execution.
+4. `AgentScheduler` streams model execution and usage tracking.
+5. Tool and permission layers validate file, shell, MCP, skill, and teammate operations.
+6. `EnhancedSQLiteSession` persists transcripts and session metadata in `~/.koder/koder.db`.
+
+## Development
+
+Set up the repository:
+
+```bash
+uv sync
+uv run koder
+```
+
+Code quality and tests:
+
+```bash
+uv run black .
+uv run ruff format
+uv run ruff check --fix
+uv run pytest
+```
+
+Focused test examples:
+
+```bash
+uv run pytest tests/test_file_tools.py
+uv run pytest -v -k "test_name"
+```
+
+## Security And Privacy
+
+- API keys should live in environment variables or local user config, not project files.
+- OAuth tokens and cached provider model lists are stored under `~/.koder/tokens/`.
+- Sessions, transcripts, memories, tasks, agents, and teams are stored locally under `~/.koder/` and project `.koder/` paths.
+- Koder does not upload sessions to a Koder-hosted service. Model requests still go to the provider you configure.
+- Shell, file, MCP, and teammate operations are mediated by local permission and sandbox policy.
+
+Use these commands to inspect boundaries:
+
+```bash
+/privacy-settings
+/permissions
+/sandbox
+/managed-settings
+/files
+/context
+```
+
+See [Permissions and Privacy](docs/permissions-and-privacy.md) for details.
+
+## Documentation
+
+- [Feature Guide](docs/features.md) - topic map for Koder's main user-facing capabilities
+- [Getting Started](docs/getting-started.md) - first install, provider setup, and a safe first session
+- [Interactive TUI](docs/interactive-tui.md) - prompt controls, slash commands, mentions, shell mode, and voice input
+- [Configuration Guide](docs/configuration.md) - config files, environment variables, providers, OAuth, and settings bundles
+- [Sessions and Memory](docs/sessions-and-memory.md) - named sessions, resume, compaction, rewind, memory, and local storage
+- [Agents and Teams](docs/agents-and-teams.md) - background subagents, project agents, teams, teammate modes, and team memory
+- [Workflows](docs/workflows.md) - review, planning, Git, GitHub, release, and verification workflows
+- [Skills, Plugins, and MCP](docs/extensions.md) - extending Koder with skills, plugins, MCP servers, channels, and Magic Docs
+- [Permissions and Privacy](docs/permissions-and-privacy.md) - approvals, sandbox policy, managed settings, workspace roots, and data boundaries
+- [Voice Mode](docs/voice-mode.md) - voice dictation setup and provider-specific notes
+- [Command Reference](docs/commands.md) - complete slash-command catalog
 
 ## Contributing
 
-Contributions are welcome!
+Contributions are welcome.
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feature/amazing-feature`.
+3. Make a focused change with tests or validation.
+4. Commit your changes: `git commit -m 'Add amazing feature'`.
+5. Push the branch and open a pull request.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  <sub>Built with Python and curiosity</sub>
-</p>
+MIT License. See [LICENSE](LICENSE) for details.

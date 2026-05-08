@@ -30,15 +30,13 @@ def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, capsys):
     skill_file = tmp_path / "bad" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: bad-skill
             : missing-value
             ---
             Body text that should still load.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -48,7 +46,7 @@ def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, capsys):
 
     assert "invalid YAML" in output
     assert skill is not None
-    assert skill.name == "SKILL"
+    assert skill.name == "bad"
     assert "Body text that should still load." in skill.content
     assert skill.description == ""
     assert skill.allowed_tools is None
@@ -65,7 +63,7 @@ def test_load_skill_without_frontmatter_warns_and_uses_body(tmp_path, capsys):
 
     assert "no frontmatter" in output
     assert skill is not None
-    assert skill.name == "SKILL"
+    assert skill.name == "no-frontmatter"
     assert skill.description == ""
     assert skill.content.startswith("Plain body only")
 
@@ -74,8 +72,7 @@ def test_allowed_tools_scalar_and_metadata_are_preserved(tmp_path):
     skill_file = tmp_path / "meta-skill" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: meta-skill
             description: Tests allowed tools
@@ -83,8 +80,7 @@ def test_allowed_tools_scalar_and_metadata_are_preserved(tmp_path):
             priority: 5
             ---
             Small body content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -97,6 +93,51 @@ def test_allowed_tools_scalar_and_metadata_are_preserved(tmp_path):
     assert "Small body content." in skill.content
 
 
+def test_skill_frontmatter_fields_are_preserved(tmp_path):
+    skill_file = tmp_path / "meta" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        textwrap.dedent("""\
+            ---
+            name: deploy
+            description: Deploy app
+            argument-hint: [env]
+            disable-model-invocation: true
+            user-invocable: false
+            model: sonnet
+            effort: high
+            context: fork
+            agent: reviewer
+            paths:
+              - src/**
+            shell: bash
+            hooks:
+              Stop:
+                - type: command
+            extra-field: present
+            ---
+            Deploy to $ARGUMENTS using ${KODER_SKILL_DIR}
+            """),
+        encoding="utf-8",
+    )
+
+    loader = SkillLoader(tmp_path)
+    skill = loader.load_skill(skill_file)
+
+    assert skill is not None
+    assert skill.argument_hint == "[env]"
+    assert skill.disable_model_invocation is True
+    assert skill.user_invocable is False
+    assert skill.model == "sonnet"
+    assert skill.effort == "high"
+    assert skill.execution_context == "fork"
+    assert skill.agent == "reviewer"
+    assert skill.paths == ["src/**"]
+    assert skill.shell == "bash"
+    assert skill.hooks == {"Stop": [{"type": "command"}]}
+    assert skill.metadata == {"extra-field": "present"}
+
+
 def test_relative_links_are_resolved_to_absolute_paths(tmp_path):
     skill_dir = tmp_path / "links"
     docs_dir = skill_dir / "docs"
@@ -105,15 +146,13 @@ def test_relative_links_are_resolved_to_absolute_paths(tmp_path):
 
     skill_file = skill_dir / "SKILL.md"
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: link-skill
             description: Tests link rewriting
             ---
             See the [notes](docs/info.md) and the [site](https://example.com).
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -132,27 +171,23 @@ def test_duplicate_skill_names_emit_warning_and_keep_first(tmp_path, capsys):
     second.parent.mkdir(parents=True)
 
     first.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: shared-skill
             description: primary copy
             ---
             Primary content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     second.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: shared-skill
             description: duplicate copy
             ---
             Duplicate content that should be ignored.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -181,7 +216,8 @@ def test_get_skill_reports_missing_when_no_skills(tmp_path, monkeypatch):
 
     result = invoke_get_skill({"skill_name": "unknown-skill"})
 
-    assert result == "Skill 'unknown-skill' not found. No skills are currently available."
+    assert "Skill 'unknown-skill' not found. Available skills:" in result
+    assert "batch" in result
 
 
 def test_project_skills_override_user_skills(tmp_path, monkeypatch):
@@ -196,30 +232,26 @@ def test_project_skills_override_user_skills(tmp_path, monkeypatch):
     user_skill = user_home / ".koder/skills/shared/SKILL.md"
     user_skill.parent.mkdir(parents=True)
     user_skill.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: shared
             description: user copy
             ---
             User content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
     project_skill = project_root / ".koder/skills/shared/SKILL.md"
     project_skill.parent.mkdir(parents=True)
     project_skill.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: shared
             description: project copy
             ---
             Project content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -230,18 +262,95 @@ def test_project_skills_override_user_skills(tmp_path, monkeypatch):
     assert "User content." not in result
 
 
+def test_plugin_skills_are_namespaced_and_loaded(tmp_path, monkeypatch):
+    from koder_agent.tools.skill import discover_merged_skills
+
+    monkeypatch.chdir(tmp_path)
+    plugin_root = tmp_path / ".koder" / "plugins" / "demo-plugin"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "plugin.json").write_text(
+        json.dumps({"name": "demo-plugin", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    skill_file = plugin_root / "skills" / "deploy" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        textwrap.dedent("""\
+            ---
+            name: deploy
+            description: Deploy via plugin
+            ---
+            Plugin content.
+            """),
+        encoding="utf-8",
+    )
+
+    skills = discover_merged_skills(cwd=tmp_path, plugin_root=plugin_root.parent)
+
+    assert "demo-plugin:deploy" in skills
+    assert skills["demo-plugin:deploy"].source == "plugin"
+
+
+def test_nested_and_additional_skill_directories_are_discovered(tmp_path, monkeypatch):
+    from koder_agent.tools.skill import discover_merged_skills
+
+    project_root = tmp_path / "project"
+    nested = project_root / "packages" / "frontend" / ".koder" / "skills" / "frontend-skill"
+    extra_root = tmp_path / "extra"
+    extra_skill = extra_root / ".koder" / "skills" / "shared-extra"
+    nested.mkdir(parents=True)
+    extra_skill.mkdir(parents=True)
+    (nested / "SKILL.md").write_text(
+        "---\nname: frontend-skill\ndescription: nested skill\n---\ncontent",
+        encoding="utf-8",
+    )
+    (extra_skill / "SKILL.md").write_text(
+        "---\nname: shared-extra\ndescription: additional skill\n---\ncontent",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+
+    skills = discover_merged_skills(cwd=project_root, additional_dirs=[extra_root])
+
+    assert "frontend-skill" in skills
+    assert skills["frontend-skill"].source == "project"
+    assert "shared-extra" in skills
+    assert skills["shared-extra"].source == "additional"
+
+
+def test_model_metadata_excludes_manual_only_skills(tmp_path, monkeypatch):
+    from koder_agent.tools.skill import discover_merged_skills
+
+    monkeypatch.chdir(tmp_path)
+    skill_file = tmp_path / ".koder" / "skills" / "deploy" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        textwrap.dedent("""\
+            ---
+            name: deploy
+            description: manual deployment
+            disable-model-invocation: true
+            ---
+            content
+            """),
+        encoding="utf-8",
+    )
+
+    skills = discover_merged_skills(cwd=tmp_path)
+    assert skills["deploy"].disable_model_invocation is True
+
+
 # ============================================================================
-# Tests for hyphenated allowed-tools (Claude Code compatibility)
+# Tests for hyphenated allowed-tools (alternative format)
 # ============================================================================
 
 
 def test_allowed_tools_hyphenated_format(tmp_path):
-    """Test that allowed-tools (hyphenated, Claude Code format) is parsed correctly."""
+    """Test that allowed-tools (hyphenated format) is parsed correctly."""
     skill_file = tmp_path / "hyphen-skill" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: hyphen-skill
             description: Tests hyphenated allowed-tools
@@ -250,8 +359,7 @@ def test_allowed_tools_hyphenated_format(tmp_path):
               - glob_search
             ---
             Content here.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -267,16 +375,14 @@ def test_allowed_tools_hyphenated_scalar(tmp_path):
     skill_file = tmp_path / "single-tool" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: single-tool
             description: Single tool allowed
             allowed-tools: read_file
             ---
             Content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -291,8 +397,7 @@ def test_allowed_tools_underscore_still_works(tmp_path):
     skill_file = tmp_path / "underscore-skill" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: underscore-skill
             description: Tests underscored allowed_tools
@@ -301,8 +406,7 @@ def test_allowed_tools_underscore_still_works(tmp_path):
               - edit_file
             ---
             Content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -317,8 +421,7 @@ def test_allowed_tools_hyphenated_takes_priority(tmp_path):
     skill_file = tmp_path / "both-formats" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: both-formats
             description: Both formats present
@@ -328,8 +431,7 @@ def test_allowed_tools_hyphenated_takes_priority(tmp_path):
               - write_file
             ---
             Content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -343,7 +445,7 @@ def test_allowed_tools_hyphenated_takes_priority(tmp_path):
 def test_allowed_tools_empty_hyphenated_takes_priority(tmp_path):
     """Test that empty allowed-tools takes priority over non-empty allowed_tools.
 
-    This is an important edge case: if the Claude Code format (allowed-tools)
+    This is an important edge case: if the hyphenated format (allowed-tools)
     is present but empty, it should still win over the underscored format.
     Empty allowed-tools means "no restrictions" (functionally - see skill_context.py).
     The allowed_tools field stores the empty list, which is treated as "no restrictions"
@@ -352,8 +454,7 @@ def test_allowed_tools_empty_hyphenated_takes_priority(tmp_path):
     skill_file = tmp_path / "empty-hyphen" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: empty-hyphen
             description: Empty hyphenated takes priority
@@ -362,8 +463,7 @@ def test_allowed_tools_empty_hyphenated_takes_priority(tmp_path):
               - write_file
             ---
             Content.
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -385,15 +485,13 @@ def test_skill_name_validation_warns_on_uppercase(tmp_path, capsys):
     skill_file = tmp_path / "bad-name" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: BadName
             description: Invalid name format
             ---
             Content
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -410,15 +508,13 @@ def test_skill_name_validation_warns_on_underscores(tmp_path, capsys):
     skill_file = tmp_path / "bad-name" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: bad_name_here
             description: Name with underscores
             ---
             Content
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -453,15 +549,13 @@ def test_skill_name_valid_does_not_warn(tmp_path, capsys):
     skill_file = tmp_path / "valid" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: valid-skill-name123
             description: A valid skill name
             ---
             Content
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 
@@ -498,15 +592,13 @@ def test_skill_description_valid_does_not_warn(tmp_path, capsys):
     skill_file = tmp_path / "valid-desc" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
-        textwrap.dedent(
-            """\
+        textwrap.dedent("""\
             ---
             name: valid-desc
             description: A perfectly normal description that is well under the limit.
             ---
             Content
-            """
-        ),
+            """),
         encoding="utf-8",
     )
 

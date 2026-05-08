@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from koder_agent.core.bash_security import analyze_command
+
 
 class SecurityGuard:
     """Security guard to validate paths and inputs."""
@@ -13,27 +15,17 @@ class SecurityGuard:
 
     @staticmethod
     def validate_command(command: str) -> Optional[str]:
-        """Validate a shell command for safety."""
-        command_lower = command.lower()
+        """Validate a shell command for safety.
 
-        # Check for forbidden commands
-        for forbidden in SecurityGuard.FORBIDDEN_WORDS:
-            if forbidden in command_lower:
-                return f"Forbidden command pattern detected: {forbidden}"
+        Delegates to the bash_security analyzer for comprehensive
+        pattern detection covering ~25 attack vectors.
 
-        # Check for dangerous patterns
-        dangerous_patterns = [
-            r">\s*/dev/(?!null\b)",  # Writing to device files (allow /dev/null)
-            r"dd\s+if=",  # Disk destroyer
-            r"mkfs",  # Format filesystem
-            r":(){ :|:& };:",  # Fork bomb
-        ]
-
-        for pattern in dangerous_patterns:
-            if re.search(pattern, command_lower):
-                return "Dangerous command pattern detected"
-
-        return None  # Valid command
+        Returns None if the command is safe, or a reason string if blocked.
+        """
+        analysis = analyze_command(command)
+        if analysis.blocked:
+            return analysis.reason
+        return None
 
     @staticmethod
     def sanitize_path(path: str) -> str:
