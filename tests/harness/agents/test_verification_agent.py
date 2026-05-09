@@ -14,6 +14,6 @@ def test_verification_agent_is_read_only():
     assert "Write" in (agent.disallowed_tools or [])
 
 
-def test_verification_agent_has_sonnet_model():
+def test_verification_agent_inherits_current_model():
     agent = next(a for a in BUILTIN_AGENT_DEFINITIONS if a.agent_type == "verification")
-    assert agent.model == "sonnet"
+    assert agent.model == "inherit"

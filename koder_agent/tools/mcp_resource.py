@@ -6,9 +6,8 @@ import json
 import logging
 import os
 
-from agents import function_tool
-
 from ..mcp.server_manager import MCPServerManager
+from .compat import function_tool
 
 _logger = logging.getLogger(__name__)
 

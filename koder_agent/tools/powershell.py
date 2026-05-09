@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from agents import function_tool
 from pydantic import BaseModel
 
 from koder_agent.harness.permissions.powershell_classifier import classify_powershell_command
 from koder_agent.harness.tools.shell_executor import execute_powershell_command
+
+from .compat import function_tool
 
 
 class PowerShellModel(BaseModel):

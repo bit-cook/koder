@@ -72,7 +72,7 @@ def test_compact_hooks_fire(tmp_path, monkeypatch):
 
     output = _run("/compact", handler=handler, scheduler=scheduler)
 
-    assert "original_count:" in output
+    assert output.startswith("compacted, context size ")
     assert json.loads(pre.read_text(encoding="utf-8"))["event"] == "PreCompact"
     assert json.loads(post.read_text(encoding="utf-8"))["event"] == "PostCompact"
 

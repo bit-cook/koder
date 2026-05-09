@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 from typing import Any, List, Optional
 
-from agents import function_tool
 from pydantic import BaseModel, Field
 
 from koder_agent.harness.tasks.storage import TaskStorage
+
+from .compat import function_tool
 
 # --- Storage singleton ---
 

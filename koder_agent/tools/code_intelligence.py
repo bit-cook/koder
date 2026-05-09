@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from agents import function_tool
 from pydantic import BaseModel
 
 from koder_agent.harness.code_intelligence import run_code_intelligence
+
+from .compat import function_tool
 
 
 class CodeIntelligenceModel(BaseModel):

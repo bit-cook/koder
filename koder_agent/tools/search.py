@@ -5,8 +5,9 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from agents import function_tool
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 
 class GlobModel(BaseModel):

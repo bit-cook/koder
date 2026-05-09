@@ -51,7 +51,7 @@ def test_resolve_advisor_model_uses_provider_default(tmp_path, monkeypatch):
     config.model.provider = "openai"
     config_service.save(config)
 
-    assert resolve_advisor_model() == "gpt-5.1"
+    assert resolve_advisor_model() == "gpt-5.5"
 
 
 def test_resolve_advisor_model_rejects_unsupported_provider(tmp_path, monkeypatch):
@@ -139,7 +139,7 @@ def test_run_advisor_review_uses_stronger_model_and_full_context(tmp_path, monke
     )
 
     assert output.startswith("# Advisor Review")
-    assert str(captured["model"]).endswith("gpt-5.1")
+    assert str(captured["model"]).endswith("gpt-5.5")
     prompt = captured["messages"][-1]["content"]
     assert "Focus on auth and tests" in prompt
     assert "Check auth and tests." in prompt

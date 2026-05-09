@@ -6,7 +6,7 @@ import json
 import sys
 from typing import Callable
 
-from agents import function_tool
+from .compat import function_tool
 
 _input_handler: Callable[[str], str] | None = None
 

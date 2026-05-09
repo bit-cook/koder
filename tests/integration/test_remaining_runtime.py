@@ -138,8 +138,16 @@ async def test_memory_not_injected_on_subsequent_turns(tmp_path):
 
         scheduler = AgentScheduler(session_id="test-subsequent", streaming=False)
 
-        # Mock session to return history on second call
-        scheduler.session.get_items = AsyncMock(side_effect=[[], [{"role": "user"}]])
+        get_items_calls = 0
+
+        def _session_items():
+            nonlocal get_items_calls
+            get_items_calls += 1
+            if get_items_calls <= 3:
+                return []
+            return [{"role": "user"}]
+
+        scheduler.session.get_items = AsyncMock(side_effect=_session_items)
 
         with patch("koder_agent.core.scheduler.Runner.run", new_callable=AsyncMock) as mock_run:
             mock_result = MagicMock()

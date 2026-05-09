@@ -5,10 +5,10 @@ from typing import List, Optional, Tuple
 
 import tiktoken
 import whatthepatch
-from agents import function_tool
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
+from .compat import function_tool
 from .file_state import ReadFileState
 
 _file_state = ReadFileState()

@@ -2,8 +2,9 @@
 
 from typing import List
 
-from agents import function_tool
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 
 class TodoModel(BaseModel):

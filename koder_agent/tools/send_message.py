@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from agents import function_tool
 from pydantic import BaseModel
 
 from koder_agent.harness.agents.teams.context import TeamToolContext, get_team_tool_context
 from koder_agent.harness.agents.teams.runtime import TEAM_LEAD_NAME
+
+from .compat import function_tool
 
 
 class SendMessageModel(BaseModel):

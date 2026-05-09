@@ -6,6 +6,8 @@ import time
 import uuid
 from pathlib import Path
 
+from koder_agent.harness.version_info import resolve_runtime_version
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -94,6 +96,6 @@ def test_tmux_release_notes_command_uses_cached_changelog(tmp_path):
         assert "Version 0.4.13:" in output
         assert "Added configurable statusline setup" in output
         saved = config_path.read_text(encoding="utf-8")
-        assert "last_release_notes_seen: 0.4.13" in saved
+        assert f"last_release_notes_seen: {resolve_runtime_version()}" in saved
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)

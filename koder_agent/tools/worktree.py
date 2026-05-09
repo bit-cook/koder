@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from agents import function_tool
+from .compat import function_tool
 
 # --- Slug validation ---
 

@@ -11,10 +11,10 @@ import time
 import uuid
 from typing import List, Optional
 
-from agents import function_tool
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
+from .compat import function_tool
 
 # Detect OS once at module load
 IS_WINDOWS = platform.system() == "Windows"

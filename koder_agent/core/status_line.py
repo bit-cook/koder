@@ -347,9 +347,12 @@ class StatusLine:
                 fragments.extend(pr_fragments)
 
         if self._notice:
-            notice = self._truncate(
-                self._notice, max(10, columns - sum(len(t) for _, t in fragments) - 12)
-            )
+            if self._notice.startswith("Voice error:"):
+                notice = self._notice
+            else:
+                notice = self._truncate(
+                    self._notice, max(10, columns - sum(len(t) for _, t in fragments) - 12)
+                )
             if notice:
                 self._append_field(fragments, "Notice: ", notice)
 

@@ -738,6 +738,7 @@ def test_upgrade_scenario_is_acceptance_backed_by_helper_script_help():
     assert "upgrade-help.txt" in help_turn["send"]
     assert "Checking " in help_turn["send"]
     assert help_turn["expect_all"] == [
+        "Shell Mode",
         "Usage: uv run scripts/upgrade_dependency.py [--help]",
         "upgrade-help-proof",
     ]
@@ -3840,19 +3841,26 @@ def test_release_notes_scenario_is_acceptance_backed_by_cached_changelog():
     } <= set(release_turn["expect_all"])
     assert {"Version 0.4.12:", "Older performance improvements"} <= set(release_turn["expect_not"])
     proof_turn = scenario["turns"][1]
-    assert "last_release_notes_seen: 0.4.13" in proof_turn["send"]
+    assert "resolve_runtime_version" in proof_turn["send"]
+    assert "last_release_notes_seen: 0.4.13" not in proof_turn["send"]
     assert "release-config-ok" not in proof_turn["send"]
     assert proof_turn["expect_all"] == [
-        "last_release_notes_seen: 0.4.13",
+        "Shell Mode",
+        "last_release_notes_seen: $RUNTIME_VERSION",
         "Added configurable statusline setup",
         "release-config-ok",
     ]
     assert scenario["turns"][2] == {
         "send": "/version",
-        "expect_all": ["version: 0.4.13", "package: koder"],
+        "expect_all": ["version: $RUNTIME_VERSION", "package: koder"],
     }
     assert scenario["post_assertions"] == [
-        {"file_contains": ["$HOME/.koder/config.yaml", "last_release_notes_seen: 0.4.13"]},
+        {
+            "file_contains": [
+                "$HOME/.koder/config.yaml",
+                "last_release_notes_seen: $RUNTIME_VERSION",
+            ]
+        },
         {"file_contains": ["$HOME/.koder/cache/changelog.md", "Improved release notes command"]},
     ]
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any, Optional, Union
 
-from agents import function_tool
-
 from koder_agent.config.manager import get_config_manager
+
+from .compat import function_tool
 
 # Supported settings mapped to type coercion
 _SUPPORTED_SETTINGS: dict[str, type] = {

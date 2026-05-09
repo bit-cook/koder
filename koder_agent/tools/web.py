@@ -3,11 +3,12 @@
 from urllib.parse import urlparse
 
 import requests
-from agents import function_tool
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 
 class SearchModel(BaseModel):

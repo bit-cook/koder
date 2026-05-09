@@ -6,9 +6,9 @@ import json
 import re
 from pathlib import Path
 
-from agents import function_tool
-
 from koder_agent.harness.cron.storage import CronStorage
+
+from .compat import function_tool
 
 # --- Storage singleton ---
 

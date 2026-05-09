@@ -281,8 +281,10 @@ class InteractivePrompt:
         self._config_service = config_service or RuntimeConfigService()
         self._voice_controller = VoiceDictationController(
             config_getter=self._config_service.load,
-            model_provider_getter=lambda: (get_config().model.provider or "").strip().lower()
-            or get_model_name().replace("litellm/", "").split("/", 1)[0],
+            model_provider_getter=lambda: (
+                (get_config().model.provider or "").strip().lower()
+                or get_model_name().replace("litellm/", "").split("/", 1)[0]
+            ),
         )
         self._last_space_pressed_at: Optional[float] = None
         self.history = InMemoryHistory()
@@ -752,8 +754,10 @@ class InteractivePrompt:
                 return 80, 24
 
         show_status_line = Condition(
-            lambda: self.status_line is not None
-            and _should_show_status_line(rows=_get_terminal_size()[1])
+            lambda: (
+                self.status_line is not None
+                and _should_show_status_line(rows=_get_terminal_size()[1])
+            )
         )
         show_completion_menu = Condition(
             lambda: (

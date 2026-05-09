@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from agents import function_tool
-
 from koder_agent.tools.shell import BackgroundShellManager
+
+from .compat import function_tool
 
 _shell_lookup: Callable[[str], Any] | None = None
 

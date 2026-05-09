@@ -6,9 +6,9 @@ import asyncio
 import json
 from typing import Any, Optional
 
-from agents import function_tool
-
 from koder_agent.tools.shell import BackgroundShellManager
+
+from .compat import function_tool
 
 _manager: Any = None
 

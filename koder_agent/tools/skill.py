@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
-from agents import function_tool
 from pydantic import BaseModel
 
 from koder_agent.config import get_config
 from koder_agent.harness.paths import harness_home_dir
 from koder_agent.harness.skills.bundled import get_bundled_skills
 from koder_agent.harness.skills.discovery import discover_skills_for_paths
+
+from .compat import function_tool
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 
-from agents import function_tool
+from .compat import function_tool
 
 # --- Deferred tool registry ---
 

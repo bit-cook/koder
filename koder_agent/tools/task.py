@@ -4,8 +4,10 @@ import asyncio
 from pathlib import Path
 from typing import List, Union
 
-from agents import RunConfig, Runner, function_tool
+from agents import RunConfig, Runner
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 
 class TaskModel(BaseModel):

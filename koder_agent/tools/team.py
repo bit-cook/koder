@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from agents import function_tool
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 
 class TeamCreateModel(BaseModel):

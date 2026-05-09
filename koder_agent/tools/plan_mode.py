@@ -6,9 +6,9 @@ import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from agents import function_tool
-
 from koder_agent.harness.plan.mode import PlanModeService
+
+from .compat import function_tool
 
 # --- Service singleton ---
 

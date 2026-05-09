@@ -72,7 +72,10 @@ async def test_usage_tracking_includes_model_name():
     ):
         mock_session = AsyncMock()
         mock_session.get_items = AsyncMock(return_value=[])
-        mock_session.db_path = Path("/tmp/test.db")
+        mock_session.db_path = ":memory:"
+        mock_session.encoder = Mock()
+        mock_session.encoder.encode = Mock(return_value=[])
+        mock_session._estimate_tokens = Mock(return_value=0)
         mock_session_cls.return_value = mock_session
 
         scheduler = AgentScheduler(session_id="test-usage-tracking")

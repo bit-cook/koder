@@ -14,8 +14,9 @@ from dataclasses import replace as _replace
 from pathlib import Path
 from typing import Optional
 
-from agents import function_tool
 from pydantic import BaseModel
+
+from .compat import function_tool
 
 # Fork context available via tools/fork_agent.py build_fork_context()
 # Pass result via AgentService seed_items parameter for context inheritance

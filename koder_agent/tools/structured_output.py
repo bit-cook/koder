@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from agents import function_tool
+from .compat import function_tool
 
 
 @function_tool

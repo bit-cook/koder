@@ -386,6 +386,16 @@ def _expand_scenario_path(value: str, *, home: Path, repo: Path) -> Path:
     return Path(expanded).expanduser()
 
 
+def _expand_scenario_text(value: str, *, home: Path, repo: Path) -> str:
+    from koder_agent.harness.version_info import resolve_runtime_version
+
+    return (
+        value.replace("$HOME", str(home))
+        .replace("$REPO", str(repo))
+        .replace("$RUNTIME_VERSION", resolve_runtime_version())
+    )
+
+
 def _expand_scenario_glob(value: str, *, home: Path, repo: Path) -> list[Path]:
     expanded = value.replace("$HOME", str(home)).replace("$REPO", str(repo))
     return [Path(path) for path in sorted(glob.glob(str(Path(expanded).expanduser())))]
@@ -399,8 +409,9 @@ def _expand_scenario_env_value(value: str, *, home: Path, repo: Path) -> str:
     )
 
 
-def _expected_strings(value: str | list[str]) -> list[str]:
-    return [value] if isinstance(value, str) else value
+def _expected_strings(value: str | list[str], *, home: Path, repo: Path) -> list[str]:
+    strings = [value] if isinstance(value, str) else value
+    return [_expand_scenario_text(item, home=home, repo=repo) for item in strings]
 
 
 def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> list[str]:
@@ -423,7 +434,11 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
                 failures.append(f"post_assertion {index}: expected file to exist: {path}")
                 continue
             content = path.read_text(encoding="utf-8")
-            missing = [item for item in _expected_strings(expected) if item not in content]
+            missing = [
+                item
+                for item in _expected_strings(expected, home=home, repo=repo)
+                if item not in content
+            ]
             if missing:
                 failures.append(
                     f"post_assertion {index}: {path} missing "
@@ -445,7 +460,7 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
                 failures.append(f"post_assertion {index}: expected glob to match: {raw_pattern}")
                 continue
             missing = []
-            for item in _expected_strings(expected):
+            for item in _expected_strings(expected, home=home, repo=repo):
                 if not any(item in path.read_text(encoding="utf-8") for path in matches):
                     missing.append(item)
             if missing:
@@ -458,7 +473,7 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
             raw_pattern, forbidden = assertion["file_glob_not_contains"]
             matches = _expand_scenario_glob(raw_pattern, home=home, repo=repo)
             present = []
-            for item in _expected_strings(forbidden):
+            for item in _expected_strings(forbidden, home=home, repo=repo):
                 if any(item in path.read_text(encoding="utf-8") for path in matches):
                     present.append(item)
             if present:
@@ -473,7 +488,11 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
             if not path.exists():
                 continue
             content = path.read_text(encoding="utf-8")
-            present = [item for item in _expected_strings(forbidden) if item in content]
+            present = [
+                item
+                for item in _expected_strings(forbidden, home=home, repo=repo)
+                if item in content
+            ]
             if present:
                 failures.append(
                     f"post_assertion {index}: {path} unexpectedly contains "
@@ -495,7 +514,11 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
             content = "\n".join(
                 "\t".join("" if value is None else str(value) for value in row) for row in rows
             )
-            missing = [item for item in _expected_strings(expected) if item not in content]
+            missing = [
+                item
+                for item in _expected_strings(expected, home=home, repo=repo)
+                if item not in content
+            ]
             if missing:
                 failures.append(
                     f"post_assertion {index}: sqlite result from {path} missing "
@@ -754,7 +777,14 @@ def _tmux_pane_assertions_pass(session: str, turn: dict[str, Any]) -> tuple[bool
     return True, pane_outputs
 
 
-def _wait_for_assertions(session: str, turn: dict[str, Any], timeout: float) -> tuple[bool, str]:
+def _wait_for_assertions(
+    session: str,
+    turn: dict[str, Any],
+    *,
+    home: Path,
+    repo: Path,
+    timeout: float,
+) -> tuple[bool, str]:
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
@@ -764,10 +794,10 @@ def _wait_for_assertions(session: str, turn: dict[str, Any], timeout: float) -> 
                 return True, last
         elif exists:
             last = _capture_for_turn(session, turn)
-            expect_all = turn.get("expect_all", [])
-            expect_any = turn.get("expect_any", [])
-            expect_regex = turn.get("expect_regex", [])
-            expect_not = turn.get("expect_not", [])
+            expect_all = _expected_strings(turn.get("expect_all", []), home=home, repo=repo)
+            expect_any = _expected_strings(turn.get("expect_any", []), home=home, repo=repo)
+            expect_regex = _expected_strings(turn.get("expect_regex", []), home=home, repo=repo)
+            expect_not = _expected_strings(turn.get("expect_not", []), home=home, repo=repo)
             all_ok = all(item in last for item in expect_all)
             any_ok = True if not expect_any else any(item in last for item in expect_any)
             regex_ok = all(re.search(pattern, last) for pattern in expect_regex)
@@ -818,7 +848,11 @@ def run_scenario(scenario: ScenarioRef, *, output_dir: Path) -> bool:
                 if turn.get("wait"):
                     time.sleep(float(turn["wait"]))
                 passed, output = _wait_for_assertions(
-                    session, turn, float(turn.get("timeout", 12.0))
+                    session,
+                    turn,
+                    home=home,
+                    repo=repo,
+                    timeout=float(turn.get("timeout", 12.0)),
                 )
                 capture = output_dir / f"{scenario.suite}-{scenario.name}-turn-{index}.txt"
                 capture.write_text(output, encoding="utf-8")
