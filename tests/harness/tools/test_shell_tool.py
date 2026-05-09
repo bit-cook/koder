@@ -6,6 +6,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # Stub litellm before importing koder_agent to avoid optional dependency issues
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
@@ -17,6 +19,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from koder_agent.harness.permissions.service import PermissionService
+from koder_agent.harness.sandbox.registry import get_backend_status
 from koder_agent.harness.tools.registry import ToolRegistry
 
 
@@ -30,7 +33,7 @@ def test_shell_tool_respects_permission_gate():
     assert result["permission"]["tool"] == "run_shell"
 
 
-def test_shell_tool_strict_sandbox_returns_error_before_execution(tmp_path, monkeypatch):
+def test_shell_tool_sandbox_returns_error_before_execution(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"
     (project / ".koder").mkdir(parents=True)
@@ -39,7 +42,7 @@ def test_shell_tool_strict_sandbox_returns_error_before_execution(tmp_path, monk
             {
                 "sandbox": {
                     "enabled": True,
-                    "allowUnsandboxedCommands": False,
+                    "backend": "missing",
                 }
             }
         ),
@@ -53,7 +56,38 @@ def test_shell_tool_strict_sandbox_returns_error_before_execution(tmp_path, monk
     result = asyncio.run(registry.get("run_shell").invoke({"command": "touch foo.txt"}))
 
     assert result["status"] == "error"
-    assert "strict sandbox mode" in result["content"]
+    assert "configured backend is unavailable" in result["content"]
+
+
+def test_shell_tool_runs_mutating_command_in_real_sandbox(tmp_path, monkeypatch):
+    status = get_backend_status("unix-local")
+    if not status.available:
+        pytest.skip(status.reason)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / "project"
+    (project / ".koder").mkdir(parents=True)
+    (project / ".koder" / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "sandbox": {
+                    "enabled": True,
+                    "backend": "unix-local",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    registry = ToolRegistry.with_permission_service(PermissionService.default())
+    registry.register_module("shell")
+
+    result = asyncio.run(registry.get("run_shell").invoke({"command": "touch sandboxed.txt"}))
+
+    assert result["status"] == "success"
+    assert "sandboxed: true" in result["content"]
+    assert "backend: unix-local" in result["content"]
+    assert (project / "sandboxed.txt").exists()
 
 
 def test_shell_tool_reports_argument_error_for_missing_command():

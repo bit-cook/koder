@@ -122,15 +122,17 @@ Export and import scopes are `all`, `user`, and `project`. Import writes into th
 
 ## Managed Settings
 
-Koder reads an optional local managed policy file at `~/.koder/managed-settings.json`. It can define high-priority hook settings and sandbox policy keys such as `enabled`, `autoAllowBashIfSandboxed`, and `allowUnsandboxedCommands`.
+Koder reads an optional local managed policy file at `~/.koder/managed-settings.json`. It can define high-priority hook settings and sandbox policy keys such as `enabled`, `mode`, `backend`, and `autoAllowBashIfSandboxed`.
 
 ```bash
 koder /managed-settings
 koder /hooks
-koder /sandbox-toggle status
+koder /sandbox status
 ```
 
 Managed settings are local files. Koder does not fetch a hosted managed-settings service, and `/managed-settings` only inspects the local policy file currently present on disk.
+
+See the [Sandbox Guide](sandbox.md) for sandbox backend selection, enable/disable commands, and status fields.
 
 ## Provider Setup
 

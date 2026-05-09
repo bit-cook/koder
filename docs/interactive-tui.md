@@ -52,7 +52,7 @@ Command families:
 | Memory | `/memory`, `/remember`, `/thinkback`, `/thinkback-play`, `/compact`, `/rewind` |
 | Agents | `/agents`, `/fork`, `/peers`, `/tasks`, `/teleport`, `/schedule` |
 | Extensions | `/skills`, `/plugin`, `/reload-plugins`, `/mcp`, `/channels`, `/magic-docs` |
-| Permissions | `/permissions`, `/sandbox`, `/sandbox-toggle`, `/managed-settings`, `/privacy-settings`, `/add-dir` |
+| Permissions | `/permissions`, `/sandbox`, `/managed-settings`, `/privacy-settings`, `/add-dir` |
 | GitHub | `/pr-comments`, `/install-github-app`, `/release-notes`, `/subscribe-pr`, `/autofix-pr` |
 
 See [Command Reference](commands.md) for the complete catalog.

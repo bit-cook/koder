@@ -10,7 +10,11 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from koder_agent.harness.sandbox.backend import SandboxExecutionContext
+from koder_agent.harness.sandbox.sdk_backend import execute_with_sdk_backend
+from koder_agent.harness.sandbox_settings import is_excluded_command, resolve_sandbox_settings
 from koder_agent.harness.session_env import build_subprocess_env
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -140,6 +144,18 @@ class ShellExecutionResult:
     shell_id: str | None = None
 
 
+def _sandbox_output(result) -> str:
+    lines: list[str] = []
+    if result.sandboxed:
+        lines.append("sandboxed: true")
+        if result.backend_id:
+            lines.append(f"backend: {result.backend_id}")
+    body = result.combined_output().strip()
+    if body:
+        lines.append(body)
+    return "\n".join(lines) if lines else "(no output)"
+
+
 async def execute_shell_command(
     command: str,
     *,
@@ -153,6 +169,47 @@ async def execute_shell_command(
         return ShellExecutionResult(status="error", output="Empty command")
 
     timeout = max(1, min(timeout, 600))
+
+    sandbox_state = resolve_sandbox_settings(Path.cwd())
+    use_sandbox = sandbox_state.enabled and not is_excluded_command(command, cwd=Path.cwd())
+    if use_sandbox:
+        if run_in_background:
+            return ShellExecutionResult(
+                status="error",
+                output=(
+                    "sandboxed: false\n"
+                    f"backend: {sandbox_state.backend}\n"
+                    "reason: background sandbox execution is not implemented"
+                ),
+            )
+        elif sandbox_state.policy is not None:
+            child_env = build_subprocess_env(session_id)
+            sandbox_result = await execute_with_sdk_backend(
+                SandboxExecutionContext(
+                    cwd=Path.cwd().resolve(),
+                    repo_root=Path.cwd().resolve(),
+                    command=command,
+                    env=child_env,
+                    timeout=timeout,
+                    background=False,
+                    session_id=session_id,
+                    policy=sandbox_state.policy,
+                )
+            )
+            if sandbox_result.status not in {"unavailable", "unsupported"}:
+                return ShellExecutionResult(
+                    status="success" if sandbox_result.exit_code == 0 else "error",
+                    output=_sandbox_output(sandbox_result),
+                    exit_code=sandbox_result.exit_code,
+                )
+            return ShellExecutionResult(
+                status="error",
+                output=(
+                    "sandboxed: false\n"
+                    f"backend: {sandbox_state.backend}\n"
+                    f"reason: {sandbox_result.reason or 'sandbox backend unavailable'}"
+                ),
+            )
 
     if run_in_background:
         shell_id = str(uuid.uuid4())[:8]
@@ -231,7 +288,6 @@ async def execute_shell_command(
             if output
             else f"[exit code]: {process.returncode}"
         )
-
     return ShellExecutionResult(
         status="success" if process.returncode == 0 else "error",
         output=output or "(no output)",

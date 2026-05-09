@@ -15,7 +15,7 @@ def test_managed_settings_command_reports_policy_file(tmp_path, monkeypatch):
         json.dumps(
             {
                 "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo ok"}]}]},
-                "sandbox": {"enabled": True, "allowUnsandboxedCommands": False},
+                "sandbox": {"enabled": True, "backend": "unix-local"},
             }
         ),
         encoding="utf-8",

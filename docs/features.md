@@ -14,6 +14,7 @@ This guide is the topic map for the `koder` CLI. Start here when you want to kno
 | Engineering workflows | [Workflows](workflows.md) | Reviews, security review, planning, Git readiness, PR comments, GitHub Actions setup, and release notes. |
 | Extension system | [Skills, Plugins, and MCP](extensions.md) | Skills, verifier skills, plugins, MCP servers, channels, and Magic Docs. |
 | Permissions and data | [Permissions and Privacy](permissions-and-privacy.md) | Tool approvals, sandbox policy, managed settings, workspace directories, local paths, and privacy boundaries. |
+| Shell sandboxing | [Sandbox Guide](sandbox.md) | Backend selection, real backend status, shell isolation boundaries, backend setup, and troubleshooting. |
 | Voice input | [Voice Mode](voice-mode.md) | Dictation controls and provider-specific speech-to-text configuration. |
 | Full command list | [Command Reference](commands.md) | Complete slash-command catalog with examples. |
 

@@ -31,6 +31,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 .ruff_cache
+.uv-cache
 *.egg
 MANIFEST
 

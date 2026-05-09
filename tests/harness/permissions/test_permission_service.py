@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # Stub litellm before importing koder_agent to avoid optional dependency issues
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
@@ -15,6 +17,7 @@ if str(project_root) not in sys.path:
 
 from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.service import PermissionService
+from koder_agent.harness.sandbox.registry import get_backend_status
 
 
 def test_permission_service_requires_approval_for_write_shell_command():
@@ -58,9 +61,7 @@ def test_permission_service_supports_skill_rule_syntax():
     assert allowed.allowed is True
 
 
-def test_permission_service_strict_sandbox_blocks_non_excluded_shell_commands(
-    tmp_path, monkeypatch
-):
+def test_permission_service_sandbox_blocks_non_excluded_shell_commands(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"
     (project / ".koder").mkdir(parents=True)
@@ -69,7 +70,7 @@ def test_permission_service_strict_sandbox_blocks_non_excluded_shell_commands(
             {
                 "sandbox": {
                     "enabled": True,
-                    "allowUnsandboxedCommands": False,
+                    "backend": "missing",
                 }
             }
         ),
@@ -82,10 +83,39 @@ def test_permission_service_strict_sandbox_blocks_non_excluded_shell_commands(
 
     assert result.allowed is False
     assert result.requires_approval is False
-    assert "strict sandbox mode" in result.reason
+    assert "configured backend is unavailable" in result.reason
 
 
-def test_permission_service_strict_sandbox_allows_excluded_shell_commands_to_fall_back(
+def test_permission_service_auto_allows_real_sandboxed_shell_commands(tmp_path, monkeypatch):
+    status = get_backend_status("unix-local")
+    if not status.available:
+        pytest.skip(status.reason)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / "project"
+    (project / ".koder").mkdir(parents=True)
+    (project / ".koder" / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "sandbox": {
+                    "enabled": True,
+                    "backend": "unix-local",
+                    "autoAllowBashIfSandboxed": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    service = PermissionService.default()
+    result = service.evaluate_tool_call("run_shell", {"command": "touch foo.txt"})
+
+    assert result.allowed is True
+    assert result.requires_approval is False
+    assert "sandboxed shell command auto-allowed" in result.reason
+
+
+def test_permission_service_sandbox_exclusions_return_to_normal_shell_permissions(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -96,7 +126,6 @@ def test_permission_service_strict_sandbox_allows_excluded_shell_commands_to_fal
             {
                 "sandbox": {
                     "enabled": True,
-                    "allowUnsandboxedCommands": False,
                     "excludedCommands": ["touch *"],
                 }
             }

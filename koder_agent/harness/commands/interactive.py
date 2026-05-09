@@ -439,7 +439,6 @@ class HarnessInteractiveCommandHandler:
             "teleport": self._execute_teleport,
             "voice": self._execute_voice,
             "ctx_viz": self._execute_ctx_viz,
-            "sandbox-toggle": self._execute_sandbox_toggle,
             "security-review": self._execute_security_review,
             "summary": self._execute_summary,
             "onboarding": self._execute_onboarding,
@@ -4324,20 +4323,118 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         return "\n".join(lines)
 
     async def _execute_sandbox(self, _scheduler, _args: list[str]) -> str:
-        """Show sandbox status."""
+        """Show and update sandbox settings."""
         from pathlib import Path
 
-        from koder_agent.harness.sandbox_settings import resolve_sandbox_settings
+        from koder_agent.harness.sandbox.registry import BACKEND_IDS, normalize_backend_id
 
-        state = resolve_sandbox_settings(Path.cwd())
-        lines = ["Sandbox Settings:"]
-        lines.append(f"  Enabled: {state.enabled}")
-        lines.append(f"  Allow unsandboxed: {state.allow_unsandboxed_commands}")
-        lines.append(f"  Policy locked: {state.policy_locked}")
-        if state.excluded_commands:
-            lines.append(f"  Excluded commands: {', '.join(state.excluded_commands)}")
-        lines.append("\nUse /sandbox-toggle to modify sandbox settings.")
-        return "\n".join(lines)
+        cwd = Path.cwd()
+
+        def _render_backend_choices(prefix: str | None = None) -> str:
+            state = resolve_sandbox_settings(cwd)
+            lines: list[str] = []
+            if prefix:
+                lines.append(prefix)
+            lines.append("Available sandbox backends:")
+            for status in state.backend_statuses:
+                marker = "*" if status.backend_id == state.backend else "-"
+                availability = "available" if status.available else "unavailable"
+                lines.append(f"  {marker} {status.backend_id}: {availability} ({status.reason})")
+            lines.append("Usage: /sandbox enable <backend>")
+            lines.append("Example: /sandbox enable unix-local")
+            return "\n".join(lines)
+
+        def _render_status(prefix: str | None = None) -> str:
+            state = resolve_sandbox_settings(cwd)
+            lines: list[str] = []
+            if prefix:
+                lines.append(prefix)
+            lines.extend(
+                [
+                    f"sandbox_enabled: {str(state.enabled).lower()}",
+                    f"backend: {state.backend}",
+                    f"backend_available: {str(state.backend_available).lower()}",
+                    f"backend_reason: {state.backend_reason}",
+                    f"mode: {state.policy_mode}",
+                    f"auto_allow_bash_if_sandboxed: {str(state.auto_allow_bash_if_sandboxed).lower()}",
+                    f"network_access: {str(state.network_access).lower()}",
+                    "allowed_domains: "
+                    + (", ".join(state.allowed_domains) if state.allowed_domains else "none"),
+                    "denied_domains: "
+                    + (", ".join(state.denied_domains) if state.denied_domains else "none"),
+                    "protected_paths: "
+                    + (", ".join(state.protected_paths) if state.protected_paths else "none"),
+                    f"excluded_commands: {len(state.excluded_commands)}",
+                    f"policy_locked: {str(state.policy_locked).lower()}",
+                    f"settings_path: {state.settings_path}",
+                    "backend_options: " + ", ".join(BACKEND_IDS),
+                ]
+            )
+            if state.enabled and state.backend_available and state.platform_enabled:
+                lines.append(
+                    f"note: foreground shell commands use sandbox backend {state.backend}."
+                )
+            elif state.enabled:
+                lines.append(
+                    "note: sandbox is enabled, but the configured backend is unavailable; "
+                    "non-excluded foreground shell commands are denied."
+                )
+            else:
+                lines.append(
+                    "note: sandbox disabled; shell commands use the normal local executor."
+                )
+            return "\n".join(lines)
+
+        if not _args or _args[0].lower() == "status":
+            return _render_status()
+
+        subcommand = _args[0].lower()
+        state = resolve_sandbox_settings(cwd)
+        if subcommand in {"backends", "list"}:
+            return _render_backend_choices()
+
+        if state.policy_locked and subcommand in {"enable", "disable", "off", "exclude"}:
+            return _render_status("sandbox: settings locked by managed policy")
+
+        if subcommand == "enable":
+            if len(_args) < 2:
+                return _render_backend_choices("sandbox: choose a backend")
+            backend = normalize_backend_id(_args[1])
+            if backend not in BACKEND_IDS:
+                return _render_backend_choices(f"sandbox: unknown backend {backend}")
+            update_local_sandbox_settings(
+                cwd,
+                enabled=True,
+                backend=backend,
+            )
+            return _render_status("sandbox: enabled")
+
+        if subcommand in {"disable", "off"}:
+            update_local_sandbox_settings(cwd, enabled=False)
+            return _render_status("sandbox: disabled")
+
+        if subcommand == "exclude":
+            command_pattern = " ".join(_args[1:]).strip()
+            if not command_pattern:
+                return 'Usage: /sandbox exclude "command pattern"'
+            if (
+                len(command_pattern) >= 2
+                and command_pattern[0] == command_pattern[-1]
+                and command_pattern[0] in {'"', "'"}
+            ):
+                command_pattern = command_pattern[1:-1]
+            target, normalized = add_excluded_command(cwd, command_pattern)
+            state = resolve_sandbox_settings(cwd)
+            return (
+                "sandbox: excluded command added\n"
+                f"pattern: {normalized}\n"
+                f"excluded_commands: {len(state.excluded_commands)}\n"
+                f"settings_path: {target}"
+            )
+
+        return (
+            'Usage: /sandbox [status|backends|enable <backend>|disable|exclude "command pattern"]'
+        )
 
     async def _execute_schedule(self, _scheduler, _args: list[str]) -> str:
         """Show/manage cron tasks."""
@@ -5054,99 +5151,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                 sections.append("Recent transcript:\n" + "\n".join(recent_lines))
 
         return "\n\n".join(section for section in sections if section).strip()
-
-    async def _execute_sandbox_toggle(self, _scheduler, _args: list[str]) -> str:
-        cwd = Path.cwd()
-        state = resolve_sandbox_settings(cwd)
-
-        def _render_status(prefix: str | None = None) -> str:
-            lines: list[str] = []
-            if prefix:
-                lines.append(prefix)
-            lines.extend(
-                [
-                    f"sandbox_enabled: {str(state.enabled).lower()}",
-                    f"execution_mode: {state.execution_mode}",
-                    f"allow_unsandboxed_commands: {str(state.allow_unsandboxed_commands).lower()}",
-                    (
-                        "auto_allow_bash_if_sandboxed: "
-                        f"{str(state.auto_allow_bash_if_sandboxed).lower()}"
-                    ),
-                    f"excluded_commands: {len(state.excluded_commands)}",
-                    f"platform: {state.platform}",
-                    f"platform_supported: {str(state.platform_supported).lower()}",
-                    f"platform_enabled: {str(state.platform_enabled).lower()}",
-                    f"policy_locked: {str(state.policy_locked).lower()}",
-                    (
-                        "dependency_errors: "
-                        + (
-                            ", ".join(state.dependency_errors)
-                            if state.dependency_errors
-                            else "none"
-                        )
-                    ),
-                    f"settings_path: {state.settings_path}",
-                    (
-                        "note: koder does not provide an OS-level sandbox executor; "
-                        "strict mode blocks non-excluded model shell commands."
-                    ),
-                ]
-            )
-            return "\n".join(lines)
-
-        if not _args or (_args and _args[0].lower() == "status"):
-            return _render_status()
-
-        subcommand = _args[0].lower()
-        if state.policy_locked:
-            return _render_status("sandbox-toggle: settings locked by managed policy")
-
-        if subcommand == "strict":
-            update_local_sandbox_settings(
-                cwd,
-                enabled=True,
-                allow_unsandboxed_commands=False,
-            )
-            state = resolve_sandbox_settings(cwd)
-            return _render_status("sandbox-toggle: strict mode enabled")
-
-        if subcommand in {"fallback", "enable"}:
-            update_local_sandbox_settings(
-                cwd,
-                enabled=True,
-                allow_unsandboxed_commands=True,
-            )
-            state = resolve_sandbox_settings(cwd)
-            return _render_status("sandbox-toggle: fallback mode enabled")
-
-        if subcommand in {"disable", "off"}:
-            update_local_sandbox_settings(
-                cwd,
-                enabled=False,
-            )
-            state = resolve_sandbox_settings(cwd)
-            return _render_status("sandbox-toggle: disabled")
-
-        if subcommand == "exclude":
-            command_pattern = " ".join(_args[1:]).strip()
-            if not command_pattern:
-                return 'Usage: /sandbox-toggle exclude "command pattern"'
-            if (
-                len(command_pattern) >= 2
-                and command_pattern[0] == command_pattern[-1]
-                and command_pattern[0] in {'"', "'"}
-            ):
-                command_pattern = command_pattern[1:-1]
-            target, normalized = add_excluded_command(cwd, command_pattern)
-            state = resolve_sandbox_settings(cwd)
-            return (
-                "sandbox-toggle: excluded command added\n"
-                f"pattern: {normalized}\n"
-                f"excluded_commands: {len(state.excluded_commands)}\n"
-                f"settings_path: {target}"
-            )
-
-        return 'Usage: /sandbox-toggle [status|strict|fallback|disable|exclude "command pattern"]'
 
     async def _execute_security_review(self, _scheduler, _args: list[str]) -> str:
         return await run_security_review(cwd=Path.cwd())

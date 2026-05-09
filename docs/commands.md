@@ -6,7 +6,7 @@ This reference lists the live Koder slash-command registry with usage examples a
 
 ## Summary
 
-- Runtime slash commands: `94`
+- Runtime slash commands: `93`
 - Common workflow rows: `16`
 - Missing runtime command entries: `0`
 
@@ -68,7 +68,7 @@ This reference lists the live Koder slash-command registry with usage examples a
 | `/output-style` | `/output-style` | Inspect, update, and reset terminal output style controls across theme, color, vim, statusline, and persisted settings. | `8` | Inspect and update terminal output styling |
 | `/passes` | `/passes` | Show verification status from real pytest cache, including no-cache, passing, and failing test states. | `5` | Show verification passes |
 | `/peers` | `/peers create peers-scenario` | Create and inspect an agent team, consume mailbox work, record history, and complete a persisted team task. | `11` | Create and manage local agent teams |
-| `/permissions` | `/permissions` | Validate permission status, mutating shell approvals, strict sandbox denials, fallback read-only allowance, and persisted settings. | `6` | Inspect runtime permission behavior |
+| `/permissions` | `/permissions` | Validate permission status, mutating shell approvals, sandbox auto-allow when the configured backend is available, excluded commands, and persisted settings. | `6` | Inspect runtime permission behavior |
 | `/plan` | `/plan` | Enter and exit plan mode while proving read-only permission enforcement through the TUI. | `6` | Enter read-only plan mode |
 | `/plugin` | `/plugin` | List the installed plugin, reject a missing plugin toggle, disable and re-enable the fixture plugin, and assert persisted enabled state. | `6` | Inspect and manage installed plugins |
 | `/pr-comments` | `/pr-comments` | Fetch and render PR comments through a deterministic local gh fixture, including threaded review comments and failure edges. | `8` | Render GitHub PR comments for the current branch |
@@ -81,8 +81,7 @@ This reference lists the live Koder slash-command registry with usage examples a
 | `/resume` | `/resume resume-title` | Resume existing sessions by exact title and id while rejecting missing and ambiguous targets. | `7` | Resume a previous session |
 | `/review` | `/review` | Review local and PR diffs through deterministic fake gh and OpenAI-compatible fixtures, including clean and gh-failure edges. | `8` | Start a review-oriented workflow |
 | `/rewind` | `!uv --project "$PYTHONPATH" run --no-sync python -c 'import asyncio, sqlite3; from pathlib import Path; from koder_agent.core.session import EnhancedSQLiteSession; db=Path.home()/".koder"/"koder.db"; conn=sqlite3.connect(db); sid=conn.execute("select session_id from session_metadata order by updated_at desc limit 1").fetchone()[0]; items=[{"role":"user","content":"first prompt"},{"role":"assistant","content":"first reply"},{"role":"user","content":"second prompt"},{"role":"assistant","content":"second reply"}]; asyncio.run(EnhancedSQLiteSession(sid).add_items(items)); marker="rewind-"+"seed"; print(marker, sid)'` | Seed conversation history, list rewind targets, restore a selected prompt into input, and prove session history is trimmed. | `9` | Rewind recent workflow state |
-| `/sandbox` | `/sandbox` | Validate default, strict, and fallback sandbox status plus persisted local settings. | `5` | Inspect sandbox settings |
-| `/sandbox-toggle` | `/sandbox-toggle status` | Validate sandbox status, strict mode, excluded command patterns, fallback mode, disable, invalid usage, and persisted settings. | `6` | Toggle local sandbox policy settings |
+| `/sandbox` | `/sandbox status` | Validate sandbox status, backend choices, enable, disable, excluded command patterns, and persisted local settings. | `5` | Inspect and configure sandbox settings |
 | `/schedule` | `/schedule` | Inspect the scheduled task registry from real cron storage, including empty, created, deleted, and malformed states. | `8` | Inspect scheduled task registry |
 | `/security-review` | `/security-review` | Run a deterministic security review over pending git changes and verify the clean-worktree short circuit. | `5` | Run a security-focused review of pending changes |
 | `/session` | `/session` | Inspect active session identifiers and metadata before and after title/tag mutations. | `4` | Inspect the current session |
@@ -124,7 +123,7 @@ This reference lists the live Koder slash-command registry with usage examples a
 | `skills` | `project-and-plugin-skill-listing` | /skills, /plugin, /reload-plugins, /demo-plugin:plugin-skill | Verify project and plugin skills are listed with namespaces, plugin skills execute locally, disabling hides and blocks them, and re-enabling restores them. | `9` |
 | `features` | `auto-dream-task` | /tasks | Run a deterministic AutoDream consolidation, verify task and memory persistence, update task metadata, and report malformed task records through /tasks. | `4` |
 | `features` | `memory-and-session` | /memory, /remember, /rename, /clear, /resume, /session | Save project memory, verify memory listing, rename the active session, switch away, resume by title, and confirm durable session metadata. | `9` |
-| `features` | `permissions-and-sandbox` | /permissions, /sandbox-toggle, /sandbox | Exercise sandbox policy changes and permission-engine decisions for denied, approval-required, and allowed shell tool calls. | `9` |
+| `features` | `permissions-and-sandbox` | /permissions, /sandbox | Exercise sandbox policy changes and permission-engine decisions for approval-required, sandboxed, and excluded shell tool calls. | `7` |
 | `features` | `prompt-suggestion` | shell mode, /clear | Generate a post-turn ghost suggestion, accept it into the prompt, clear it, and verify stale suggestions do not survive a session clear. | `7` |
 | `features` | `settings-bundle` | /config | Export and import local settings bundles, covering dry-run behavior, project scope filtering, token/cache exclusion, restore, and backup UX. | `5` |
 | `features` | `slash-completion` | prompt completion, /stats | Filter slash completions in the real prompt, survive a small terminal resize without layout errors, and execute the selected completion. | `3` |

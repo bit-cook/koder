@@ -106,7 +106,7 @@ Good first commands inside the TUI:
 | Check usage and cost | `/usage`, `/cost` |
 | Manage agents and teams | `/agents`, `/fork`, `/peers`, `/tasks` |
 | Manage extensions | `/skills`, `/plugin`, `/mcp`, `/channels` |
-| Manage permissions | `/permissions`, `/sandbox`, `/sandbox-toggle`, `/add-dir` |
+| Manage permissions | `/permissions`, `/sandbox`, `/add-dir` |
 
 See the [Command Reference](docs/commands.md) for the complete slash-command catalog.
 
@@ -301,7 +301,7 @@ uv run pytest -v -k "test_name"
 - OAuth tokens and cached provider model lists are stored under `~/.koder/tokens/`.
 - Sessions, transcripts, memories, tasks, agents, and teams are stored locally under `~/.koder/` and project `.koder/` paths.
 - Koder does not upload sessions to a Koder-hosted service. Model requests still go to the provider you configure.
-- Shell, file, MCP, and teammate operations are mediated by local permission and sandbox policy.
+- Shell, file, MCP, and teammate operations are mediated by local permission and sandbox policy. Foreground shell commands can use a real sandbox backend when `/sandbox status` reports that backend as available.
 
 Use these commands to inspect boundaries:
 
@@ -314,7 +314,7 @@ Use these commands to inspect boundaries:
 /context
 ```
 
-See [Permissions and Privacy](docs/permissions-and-privacy.md) for details.
+See [Sandbox Guide](docs/sandbox.md) and [Permissions and Privacy](docs/permissions-and-privacy.md) for details.
 
 ## Documentation
 
@@ -327,6 +327,7 @@ See [Permissions and Privacy](docs/permissions-and-privacy.md) for details.
 - [Workflows](docs/workflows.md) - review, planning, Git, GitHub, release, and verification workflows
 - [Skills, Plugins, and MCP](docs/extensions.md) - extending Koder with skills, plugins, MCP servers, channels, and Magic Docs
 - [Permissions and Privacy](docs/permissions-and-privacy.md) - approvals, sandbox policy, managed settings, workspace roots, and data boundaries
+- [Sandbox Guide](docs/sandbox.md) - shell sandbox backends, status fields, configuration, and troubleshooting
 - [Voice Mode](docs/voice-mode.md) - voice dictation setup and provider-specific notes
 - [Command Reference](docs/commands.md) - complete slash-command catalog
 

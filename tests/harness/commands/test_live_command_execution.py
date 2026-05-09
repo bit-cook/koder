@@ -545,7 +545,7 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
         os.environ["HOME"] = str(original_home)
     color_output = _run("/color", handler=handler)
     ctx_viz_output = _run("/ctx_viz", handler=handler)
-    sandbox_toggle_output = _run("/sandbox-toggle", handler=handler)
+    sandbox_output = _run("/sandbox", handler=handler)
     security_review_output = _run("/security-review", handler=handler)
     summary_output = _run("/summary", handler=handler)
     terminal_setup_output = _run("/terminalSetup", handler=handler)
@@ -605,8 +605,8 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     assert saved_statusline["statusLine"]["type"] == "command"
     assert "Please provide a color." in color_output
     assert "Working directory:" in ctx_viz_output
-    assert "sandbox_enabled:" in sandbox_toggle_output
-    assert "execution_mode: local-policy-only" in sandbox_toggle_output
+    assert "sandbox_enabled:" in sandbox_output
+    assert "backend: unix-local" in sandbox_output
     assert "# Security Review" in security_review_output
     assert summary_output
     assert "terminal" in terminal_setup_output.lower()
@@ -1292,27 +1292,31 @@ def test_ctx_viz_command_reports_session_snapshot_when_scheduler_present(tmp_pat
     assert "Investigate auth failures." in output
 
 
-def test_sandbox_toggle_command_reports_and_updates_local_policy(tmp_path, monkeypatch):
+def test_sandbox_command_reports_and_updates_local_policy(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     handler = HarnessInteractiveCommandHandler(emit_console=False)
 
-    status_output = _run("/sandbox-toggle", handler=handler)
+    status_output = _run("/sandbox", handler=handler)
     assert "sandbox_enabled: false" in status_output
-    assert "execution_mode: local-policy-only" in status_output
+    assert "backend: unix-local" in status_output
 
-    strict_output = _run("/sandbox-toggle strict", handler=handler)
-    assert "sandbox-toggle: strict mode enabled" in strict_output
-    assert "allow_unsandboxed_commands: false" in strict_output
+    choices_output = _run("/sandbox enable", handler=handler)
+    assert "sandbox: choose a backend" in choices_output
+    assert "unix-local" in choices_output
 
-    exclude_output = _run('/sandbox-toggle exclude "touch *"', handler=handler)
-    assert "sandbox-toggle: excluded command added" in exclude_output
+    enable_output = _run("/sandbox enable unix-local", handler=handler)
+    assert "sandbox: enabled" in enable_output
+    assert "backend: unix-local" in enable_output
+
+    exclude_output = _run('/sandbox exclude "touch *"', handler=handler)
+    assert "sandbox: excluded command added" in exclude_output
     assert "pattern: touch *" in exclude_output
 
     settings_path = tmp_path / ".koder" / "settings.local.json"
     saved = json.loads(settings_path.read_text(encoding="utf-8"))
     assert saved["sandbox"]["enabled"] is True
-    assert saved["sandbox"]["allowUnsandboxedCommands"] is False
+    assert saved["sandbox"]["backend"] == "unix-local"
     assert saved["sandbox"]["excludedCommands"] == ["touch *"]
 
 
@@ -1321,20 +1325,19 @@ def test_sandbox_command_reports_managed_policy_lock(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".koder").mkdir(parents=True)
     (tmp_path / ".koder" / "managed-settings.json").write_text(
-        json.dumps({"sandbox": {"enabled": True, "allowUnsandboxedCommands": False}}),
+        json.dumps({"sandbox": {"enabled": True, "backend": "unix-local"}}),
         encoding="utf-8",
     )
     handler = HarnessInteractiveCommandHandler(emit_console=False)
 
     output = _run("/sandbox", handler=handler)
-    toggle_output = _run("/sandbox-toggle fallback", handler=handler)
+    toggle_output = _run("/sandbox enable docker", handler=handler)
 
-    assert "Enabled: True" in output
-    assert "Allow unsandboxed: False" in output
-    assert "Policy locked: True" in output
-    assert "sandbox-toggle: settings locked by managed policy" in toggle_output
+    assert "sandbox_enabled: true" in output
+    assert "backend: unix-local" in output
+    assert "policy_locked: true" in output
+    assert "sandbox: settings locked by managed policy" in toggle_output
     assert "sandbox_enabled: true" in toggle_output
-    assert "allow_unsandboxed_commands: false" in toggle_output
     assert "policy_locked: true" in toggle_output
 
 
@@ -2431,24 +2434,22 @@ def test_permissions_check_reports_sandbox_and_tool_decisions(tmp_path, monkeypa
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     handler = HarnessInteractiveCommandHandler(emit_console=False)
 
-    strict_output = _run("/sandbox-toggle strict", handler=handler)
+    enable_output = _run("/sandbox enable unix-local", handler=handler)
     blocked_output = _run("/permissions check run_shell touch blocked.txt", handler=handler)
-    exclude_output = _run("/sandbox-toggle exclude touch *", handler=handler)
-    fallback_output = _run("/permissions check run_shell touch blocked.txt", handler=handler)
-    fallback_mode_output = _run("/sandbox-toggle fallback", handler=handler)
+    exclude_output = _run("/sandbox exclude touch *", handler=handler)
+    excluded_output = _run("/permissions check run_shell touch blocked.txt", handler=handler)
     read_output = _run("/permissions check run_shell rg TODO .", handler=handler)
 
-    assert "sandbox-toggle: strict mode enabled" in strict_output
+    assert "sandbox: enabled" in enable_output
     assert "permissions: check" in blocked_output
     assert "tool: run_shell" in blocked_output
-    assert "allowed: false" in blocked_output
+    assert "allowed: true" in blocked_output
     assert "requires_approval: false" in blocked_output
-    assert "strict sandbox mode" in blocked_output
-    assert "sandbox-toggle: excluded command added" in exclude_output
-    assert "allowed: false" in fallback_output
-    assert "requires_approval: true" in fallback_output
-    assert "mutate filesystem" in fallback_output
-    assert "sandbox-toggle: fallback mode enabled" in fallback_mode_output
+    assert "sandboxed shell command auto-allowed" in blocked_output
+    assert "sandbox: excluded command added" in exclude_output
+    assert "allowed: false" in excluded_output
+    assert "requires_approval: true" in excluded_output
+    assert "mutate filesystem" in excluded_output
     assert "allowed: true" in read_output
     assert "requires_approval: false" in read_output
 

@@ -86,8 +86,16 @@ def render_managed_settings_status(path: Path | None = None) -> str:
             key in sandbox
             for key in (
                 "enabled",
+                "mode",
+                "backend",
+                "networkAccess",
+                "writableRoots",
+                "allowRead",
+                "denyRead",
+                "allowWrite",
+                "denyWrite",
+                "protectedPaths",
                 "autoAllowBashIfSandboxed",
-                "allowUnsandboxedCommands",
             )
         )
     )

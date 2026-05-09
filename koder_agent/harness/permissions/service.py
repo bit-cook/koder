@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..sandbox.workspace import protected_write_violation, read_only_violation
 from ..sandbox_settings import is_excluded_command, resolve_sandbox_settings
 from .denial_log import DenialLog
 from .modes import PermissionMode
@@ -301,11 +302,16 @@ class PermissionService:
                 )
             current_cwd = Path.cwd()
             state = resolve_sandbox_settings(current_cwd)
-            if state.enabled and not is_excluded_command(command, cwd=current_cwd):
-                if not state.allow_unsandboxed_commands:
+            excluded_from_sandbox = is_excluded_command(command, cwd=current_cwd)
+            decision = (
+                classify_powershell_command(command)
+                if tool_name == "run_powershell"
+                else classify_shell_command(command)
+            )
+            if state.enabled and not excluded_from_sandbox:
+                if tool_name == "run_powershell":
                     reason = (
-                        "strict sandbox mode is enabled, but koder has no OS sandbox executor for "
-                        "model shell commands; allow unsandboxed fallback or add an excluded command"
+                        "sandbox is enabled, but PowerShell sandbox execution is not implemented"
                     )
                     self.denial_log.record(tool_name, reason)
                     return PermissionEvaluationResult.deny(
@@ -313,11 +319,56 @@ class PermissionService:
                         reason=reason,
                         mode=self.mode,
                     )
-            decision = (
-                classify_powershell_command(command)
-                if tool_name == "run_powershell"
-                else classify_shell_command(command)
-            )
+                if bool(arguments.get("run_in_background")):
+                    reason = (
+                        "sandbox is enabled, but background sandbox execution is not implemented "
+                        "for model shell commands"
+                    )
+                    self.denial_log.record(tool_name, reason)
+                    return PermissionEvaluationResult.deny(
+                        tool_name=tool_name,
+                        reason=reason,
+                        mode=self.mode,
+                    )
+
+                if not state.backend_available or not state.platform_enabled:
+                    reason = (
+                        "sandbox is enabled, but the configured backend is unavailable; "
+                        f"backend={state.backend}; reason={state.backend_reason}"
+                    )
+                    self.denial_log.record(tool_name, reason)
+                    return PermissionEvaluationResult.deny(
+                        tool_name=tool_name,
+                        reason=reason,
+                        mode=self.mode,
+                    )
+                elif tool_name == "run_shell" and state.policy is not None:
+                    violation = read_only_violation(command, policy=state.policy)
+                    if violation is None:
+                        violation = protected_write_violation(
+                            command,
+                            policy=state.policy,
+                            repo_root=current_cwd,
+                        )
+                    if violation is not None:
+                        self.denial_log.record(tool_name, violation)
+                        return PermissionEvaluationResult.deny(
+                            tool_name=tool_name,
+                            reason=violation,
+                            mode=self.mode,
+                        )
+                    if (
+                        decision.requires_approval
+                        and state.auto_allow_bash_if_sandboxed
+                        and state.backend_available
+                    ):
+                        return PermissionEvaluationResult.allow(
+                            tool_name=tool_name,
+                            mode=self.mode,
+                            reason=(
+                                f"sandboxed shell command auto-allowed; backend={state.backend}"
+                            ),
+                        )
             if not decision.allowed:
                 self.denial_log.record(tool_name, decision.reason)
                 return PermissionEvaluationResult.deny(

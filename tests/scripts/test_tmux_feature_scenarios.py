@@ -2380,25 +2380,19 @@ def test_managed_settings_scenario_is_acceptance_backed_by_policy_lock():
     assert "hooks_events: 1" in managed_turn["expect_all"]
     assert "hooks_groups: 1" in managed_turn["expect_all"]
     assert "sandbox_policy_locked: true" in managed_turn["expect_all"]
-    assert "sandbox_keys: allowUnsandboxedCommands, enabled" in managed_turn["expect_all"]
+    assert "sandbox_keys: backend, enabled" in managed_turn["expect_all"]
 
     sandbox_turn = scenario["turns"][2]
     assert sandbox_turn == {
         "send": "/sandbox",
-        "expect_all": [
-            "Sandbox Settings:",
-            "Enabled: True",
-            "Allow unsandboxed: False",
-            "Policy locked: True",
-        ],
+        "expect_all": ["sandbox_enabled: true", "backend: unix-local", "policy_locked: true"],
     }
     lock_turn = scenario["turns"][3]
     assert lock_turn == {
-        "send": "/sandbox-toggle fallback",
+        "send": "/sandbox enable docker",
         "expect_all": [
-            "sandbox-toggle: settings locked by managed policy",
+            "sandbox: settings locked by managed policy",
             "sandbox_enabled: true",
-            "allow_unsandboxed_commands: false",
             "policy_locked: true",
         ],
     }
@@ -2406,7 +2400,7 @@ def test_managed_settings_scenario_is_acceptance_backed_by_policy_lock():
         {
             "file_contains": [
                 "$HOME/.koder/managed-settings.json",
-                ["disableAllHooks", "echo managed", "allowUnsandboxedCommands"],
+                ["disableAllHooks", "echo managed", "unix-local"],
             ]
         },
         {"path_not_exists": "$REPO/.koder/settings.local.json"},
@@ -2977,7 +2971,7 @@ def test_permissions_and_sandbox_scenario_is_acceptance_backed_by_decisions():
     assert scenario["acceptance_artifacts"]
     assert any(
         turn.get("send") == "/permissions check run_shell touch blocked.txt"
-        and "strict sandbox mode" in turn.get("expect_all", [])
+        and "sandboxed shell command auto-allowed" in turn.get("expect_all", [])
         for turn in scenario["turns"]
     )
     assert any(
@@ -2996,7 +2990,7 @@ def test_permissions_and_sandbox_scenario_is_acceptance_backed_by_decisions():
                 "$REPO/.koder/settings.local.json",
                 [
                     '"enabled": false',
-                    '"allowUnsandboxedCommands": true',
+                    '"backend": "unix-local"',
                     '"excludedCommands"',
                     '"touch *"',
                 ],
@@ -3008,7 +3002,7 @@ def test_permissions_and_sandbox_scenario_is_acceptance_backed_by_decisions():
 def test_permission_slash_commands_are_acceptance_backed_by_runtime_state():
     manifest = _load_manifest(DEFAULT_MANIFEST)
 
-    for command in ("add-dir", "permissions", "sandbox", "sandbox-toggle"):
+    for command in ("add-dir", "permissions", "sandbox"):
         scenario = manifest["slash_commands"][command]
         assert scenario["validation_level"] == "acceptance"
         assert scenario["acceptance_criteria"]
@@ -3044,7 +3038,7 @@ def test_permission_slash_commands_are_acceptance_backed_by_runtime_state():
     )
     assert any(
         turn.get("send") == "/permissions check run_shell touch blocked.txt"
-        and "strict sandbox mode" in turn.get("expect_all", [])
+        and "sandboxed shell command auto-allowed" in turn.get("expect_all", [])
         for turn in permissions["turns"]
     )
     assert any(
@@ -3055,42 +3049,36 @@ def test_permission_slash_commands_are_acceptance_backed_by_runtime_state():
     assert {
         "file_contains": [
             "$REPO/.koder/settings.local.json",
-            ['"enabled": true', '"allowUnsandboxedCommands": true'],
+            ['"enabled": true', '"backend": "unix-local"'],
         ]
     } in permissions["post_assertions"]
 
     sandbox = manifest["slash_commands"]["sandbox"]
     assert any(
-        turn.get("send") == "/sandbox" and "Enabled: False" in turn.get("expect_all", [])
+        turn.get("send") == "/sandbox" and "sandbox_enabled: false" in turn.get("expect_all", [])
         for turn in sandbox["turns"]
     )
     assert any(
-        turn.get("send") == "/sandbox" and "Allow unsandboxed: True" in turn.get("expect_all", [])
+        turn.get("send") == "/sandbox enable"
+        and "Available sandbox backends:" in turn.get("expect_all", [])
         for turn in sandbox["turns"]
     )
-
-    sandbox_toggle = manifest["slash_commands"]["sandbox-toggle"]
     assert any(
-        turn.get("send") == "/sandbox-toggle exclude touch *"
+        turn.get("send") == "/sandbox exclude touch *"
         and "excluded_commands: 1" in turn.get("expect_all", [])
-        for turn in sandbox_toggle["turns"]
-    )
-    assert any(
-        turn.get("send") == "/sandbox-toggle wat"
-        and "Usage: /sandbox-toggle" in turn.get("expect_all", [])
-        for turn in sandbox_toggle["turns"]
+        for turn in sandbox["turns"]
     )
     assert {
         "file_contains": [
             "$REPO/.koder/settings.local.json",
             [
                 '"enabled": false',
-                '"allowUnsandboxedCommands": true',
+                '"backend": "unix-local"',
                 '"excludedCommands"',
                 '"touch *"',
             ],
         ]
-    } in sandbox_toggle["post_assertions"]
+    } in sandbox["post_assertions"]
 
 
 def test_plan_slash_scenario_is_acceptance_backed_by_permission_checks():

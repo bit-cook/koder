@@ -25,19 +25,29 @@ Inspect the active policy:
 ```bash
 /permissions
 /sandbox
-/sandbox-toggle status
+/sandbox status
 /privacy-settings
 ```
 
 Change sandbox policy:
 
 ```bash
-/sandbox-toggle strict
-/sandbox-toggle fallback
-/sandbox-toggle disable
+/sandbox enable
+/sandbox enable unix-local
+/sandbox disable
 ```
 
-The local permission layer protects shell, file, tool, and teammate operations. When a full operating-system sandbox executor is not available, Koder reports local policy state rather than pretending to provide OS-level isolation.
+The permission layer protects shell, file, tool, and teammate operations. Foreground `run_shell` commands can also run through a real OpenAI Agents SDK sandbox backend when sandbox policy is enabled and the configured backend is available. `/sandbox status` reports the active backend and whether it is available.
+
+Sandbox policy supports these high-level modes:
+
+| Mode | Behavior |
+|---|---|
+| `read-only` | Mutating shell commands are denied before execution. |
+| `workspace-write` | Foreground shell commands run in the selected backend and can write the workspace while outside-workspace writes are blocked by supported backends. |
+| `danger-full-access` | Sandbox disabled; shell commands use the normal local executor. |
+
+Koder currently treats file tools, MCP servers, teammate processes, and background shell commands as permission-backed unless their execution path is explicitly routed through a sandbox backend. Hosted backends are listed with missing dependency or credential hints; credentials are not printed. See the [Sandbox Guide](sandbox.md) for setup, status fields, backend options, and troubleshooting.
 
 ## Workspace Directories
 
@@ -62,7 +72,7 @@ Inspect them with:
 ```bash
 /managed-settings
 /hooks
-/sandbox-toggle status
+/sandbox status
 ```
 
 Koder does not fetch a hosted managed-settings service. The command reports the local policy file currently present on disk.

@@ -1,6 +1,6 @@
 [project]
 name = "koder"
-version = "0.5.0"
+version = "0.5.1"
 description = "An intuitive AI coding assistant and interactive CLI tool that boosts developer productivity with intelligent automation and context-aware support."
 authors = [{ name = "Pengfei Ni" }]
 readme = "README.md"
@@ -44,6 +44,11 @@ dependencies = [
     "sounddevice>=0.5.5",
     "whatthepatch>=1.0.7",
     "anthropic>=0.100.0",
+    "docker>=7.1.0",
+    "modal>=1.4.2",
+    "vercel>=0.5.8",
+    "e2b>=2.21.0",
+    "e2b-code-interpreter>=2.6.2",
 ]
 
 [project.urls]
