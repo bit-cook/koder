@@ -78,7 +78,6 @@ PROVIDER_ENV_VARS = {
     "perplexity": {"api_key": "PERPLEXITYAI_API_KEY"},
     "fireworks_ai": {"api_key": "FIREWORKS_AI_API_KEY"},
     "cloudflare": {"api_key": "CLOUDFLARE_API_KEY"},
-    "github_copilot": {"api_key": "GITHUB_TOKEN"},
     "ollama": {"base_url": "OLLAMA_BASE_URL"},
     "custom": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL"},
 }
@@ -198,6 +197,9 @@ def _resolve_model_settings():
 
 def _get_provider_api_key(config, config_manager, provider: str):
     """Get API key with priority: KODER_API_KEY > OAuth > ENV > Config."""
+    if provider.lower() == "github_copilot":
+        return None
+
     koder_api_key = os.environ.get("KODER_API_KEY")
     if koder_api_key:
         return koder_api_key

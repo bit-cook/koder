@@ -32,6 +32,21 @@ def test_auth_error_403():
     assert not err.should_retry
 
 
+def test_github_copilot_refresh_auth_error():
+    err = classify_api_error(
+        Exception(
+            "litellm.BadRequestError: GetLLMProvider Exception - "
+            "litellm.AuthenticationError: Failed to refresh API key: "
+            "Failed to refresh API key after maximum retries\n\n"
+            "original model: github_copilot/claude-sonnet-4.6"
+        )
+    )
+    assert err.category == ApiErrorCategory.GITHUB_COPILOT_AUTH
+    assert "GitHub Copilot" in err.user_message
+    assert "koder auth login github_copilot" in err.user_message
+    assert not err.should_retry
+
+
 def test_prompt_too_long():
     err = classify_api_error(
         Exception(

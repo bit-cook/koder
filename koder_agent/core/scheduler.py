@@ -22,6 +22,7 @@ from rich.live import Live
 from rich.text import Text
 
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
+from ..agentic.api_errors import ApiErrorCategory, classify_api_error
 from ..core.keyboard_listener import CancellationToken, escape_listener, iter_with_cancellation
 from ..core.session import EnhancedSQLiteSession, migrate_legacy_sessions
 from ..core.streaming_display import StreamingDisplayManager
@@ -61,6 +62,21 @@ from ..utils.terminal_theme import get_adaptive_console
 logger = logging.getLogger(__name__)
 
 console = get_adaptive_console()
+
+
+def _format_execution_error(error: Exception) -> str:
+    status_code = None
+    if hasattr(error, "status_code"):
+        status_code = error.status_code
+    elif hasattr(error, "response") and hasattr(error.response, "status_code"):
+        status_code = error.response.status_code
+
+    classified = classify_api_error(error, status_code=status_code)
+    if classified.category == ApiErrorCategory.UNKNOWN:
+        return str(error)
+    if classified.category == ApiErrorCategory.GITHUB_COPILOT_AUTH:
+        return classified.user_message
+    return f"{classified.user_message}\n\nDetails: {str(error)}"
 
 
 def _reasoning_stream_payload(event_data, mode: str) -> dict | None:
@@ -361,9 +377,7 @@ class AgentScheduler:
                         print()  # Add space after response
             except Exception as e:
                 # Handle execution errors gracefully
-                response = (
-                    f"[red]Execution error: {str(e)}[/red]\n\nPlease provide new instructions."
-                )
+                response = f"[red]Execution error: {_format_execution_error(e)}[/red]\n\nPlease provide new instructions."
                 if render_output:
                     print_reflowable(console, response)
                 return response
@@ -731,7 +745,7 @@ class AgentScheduler:
 
         # Handle execution error after Live context has properly closed
         if execution_error is not None:
-            error_msg = f"Execution error: {str(execution_error)}"
+            error_msg = f"Execution error: {_format_execution_error(execution_error)}"
             console.print(f"[red]{error_msg}[/red]")
             return f"{error_msg}\n\nPlease provide new instructions."
 

@@ -36,12 +36,13 @@ def test_llm_completion_uses_aresponses_for_copilot_codex(monkeypatch, tmp_path)
         tmp_path,
         {"model": {"name": "gpt-5.1-codex", "provider": "github_copilot"}},
     )
-    monkeypatch.setenv("GITHUB_TOKEN", "gh-test")
 
     calls = {"aresponses": 0, "acompletion": 0}
+    captured: dict[str, object] = {}
 
     async def fake_aresponses(**kwargs):
         calls["aresponses"] += 1
+        captured.update(kwargs)
         return {
             "id": "resp_123",
             "output": [
@@ -69,6 +70,7 @@ def test_llm_completion_uses_aresponses_for_copilot_codex(monkeypatch, tmp_path)
     )
     assert text == "ok"
     assert calls["aresponses"] == 1
+    assert "api_key" not in captured
 
 
 def test_llm_completion_uses_override_provider_credentials_and_base_url(monkeypatch, tmp_path):

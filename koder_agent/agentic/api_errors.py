@@ -10,6 +10,7 @@ class ApiErrorCategory(Enum):
     RATE_LIMIT = "rate_limit"
     OVERLOADED = "overloaded"
     AUTH = "auth"
+    GITHUB_COPILOT_AUTH = "github_copilot_auth"
     CONTEXT_OVERFLOW = "context_overflow"
     TIMEOUT = "timeout"
     CONNECTION = "connection"
@@ -32,6 +33,11 @@ _USER_MESSAGES = {
     ApiErrorCategory.RATE_LIMIT: "Rate limit exceeded. Waiting before retrying...",
     ApiErrorCategory.OVERLOADED: "API is overloaded (529). Waiting before retrying...",
     ApiErrorCategory.AUTH: "Authentication failed. Check your API key (KODER_API_KEY or provider-specific key).",
+    ApiErrorCategory.GITHUB_COPILOT_AUTH: (
+        "GitHub Copilot authentication expired or failed. Run "
+        "`koder auth login github_copilot` to complete GitHub device login again, "
+        "then retry the Copilot model."
+    ),
     ApiErrorCategory.CONTEXT_OVERFLOW: "Context window exceeded. Try /compact to reduce conversation size.",
     ApiErrorCategory.TIMEOUT: "Request timed out. Retrying...",
     ApiErrorCategory.CONNECTION: "Connection failed. Check your network and API endpoint.",
@@ -58,8 +64,14 @@ def classify_api_error(
     """Classify an API error and return a user-friendly message."""
     msg = str(error).lower()
 
+    if "github_copilot" in msg and (
+        "failed to refresh api key" in msg
+        or "copilot_internal/v2/token" in msg
+        or "github copilot api key" in msg
+    ):
+        category = ApiErrorCategory.GITHUB_COPILOT_AUTH
     # Determine category from status code first
-    if status_code == 429:
+    elif status_code == 429:
         category = ApiErrorCategory.RATE_LIMIT
     elif status_code == 529:
         category = ApiErrorCategory.OVERLOADED

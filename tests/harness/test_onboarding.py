@@ -57,6 +57,39 @@ def test_check_onboarding_state_detects_anthropic_api_key():
         assert state.api_key_configured is True
 
 
+def test_check_onboarding_state_detects_litellm_copilot_token(tmp_path):
+    """Test that LiteLLM's Copilot device-flow token satisfies auth setup."""
+    token_dir = tmp_path / "copilot-token"
+    token_dir.mkdir()
+    (token_dir / "access-token").write_text("token", encoding="utf-8")
+
+    state = check_onboarding_state(
+        env={
+            "KODER_MODEL": "github_copilot/claude-sonnet-4",
+            "GITHUB_COPILOT_TOKEN_DIR": str(token_dir),
+        }
+    )
+
+    assert state.api_key_configured is True
+    assert state.auth_provider_hint == "github_copilot"
+
+
+def test_check_onboarding_state_detects_custom_litellm_copilot_token_file(tmp_path):
+    token_dir = tmp_path / "copilot-token"
+    token_dir.mkdir()
+    (token_dir / "custom-access-token").write_text("token", encoding="utf-8")
+
+    state = check_onboarding_state(
+        env={
+            "KODER_MODEL": "github_copilot/claude-sonnet-4",
+            "GITHUB_COPILOT_TOKEN_DIR": str(token_dir),
+            "GITHUB_COPILOT_ACCESS_TOKEN_FILE": "custom-access-token",
+        }
+    )
+
+    assert state.api_key_configured is True
+
+
 def test_check_onboarding_state_no_api_key():
     """Test that check_onboarding_state returns False when no API key is set."""
     # Clear all possible API key env vars by removing them
@@ -65,7 +98,6 @@ def test_check_onboarding_state_no_api_key():
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GOOGLE_API_KEY",
-        "GITHUB_TOKEN",
     ]
     # Save current values
     original_values = {k: os.environ.get(k) for k in env_vars_to_clear}
@@ -74,7 +106,10 @@ def test_check_onboarding_state_no_api_key():
         os.environ.pop(key, None)
 
     try:
-        state = check_onboarding_state()
+        with patch(
+            "koder_agent.harness.onboarding._is_github_copilot_configured", return_value=False
+        ):
+            state = check_onboarding_state()
         assert state.api_key_configured is False
     finally:
         # Restore original values
@@ -142,6 +177,20 @@ def test_get_onboarding_steps_returns_steps_for_unconfigured_state():
     assert any("API key" in step or "api key" in step.lower() for step in steps)
     assert any("model" in step.lower() for step in steps)
     assert any("workspace" in step.lower() or "trust" in step.lower() for step in steps)
+
+
+def test_get_onboarding_steps_uses_copilot_auth_message():
+    state = OnboardingState(
+        completed=False,
+        api_key_configured=False,
+        model_selected=True,
+        workspace_trusted=True,
+        auth_provider_hint="github_copilot",
+    )
+
+    steps = get_onboarding_steps(state)
+
+    assert steps == ["Authenticate GitHub Copilot: run koder auth login github_copilot"]
 
 
 def test_get_onboarding_steps_partial_configuration():

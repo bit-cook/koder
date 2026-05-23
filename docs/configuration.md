@@ -99,7 +99,7 @@ Use these if you need different keys for different providers:
 | Google/Gemini | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | - |
 | Azure | `AZURE_API_KEY` | `AZURE_API_BASE`, `AZURE_API_VERSION` |
 | Vertex AI | `GOOGLE_APPLICATION_CREDENTIALS` | `VERTEXAI_LOCATION` |
-| GitHub Copilot | `GITHUB_TOKEN` | - |
+| GitHub Copilot | `koder auth login github_copilot` | `GITHUB_COPILOT_TOKEN_DIR` (optional token cache location) |
 | Groq | `GROQ_API_KEY` | - |
 | Together AI | `TOGETHERAI_API_KEY` | - |
 | OpenRouter | `OPENROUTER_API_KEY` | - |
@@ -193,7 +193,7 @@ export KODER_MODEL="github_copilot/claude-sonnet-4"
 koder
 ```
 
-On first run you will see a device code in the terminal. Visit <https://github.com/login/device> and enter the code to authenticate.
+Run `koder auth login github_copilot` to start the GitHub device login. Visit <https://github.com/login/device> and enter the code shown in the terminal. LiteLLM stores Copilot tokens under `~/.config/litellm/github_copilot` by default. If refresh fails with `Failed to refresh API key`, Koder will ask you to run the login command again.
 
 ### Azure OpenAI
 

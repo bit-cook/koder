@@ -240,6 +240,15 @@ def create_plugin_subparsers(subparsers):
 
 def create_auth_subparsers(subparsers):
     """Create auth subcommand parsers."""
+    auth_provider_choices = [
+        "google",
+        "claude",
+        "chatgpt",
+        "antigravity",
+        "github_copilot",
+        "github-copilot",
+        "copilot",
+    ]
     auth_parser = subparsers.add_parser("auth", help="Manage OAuth authentication")
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command", help="Auth actions")
 
@@ -247,8 +256,8 @@ def create_auth_subparsers(subparsers):
     login_parser = auth_subparsers.add_parser("login", help="Authenticate with a provider")
     login_parser.add_argument(
         "provider",
-        choices=["google", "claude", "chatgpt", "antigravity"],
-        help="OAuth provider (google, claude, chatgpt, antigravity)",
+        choices=auth_provider_choices,
+        help="OAuth provider (google, claude, chatgpt, antigravity, github_copilot)",
     )
     login_parser.add_argument(
         "--timeout",
@@ -264,7 +273,7 @@ def create_auth_subparsers(subparsers):
     revoke_parser = auth_subparsers.add_parser("revoke", help="Revoke OAuth tokens")
     revoke_parser.add_argument(
         "provider",
-        choices=["google", "claude", "chatgpt", "antigravity"],
+        choices=auth_provider_choices,
         help="OAuth provider to revoke",
     )
 
@@ -273,7 +282,7 @@ def create_auth_subparsers(subparsers):
     status_parser.add_argument(
         "provider",
         nargs="?",
-        choices=["google", "claude", "chatgpt", "antigravity"],
+        choices=auth_provider_choices,
         help="Optional: specific provider to show",
     )
 

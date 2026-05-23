@@ -47,6 +47,22 @@ def test_reasoning_stream_payload_respects_display_mode():
     }
 
 
+def test_format_execution_error_hides_copilot_raw_details():
+    from koder_agent.core.scheduler import _format_execution_error
+
+    message = _format_execution_error(
+        Exception(
+            "litellm.AuthenticationError: Failed to refresh API key: "
+            "Failed to refresh API key after maximum retries\n\n"
+            "original model: github_copilot/claude-sonnet-4.6"
+        )
+    )
+
+    assert "koder auth login github_copilot" in message
+    assert "Details:" not in message
+    assert "original model" not in message
+
+
 @pytest.mark.asyncio
 async def test_stream_json_emits_reasoning_deltas_when_enabled(tmp_path, monkeypatch):
     from agents import RawResponsesStreamEvent

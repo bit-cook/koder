@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import numbers
+import os
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -24,12 +27,30 @@ PROVIDER_DESCRIPTIONS: Dict[str, str] = {
     "antigravity": "Antigravity (Gemini 3 + Claude models)",
 }
 
+GITHUB_COPILOT_PROVIDER_ID = "github_copilot"
+GITHUB_COPILOT_PROVIDER_ALIASES = {
+    GITHUB_COPILOT_PROVIDER_ID,
+    "github-copilot",
+    "copilot",
+}
+
+
+def _normalize_provider_id(provider_id: str) -> str:
+    provider = provider_id.strip().lower()
+    if provider in GITHUB_COPILOT_PROVIDER_ALIASES:
+        return GITHUB_COPILOT_PROVIDER_ID
+    return provider
+
 
 async def handle_login(provider_id: str, timeout: float = 300) -> bool:
+    provider_id = _normalize_provider_id(provider_id)
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID:
+        return await handle_github_copilot_login(timeout=timeout)
+
     if provider_id not in SUPPORTED_PROVIDERS:
         console.print(
             f"[red]Error:[/red] Unknown provider '{provider_id}'. "
-            f"Supported: {', '.join(SUPPORTED_PROVIDERS)}"
+            f"Supported: {', '.join([*SUPPORTED_PROVIDERS, GITHUB_COPILOT_PROVIDER_ID])}"
         )
         return False
 
@@ -90,6 +111,43 @@ async def handle_login(provider_id: str, timeout: float = 300) -> bool:
         return True
     except Exception as exc:
         console.print(f"[red]Error during authentication:[/red] {exc}")
+        return False
+
+
+async def handle_github_copilot_login(timeout: float = 300) -> bool:
+    """Force GitHub Copilot device-flow login through LiteLLM's authenticator."""
+    _ = timeout
+
+    console.print("\n[bold]Authenticating with github_copilot...[/bold]\n")
+    try:
+        from litellm.llms.github_copilot.authenticator import Authenticator
+
+        def _login_and_refresh() -> tuple[str, dict]:
+            authenticator = Authenticator()
+            access_token = authenticator._login()
+            with open(authenticator.access_token_file, "w", encoding="utf-8") as file:
+                file.write(access_token)
+            api_key_info = authenticator._refresh_api_key()
+            with open(authenticator.api_key_file, "w", encoding="utf-8") as file:
+                json.dump(api_key_info, file)
+            return authenticator.token_dir, api_key_info
+
+        token_dir, api_key_info = await asyncio.to_thread(_login_and_refresh)
+        endpoints = api_key_info.get("endpoints") or {}
+        api_endpoint = endpoints.get("api") or "default"
+        console.print(
+            Panel(
+                "[green]Successfully authenticated![/green]\n\n"
+                "Provider: github_copilot\n"
+                f"Token cache: {token_dir}\n"
+                f"API endpoint: {api_endpoint}",
+                title="Authentication Complete",
+                border_style="green",
+            )
+        )
+        return True
+    except Exception as exc:
+        console.print(f"[red]GitHub Copilot authentication failed:[/red] {exc}")
         return False
 
 
@@ -184,6 +242,14 @@ async def handle_list() -> None:
 
 
 async def handle_revoke(provider_id: str) -> bool:
+    provider_id = _normalize_provider_id(provider_id)
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID:
+        console.print(
+            "[yellow]GitHub Copilot tokens are managed by LiteLLM. "
+            "Run `koder auth login github_copilot` to refresh the login.[/yellow]"
+        )
+        return False
+
     storage = get_token_storage()
     tokens = storage.load(provider_id)
     if not tokens:
@@ -202,6 +268,12 @@ async def handle_revoke(provider_id: str) -> bool:
 
 
 async def handle_status(provider_id: Optional[str] = None) -> None:
+    if provider_id:
+        provider_id = _normalize_provider_id(provider_id)
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID:
+        await _print_github_copilot_status()
+        return
+
     storage = get_token_storage()
     if provider_id:
         tokens = storage.load(provider_id)
@@ -278,6 +350,42 @@ async def _print_token_details(provider_id: str, tokens, storage) -> None:
     console.print(Panel(info.strip(), title=f"[bold]{provider_id}[/bold]", border_style="blue"))
 
 
+async def _print_github_copilot_status() -> None:
+    try:
+        from litellm.llms.github_copilot.authenticator import Authenticator
+
+        authenticator = Authenticator()
+        access_token_exists = bool(
+            authenticator.access_token_file and os.path.exists(authenticator.access_token_file)
+        )
+        api_key_info = None
+        try:
+            with open(authenticator.api_key_file, encoding="utf-8") as file:
+                api_key_info = json.load(file)
+        except Exception:
+            pass
+
+        raw_expires_at = api_key_info.get("expires_at") if isinstance(api_key_info, dict) else None
+        expires_at = raw_expires_at if isinstance(raw_expires_at, numbers.Real) else None
+        status = "[yellow]NEEDS LOGIN[/yellow]"
+        expires_line = "Expires: unavailable"
+        if expires_at:
+            expires = datetime.fromtimestamp(expires_at)
+            expires_line = f"Expires: {expires.strftime('%Y-%m-%d %H:%M:%S')}"
+            status = "[green]VALID[/green]" if expires_at > time.time() else "[red]EXPIRED[/red]"
+
+        info = (
+            f"Status: {status}\n"
+            f"Access token: {'present' if access_token_exists else 'missing'}\n"
+            f"{expires_line}\n"
+            f"Token cache: {authenticator.token_dir}\n\n"
+            "Refresh login: koder auth login github_copilot"
+        )
+        console.print(Panel(info, title="[bold]github_copilot[/bold]", border_style="blue"))
+    except Exception as exc:
+        console.print(f"[red]Unable to inspect GitHub Copilot status:[/red] {exc}")
+
+
 def show_auth_help() -> None:
     help_text = """[bold]OAuth Authentication Commands[/bold]
 
@@ -286,6 +394,9 @@ Commands:
   list                List configured OAuth providers and models
   revoke <provider>   Revoke OAuth tokens
   status [provider]   Show OAuth token status
+
+Providers:
+  google, claude, chatgpt, antigravity, github_copilot
 """
     console.print(Panel(help_text, title="koder auth", border_style="blue"))
 

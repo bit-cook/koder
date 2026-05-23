@@ -120,7 +120,7 @@ def test_env_model_provider_overrides_config(monkeypatch, tmp_path):
         ),
         (
             "github_copilot/gpt-5.1-codex",
-            {"GITHUB_TOKEN": "gh-token"},
+            {},
             "litellm/github_copilot/gpt-5.1-codex",
             "github_copilot/gpt-5.1-codex",
             False,
@@ -466,6 +466,20 @@ def test_koder_api_key_works_across_providers(monkeypatch, tmp_path):
     assert get_api_key() == "sk-koder-universal"
     kwargs = get_litellm_model_kwargs()
     assert kwargs["api_key"] == "sk-koder-universal"
+
+
+def test_github_copilot_ignores_api_key_env_vars(monkeypatch, tmp_path):
+    """GitHub Copilot uses LiteLLM device-flow auth, not KODER_API_KEY/GITHUB_TOKEN."""
+    _write_config(
+        tmp_path,
+        {"model": {"name": "claude-sonnet-4", "provider": "github_copilot"}},
+    )
+    monkeypatch.setenv("KODER_API_KEY", "sk-koder-universal")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+
+    assert get_api_key() is None
+    kwargs = get_litellm_model_kwargs()
+    assert kwargs["api_key"] is None
 
 
 def test_provider_env_api_key_works_without_koder_api_key(monkeypatch, tmp_path):
