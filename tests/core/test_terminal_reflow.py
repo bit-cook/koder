@@ -26,6 +26,7 @@ def test_reflow_replays_renderables_at_current_console_width():
 
     buffer.record(probe)
     console._width = 42
+    console._height = 25
 
     assert buffer.replay() is True
 

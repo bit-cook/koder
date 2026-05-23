@@ -75,7 +75,8 @@ def _wait_for_prompt(session: str, *, timeout: float = 10.0) -> str:
     last_output = ""
     while time.time() < deadline:
         last_output = _capture(session)
-        if "⚡ Koder" in last_output:
+        trailing_lines = "\n".join(last_output.splitlines()[-8:])
+        if "⚡ Koder" in trailing_lines and "│>" in trailing_lines:
             return last_output
         time.sleep(0.5)
     return last_output

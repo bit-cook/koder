@@ -546,7 +546,39 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     color_output = _run("/color", handler=handler)
     ctx_viz_output = _run("/ctx_viz", handler=handler)
     sandbox_output = _run("/sandbox", handler=handler)
-    security_review_output = _run("/security-review", handler=handler)
+    security_repo = tmp_path / "security-review-repo"
+    security_repo.mkdir()
+    subprocess.run(["git", "init"], cwd=security_repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=security_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=security_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    security_file = security_repo / "app.py"
+    security_file.write_text("print('before')\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "app.py"], cwd=security_repo, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "seed"],
+        cwd=security_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    security_file.write_text("print('after')\n", encoding="utf-8")
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.chdir(security_repo)
+        security_review_output = _run("/security-review", handler=handler)
     summary_output = _run("/summary", handler=handler)
     terminal_setup_output = _run("/terminalSetup", handler=handler)
     ide_output = _run("/ide", handler=handler)
