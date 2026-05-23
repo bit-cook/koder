@@ -1,24 +1,49 @@
 # Koder
 
-[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![PyPI Downloads](https://static.pepy.tech/badge/koder)](https://pepy.tech/projects/koder)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Koder is an experimental AI coding assistant for the terminal. It combines a streaming TUI, persistent local sessions, repository-aware tools, extensible skills, MCP integrations, and multi-agent workflows in one Python runtime.
+Koder is an experimental, open-source AI coding assistant for the terminal. It combines a streaming TUI, persistent local sessions, repository-aware tools, extensible skills, MCP integrations, sandbox-aware permissions, and multi-agent workflows in one Python runtime.
 
 Status: Alpha. Koder is a learning-focused project for exploring agentic coding systems. Expect rapid iteration and occasional sharp edges.
 
+## Start Here
+
+```bash
+uv tool install koder
+export KODER_API_KEY="your-api-key"
+export KODER_MODEL="gpt-4o"
+koder
+```
+
+Prefer a provider-specific key or subscription login? Jump to [Model Configuration](#model-configuration).
+
 ## Why Koder
 
-Koder is designed for developers who want a local-first coding assistant that can work across model providers without changing their workflow.
+Koder is designed for developers who want a local-first coding agent they can inspect, extend, and run across model providers without changing their workflow.
 
 - Bring your own model: OpenAI, Anthropic, Google/Gemini, GitHub Copilot, Azure, OAuth-backed subscriptions, OpenRouter, and 100+ LiteLLM providers.
 - Stay in the terminal: use slash commands, file mentions, shell mode, history search, live usage output, and optional voice dictation.
-- Keep context local: sessions, transcripts, memories, task records, settings, skills, agents, and team state live under Koder-owned local paths.
+- Keep runtime state local: sessions, transcripts, memories, task records, settings, skills, agents, and team state live under Koder-owned local paths. Model requests still go to the provider you configure.
 - Extend the runtime: add project skills, user skills, plugins, MCP servers, channels, and Magic Docs.
 - Delegate carefully: run background subagents and local teams while the main session stays responsible for integration.
+- Study the system: the Python codebase is organized to make agent scheduling, provider routing, permissions, tools, and TUI behavior easy to trace.
+
+## How It Fits
+
+Koder is in the same broad family as Codex CLI, Claude Code, OpenCode, Gemini CLI, Aider, Cline, goose, and Continue. Its emphasis is different:
+
+| If you care about... | Koder emphasizes |
+|---|---|
+| Provider choice | Universal `KODER_*` variables, provider-specific keys, OAuth-backed subscriptions, custom base URLs, and LiteLLM provider routing. |
+| Terminal ergonomics | A persistent Rich TUI with slash commands, shell mode, file mentions, usage/cost output, voice input, and resume. |
+| Local inspectability | SQLite sessions, local memory, local settings, local tokens, and documented privacy boundaries. |
+| Extension experiments | Skills, verifier skills, plugins, MCP servers, channels, Magic Docs, and project instructions. |
+| Multi-agent workflows | Background subagents, local teams, tmux teammates, mailbox/task records, and team memory. |
+| Safety research | Permission rules, managed settings, sandbox policy, backend diagnostics, and explicit local/remote data boundaries. |
 
 ## Highlights
 
@@ -56,6 +81,8 @@ uv sync
 uv run koder
 ```
 
+Requirements: Python 3.10 or newer and a model provider credential or subscription login.
+
 ## Quick Start
 
 Set a model credential and start the interactive TUI:
@@ -91,6 +118,14 @@ Good first commands inside the TUI:
 /help
 ```
 
+Good first prompts:
+
+```text
+Inspect this repository and explain the test command.
+Find the smallest safe fix for the failing test, then run the focused test.
+Review the current diff for correctness and missing verification.
+```
+
 ## Common Usage
 
 | Task | Command |
@@ -109,6 +144,26 @@ Good first commands inside the TUI:
 | Manage permissions | `/permissions`, `/sandbox`, `/add-dir` |
 
 See the [Command Reference](docs/commands.md) for the complete slash-command catalog.
+
+## Trust Boundaries
+
+Koder is local-first, not offline-only:
+
+- Koder stores product state under `~/.koder/` and project `.koder/` paths by default.
+- Koder does not upload sessions to a Koder-hosted service.
+- Prompts, selected context, and tool results needed for a turn are sent to the model provider you configure.
+- MCP servers, plugins, shell commands, and teammate processes can access whatever their local permissions allow unless constrained by Koder policy and sandbox settings.
+- OAuth tokens are stored under `~/.koder/tokens/`; avoid committing secrets into project files.
+
+Inspect the current boundary with:
+
+```bash
+/privacy-settings
+/permissions
+/sandbox status
+/files
+/context
+```
 
 ## Model Configuration
 
@@ -282,9 +337,7 @@ uv run koder
 Code quality and tests:
 
 ```bash
-uv run black .
-uv run ruff format
-uv run ruff check --fix
+uv run black . && uv run ruff format && uv run ruff check --fix
 uv run pytest
 ```
 

@@ -10,6 +10,8 @@ Use `uv tool install` for a clean command-line install:
 uv tool install koder
 ```
 
+Koder requires Python 3.10 or newer.
+
 For local development from this repository:
 
 ```bash
@@ -51,6 +53,16 @@ koder auth list
 After login, use the provider prefix in `KODER_MODEL`, for example `google/gemini-3-pro-preview`, `claude/claude-opus-4-5-20250514`, or `chatgpt/gpt-5.2`.
 
 See [Configuration Guide](configuration.md) for the full provider matrix.
+
+## Pick A Runtime Style
+
+Koder can be used in three common ways:
+
+| Style | Command | Use it when |
+|---|---|---|
+| Interactive TUI | `koder` | You want normal coding work with streamed output, slash commands, shell mode, file mentions, and resume. |
+| Single prompt | `koder "summarize the current git diff"` | You know the task and want one recorded turn from your shell. |
+| Print mode | `koder --print "summarize"` | You want script-friendly output for automation or logs. |
 
 ## Start A Session
 
@@ -109,6 +121,18 @@ koder "fix the failing test in tests/test_example.py and run the focused test"
 ```
 
 Koder will use the project instructions from `AGENTS.md` when present, and it stores session state locally under `~/.koder/`.
+
+Before allowing larger edits, ask Koder to show the boundary:
+
+```bash
+koder "report the current workspace, loaded project instructions, configured model, and whether any sandbox backend is active. Do not edit files."
+```
+
+Then run a small implementation task with explicit verification:
+
+```bash
+koder "fix the smallest failing test you can identify, run only the focused test first, and summarize changed files."
+```
 
 ## What To Read Next
 

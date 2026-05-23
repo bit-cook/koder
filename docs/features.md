@@ -41,6 +41,19 @@ Koder is organized around a few everyday jobs:
 - Extend the runtime with project skills, user skills, plugins, MCP servers, session channels, and Magic Docs.
 - Control risk with explicit permission rules, sandbox policy, managed settings, allowed workspace roots, and local privacy diagnostics.
 
+## Choosing Your Path
+
+| I want to... | Start with |
+|---|---|
+| Try Koder safely in a new repository | [Getting Started](getting-started.md), then `/onboarding`, `/status`, `/permissions`, and a read-only prompt. |
+| Understand the terminal UI | [Interactive TUI](interactive-tui.md), then `/help`, `/keybindings`, `/theme`, `/voice status`, and shell mode. |
+| Configure a model or endpoint | [Configuration Guide](configuration.md), then `/model`, `/effort`, `/reasoning`, and `koder config show`. |
+| Keep project context across sessions | [Sessions and Memory](sessions-and-memory.md), then `/session`, `/resume`, `/compact`, `/memory`, and `/thinkback`. |
+| Review or prepare a branch | [Workflows](workflows.md), then `/diff`, `/review`, `/security-review`, `/passes`, and `/commit`. |
+| Add local domain knowledge | [Skills, Plugins, and MCP](extensions.md), then `/skills`, `/init-verifiers`, `/plugin`, and `/mcp`. |
+| Run parallel investigations | [Agents and Teams](agents-and-teams.md), then `/fork`, `/agents`, `/peers`, and `/tasks`. |
+| Audit data access and command risk | [Permissions and Privacy](permissions-and-privacy.md) and [Sandbox Guide](sandbox.md). |
+
 ## Common Starting Points
 
 Use these commands when you are exploring a new workspace:

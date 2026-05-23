@@ -16,7 +16,7 @@ Koder is designed as both a functional tool and a learning playground for AI age
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.10 or higher
 - [uv](https://docs.astral.sh/uv/) package manager (recommended)
 - Git for version control
 - API key for at least one AI provider (OpenAI, Anthropic, Google, etc.)
@@ -55,13 +55,14 @@ Koder is designed as both a functional tool and a learning playground for AI age
 
    ```bash
    # Code formatting
-   black .
+   uv run black .
 
    # Linting and fixes
-   ruff check --fix
+   uv run ruff format
+   uv run ruff check --fix
 
    # Error-only pylint check
-   pylint koder_agent/ --disable=C,R,W --errors-only
+   uv run pylint koder_agent/ --disable=C,R,W --errors-only
    ```
 
 ## Development Guidelines
@@ -70,9 +71,10 @@ Koder is designed as both a functional tool and a learning playground for AI age
 
 We use automated tooling to maintain consistent code quality:
 
-- **Black**: Code formatting (`black .`)
-- **Ruff**: Linting and import sorting (`ruff check --fix`)
-- **Pylint**: Additional error checking (`pylint koder_agent/ --disable=C,R,W --errors-only`)
+- **Black**: Code formatting (`uv run black .`)
+- **Ruff**: Linting and import sorting (`uv run ruff format && uv run ruff check --fix`)
+- **Pylint**: Additional error checking (`uv run pylint koder_agent/ --disable=C,R,W --errors-only`)
+- **TUI scenarios**: Scenario verification (`uv run scripts/tmux_feature_scenarios.py --check`)
 
 ### Code Quality Standards
 
@@ -109,8 +111,9 @@ We use automated tooling to maintain consistent code quality:
 3. **Develop and Test**
 
    - Write clean, documented code
-   - Run code quality checks
-   - Test your changes thoroughly
+   - Run `uv run black . && uv run ruff format && uv run ruff check --fix`
+   - Test your changes thoroughly with the narrowest meaningful test first
+   - For TUI behavior, validate scenarios with `uv run scripts/tmux_feature_scenarios.py --check` and run focused scenarios with `uv run scripts/tmux_feature_scenarios.py --run <name>`
    - Update documentation if needed
 
 4. **Commit and Push**

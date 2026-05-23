@@ -16,7 +16,7 @@ Default paths:
 | `~/.koder/agents/`, `~/.koder/teams/`, `~/.koder/tasks/` | Agent, team, and task state. |
 | `.koder/memory/`, `~/.koder/memory/` | Project and user memory files. |
 
-Koder does not upload sessions to a Koder-hosted service. Model requests still go to the configured model provider.
+Koder does not upload sessions to a Koder-hosted service. Model requests still go to the configured model provider, and any enabled MCP server, plugin, shell command, teammate process, or external tool can have its own local or network behavior.
 
 ## Permission Commands
 
@@ -121,3 +121,14 @@ Settings bundles can move local settings and memory between machines, but they i
 koder config export ~/koder-settings.json
 koder config import ~/koder-settings.json --dry-run
 ```
+
+## Practical Boundary Checklist
+
+Before giving Koder a sensitive repository, check:
+
+- Run `/files` and `/context` to see which workspace files are loaded.
+- Run `/memory` to inspect project and user memories that may influence prompts.
+- Run `/permissions` and `/sandbox status` to see command policy and backend availability.
+- Run `/mcp`, `/plugin`, and `/channels` to inspect external tool surfaces.
+- Keep API keys in environment variables or user config; do not store them in repository files.
+- Treat model-provider requests as remote requests to that provider, even though Koder's own product state is local.

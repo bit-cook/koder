@@ -92,9 +92,7 @@ These commands inspect GitHub state through local CLI integrations. They should 
 For normal code changes in this repository, the project instructions require:
 
 ```bash
-uv run black .
-uv run ruff format
-uv run ruff check --fix
+uv run black . && uv run ruff format && uv run ruff check --fix
 uv run pytest
 ```
 
