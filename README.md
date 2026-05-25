@@ -34,7 +34,7 @@ Koder is designed for developers who want a local-first coding agent they can in
 
 ## How It Fits
 
-Koder is in the same broad family as Codex CLI, Claude Code, OpenCode, Gemini CLI, Aider, Cline, goose, and Continue. Its emphasis is different:
+Koder is in the same broad family as terminal-first and open-source AI coding agents. Its emphasis is different:
 
 | If you care about... | Koder emphasizes |
 |---|---|
