@@ -68,3 +68,19 @@ class CronStorage:
             if t["id"] == job_id:
                 return t
         return None
+
+
+_default_storage: CronStorage | None = None
+
+
+def default_cron_storage() -> CronStorage:
+    global _default_storage
+    if _default_storage is None:
+        root = Path.home() / ".koder"
+        _default_storage = CronStorage(root / "scheduled_tasks.json")
+    return _default_storage
+
+
+def set_default_cron_storage(storage: CronStorage | None) -> None:
+    global _default_storage
+    _default_storage = storage

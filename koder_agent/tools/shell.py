@@ -38,6 +38,7 @@ class ShellKillModel(BaseModel):
 
 class GitModel(BaseModel):
     command: str
+    timeout: int = 60
 
 
 class BackgroundShell:
@@ -304,6 +305,20 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
                 process.kill()
+                # Attempt to read any partial output already buffered
+                partial_stdout = ""
+                partial_stderr = ""
+                try:
+                    out, err = await asyncio.wait_for(process.communicate(), timeout=1)
+                    partial_stdout = out.decode("utf-8", errors="replace").strip() if out else ""
+                    partial_stderr = err.decode("utf-8", errors="replace").strip() if err else ""
+                except Exception:
+                    pass
+                if partial_stdout or partial_stderr:
+                    msg = f"Command timed out after {timeout} seconds. Partial output:\n{partial_stdout}"
+                    if partial_stderr:
+                        msg += f"\n[stderr]: {partial_stderr}"
+                    return msg
                 return f"Command timed out after {timeout} seconds"
 
             # Decode output
@@ -385,9 +400,20 @@ async def shell_kill(shell_id: str) -> str:
 
 
 @function_tool
-async def git_command(command: str) -> str:
-    """Execute a git command."""
+async def git_command(command: str, timeout: int = 60) -> str:
+    """Execute a git command.
+
+    Args:
+        command: The git command to execute (with or without leading 'git')
+        timeout: Timeout in seconds (default: 60, max: 300). Increase for clone/fetch/gc.
+
+    Returns:
+        Command output or error message
+    """
     try:
+        # Clamp timeout to valid range
+        timeout = max(1, min(timeout, 300))
+
         # Ensure command starts with 'git'
         if not command.strip().startswith("git"):
             command = f"git {command}"
@@ -397,7 +423,7 @@ async def git_command(command: str) -> str:
         if error:
             return error
 
-        # Execute git command (always foreground, 30s timeout)
+        # Execute git command (always foreground)
         if IS_WINDOWS:
             process = await asyncio.create_subprocess_exec(
                 "powershell.exe",
@@ -415,10 +441,10 @@ async def git_command(command: str) -> str:
             )
 
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             process.kill()
-            return "Git command timed out after 30 seconds"
+            return f"Git command timed out after {timeout} seconds"
 
         # Decode output
         output = stdout.decode("utf-8", errors="replace").strip()

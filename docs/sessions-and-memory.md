@@ -9,9 +9,11 @@ Default storage paths:
 | Path | Purpose |
 |---|---|
 | `~/.koder/koder.db` | SQLite session metadata and transcripts. |
+| `~/.koder/koder.db` (`session_goals`) | Durable goal state for each session. |
 | `~/.koder/memory/` | User-level memories. |
 | `.koder/memory/` | Project-level memories. |
 | `.koder/session-memory/` | Project-local session notes. |
+| `~/.koder/scheduled_tasks.json` | Cron-backed loop and scheduled prompt records. |
 | `~/.koder/tasks/` | Runtime task records, including maintenance tasks. |
 
 Koder does not require a hosted session service for these features.
@@ -56,6 +58,36 @@ Use these commands to understand what the active session contains:
 ```
 
 `/summary` is a compact local status report. `/insights` focuses on transcript roles, tool activity, context files, and usage counters.
+
+## Goals
+
+Use goals when a session has a concrete long-running objective that should persist across turns:
+
+```bash
+/goal improve benchmark coverage --budget 50000
+/goal
+/goal pause
+/goal resume
+/goal edit improve benchmark and scheduler coverage
+/goal budget 75000
+/goal clear
+```
+
+Goals track objective text, status, elapsed time, token usage, and an optional token budget. Active goals can trigger continuation turns until the goal is completed, paused, blocked, or budget-limited.
+
+## Scheduled Loops
+
+Use local loop jobs for recurring prompts that should run through the active scheduler:
+
+```bash
+/loop @every 5m check build
+/loop once 30 14 * * 1 monday review
+/loop list
+/loop delete <id>
+/schedule
+```
+
+Loop jobs are stored in `~/.koder/scheduled_tasks.json`. `/schedule` is the read-only registry view; `/loop` creates, lists, and deletes jobs.
 
 ## Compaction And Rewind
 

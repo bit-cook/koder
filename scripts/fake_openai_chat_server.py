@@ -18,6 +18,9 @@ class _ReusableHTTPServer(ThreadingHTTPServer):
 class _Handler(BaseHTTPRequestHandler):
     response_text: str = "fixture response"
     log_file: Path | None = None
+    scenario: str = "single"
+    stream_delay: float = 0.0
+    stream_lines: int = 2
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         length = int(self.headers.get("content-length") or 0)
@@ -27,21 +30,63 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {"raw_body": raw_body}
 
-        if self.log_file is not None:
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_file.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "path": self.path,
-                            "body": body,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                    + "\n"
-                )
+        self._write_log(body)
 
+        if self.scenario == "streaming_tool_queue":
+            if not body.get("tools"):
+                self._send_json(self._chat_completion(body, self.response_text))
+                return
+            if body.get("stream"):
+                if self._request_has_tool_output(body):
+                    self._send_text_stream(body)
+                else:
+                    self._send_tool_call_stream(body)
+                return
+            if self._request_has_tool_output(body):
+                self._send_json(self._chat_completion(body, self.response_text))
+            else:
+                self._send_json(self._tool_call_completion(body))
+            return
+
+        self._send_json(self._chat_completion(body, self.response_text))
+
+    def _write_log(self, body: dict[str, Any]) -> None:
+        if self.log_file is None:
+            return
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "path": self.path,
+                        "body": body,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    def _request_has_tool_output(self, body: dict[str, Any]) -> bool:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return False
+
+        last_user_index = -1
+        for index, message in enumerate(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                last_user_index = index
+
+        for message in messages[last_user_index + 1 :]:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "tool":
+                return True
+            if "Queued user input" in json.dumps(message, ensure_ascii=False):
+                return True
+        return False
+
+    def _chat_completion(self, body: dict[str, Any], content: str) -> dict[str, Any]:
         payload = {
             "id": "chatcmpl-koder-fixture",
             "object": "chat.completion",
@@ -56,6 +101,106 @@ class _Handler(BaseHTTPRequestHandler):
             ],
             "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
         }
+        payload["choices"][0]["message"]["content"] = content
+        return payload
+
+    def _tool_call_completion(self, body: dict[str, Any]) -> dict[str, Any]:
+        payload = self._chat_completion(body, "")
+        payload["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [self._tool_call_payload()],
+        }
+        payload["choices"][0]["finish_reason"] = "tool_calls"
+        return payload
+
+    def _tool_call_payload(self) -> dict[str, Any]:
+        return {
+            "id": "call_koder_queue_fixture",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "sample.txt"}),
+            },
+        }
+
+    def _stream_chunk(self, body: dict[str, Any], delta: dict[str, Any], finish_reason=None):
+        return {
+            "id": "chatcmpl-koder-fixture",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": body.get("model") or "gpt-4.1",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+    def _send_sse(self, chunks: list[dict[str, Any]]) -> None:
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.end_headers()
+        for chunk in chunks:
+            encoded = f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+            self.wfile.write(encoded)
+            self.wfile.flush()
+            if self.stream_delay:
+                time.sleep(self.stream_delay)
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _send_tool_call_stream(self, body: dict[str, Any]) -> None:
+        argument_json = json.dumps({"path": "sample.txt"})
+        if self.stream_lines <= 2:
+            content_chunks = [
+                self._stream_chunk(body, {"content": "streaming fixture line 1\n"}),
+                self._stream_chunk(body, {"content": "streaming fixture line 2\n"}),
+            ]
+        else:
+            content_chunks = [
+                self._stream_chunk(
+                    body,
+                    {"content": f"streaming fixture long line {line_number:03d}\n"},
+                )
+                for line_number in range(1, self.stream_lines + 1)
+            ]
+        chunks = [
+            self._stream_chunk(body, {"role": "assistant"}),
+            *content_chunks,
+            self._stream_chunk(
+                body,
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_koder_queue_fixture",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": ""},
+                        }
+                    ]
+                },
+            ),
+            self._stream_chunk(
+                body,
+                {"tool_calls": [{"index": 0, "function": {"arguments": argument_json}}]},
+            ),
+            self._stream_chunk(body, {}, "tool_calls"),
+        ]
+        self._send_sse(chunks)
+
+    def _send_text_stream(self, body: dict[str, Any]) -> None:
+        chunks = [
+            self._stream_chunk(body, {"role": "assistant"}),
+            self._stream_chunk(body, {"content": self.response_text}),
+            self._stream_chunk(body, {}, "stop"),
+        ]
+        self._send_sse(chunks)
+
+    def _send_json(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -73,10 +218,16 @@ def main() -> None:
     parser.add_argument("--response", required=True)
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path, required=True)
+    parser.add_argument("--scenario", default="single", choices=["single", "streaming_tool_queue"])
+    parser.add_argument("--stream-delay", type=float, default=0.0)
+    parser.add_argument("--stream-lines", type=int, default=2)
     args = parser.parse_args()
 
     _Handler.response_text = args.response
     _Handler.log_file = args.log_file
+    _Handler.scenario = args.scenario
+    _Handler.stream_delay = max(0.0, args.stream_delay)
+    _Handler.stream_lines = max(1, args.stream_lines)
 
     server = _ReusableHTTPServer(("127.0.0.1", args.port), _Handler)
     args.ready_file.parent.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sys
 import textwrap
 from pathlib import Path
@@ -26,7 +27,7 @@ def invoke_get_skill(payload: dict) -> str:
     return asyncio.run(skill_module.get_skill.on_invoke_tool(None, json.dumps(payload)))
 
 
-def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, capsys):
+def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, caplog):
     skill_file = tmp_path / "bad" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
@@ -41,8 +42,9 @@ def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert "invalid YAML" in output
     assert skill is not None
@@ -52,14 +54,15 @@ def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, capsys):
     assert skill.allowed_tools is None
 
 
-def test_load_skill_without_frontmatter_warns_and_uses_body(tmp_path, capsys):
+def test_load_skill_without_frontmatter_warns_and_uses_body(tmp_path, caplog):
     skill_file = tmp_path / "no-frontmatter" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text("Plain body only", encoding="utf-8")
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert "no frontmatter" in output
     assert skill is not None
@@ -164,7 +167,7 @@ def test_relative_links_are_resolved_to_absolute_paths(tmp_path):
     assert "[site](https://example.com)" in skill.content
 
 
-def test_duplicate_skill_names_emit_warning_and_keep_first(tmp_path, capsys):
+def test_duplicate_skill_names_emit_warning_and_keep_first(tmp_path, caplog):
     first = tmp_path / "first" / "SKILL.md"
     second = tmp_path / "second" / "SKILL.md"
     first.parent.mkdir(parents=True)
@@ -192,8 +195,9 @@ def test_duplicate_skill_names_emit_warning_and_keep_first(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skills = loader.discover_skills()
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skills = loader.discover_skills()
+    output = caplog.text
 
     assert "duplicate skill name 'shared-skill'" in output
     assert len(skills) == 1
@@ -480,7 +484,7 @@ def test_allowed_tools_empty_hyphenated_takes_priority(tmp_path):
 # ============================================================================
 
 
-def test_skill_name_validation_warns_on_uppercase(tmp_path, capsys):
+def test_skill_name_validation_warns_on_uppercase(tmp_path, caplog):
     """Test that uppercase in name triggers a warning."""
     skill_file = tmp_path / "bad-name" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -496,14 +500,15 @@ def test_skill_name_validation_warns_on_uppercase(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None  # Should still load (graceful degradation)
     assert "lowercase letters, numbers, and hyphens" in output
 
 
-def test_skill_name_validation_warns_on_underscores(tmp_path, capsys):
+def test_skill_name_validation_warns_on_underscores(tmp_path, caplog):
     """Test that underscores in name trigger a warning."""
     skill_file = tmp_path / "bad-name" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -519,14 +524,15 @@ def test_skill_name_validation_warns_on_underscores(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None
     assert "lowercase letters, numbers, and hyphens" in output
 
 
-def test_skill_name_too_long_warns(tmp_path, capsys):
+def test_skill_name_too_long_warns(tmp_path, caplog):
     """Test that name exceeding 64 characters triggers a warning."""
     long_name = "a" * 65
     skill_file = tmp_path / "long" / "SKILL.md"
@@ -537,14 +543,15 @@ def test_skill_name_too_long_warns(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None
     assert "exceeds 64 characters" in output
 
 
-def test_skill_name_valid_does_not_warn(tmp_path, capsys):
+def test_skill_name_valid_does_not_warn(tmp_path, caplog):
     """Test that valid names don't trigger warnings."""
     skill_file = tmp_path / "valid" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -560,8 +567,9 @@ def test_skill_name_valid_does_not_warn(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None
     assert skill.name == "valid-skill-name123"
@@ -569,7 +577,7 @@ def test_skill_name_valid_does_not_warn(tmp_path, capsys):
     assert "exceeds" not in output
 
 
-def test_skill_description_too_long_warns(tmp_path, capsys):
+def test_skill_description_too_long_warns(tmp_path, caplog):
     """Test that description exceeding 1024 characters triggers a warning."""
     long_desc = "x" * 1025
     skill_file = tmp_path / "longdesc" / "SKILL.md"
@@ -580,14 +588,15 @@ def test_skill_description_too_long_warns(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None
     assert "exceeds 1024 characters" in output
 
 
-def test_skill_description_valid_does_not_warn(tmp_path, capsys):
+def test_skill_description_valid_does_not_warn(tmp_path, caplog):
     """Test that valid descriptions don't trigger warnings."""
     skill_file = tmp_path / "valid-desc" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -603,8 +612,9 @@ def test_skill_description_valid_does_not_warn(tmp_path, capsys):
     )
 
     loader = SkillLoader(tmp_path)
-    skill = loader.load_skill(skill_file)
-    output = capsys.readouterr().out
+    with caplog.at_level(logging.WARNING, logger="koder_agent.tools.skill"):
+        skill = loader.load_skill(skill_file)
+    output = caplog.text
 
     assert skill is not None
     assert "exceeds" not in output

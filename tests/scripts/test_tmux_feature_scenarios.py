@@ -5,9 +5,11 @@ import sqlite3
 from pathlib import Path
 
 from scripts import tmux_feature_scenarios as scenarios
+from scripts.fake_openai_chat_server import _Handler as FakeOpenAIHandler
 from scripts.tmux_feature_scenarios import (
     DEFAULT_MANIFEST,
     VALIDATION_LEVELS,
+    _bottom_assertions_pass,
     _load_manifest,
     validate_manifest,
 )
@@ -21,6 +23,15 @@ def test_tui_feature_scenario_manifest_covers_all_runtime_commands():
     assert errors == []
 
 
+def test_bottom_assertions_only_scan_the_visible_capture_tail():
+    capture = "old output\nmid prompt | ⚡ Koder |\n" + "\n".join(
+        ["line 1", "line 2", "line 3", "line 4", "line 5", "status tail"]
+    )
+
+    assert not _bottom_assertions_pass(capture, ["| ⚡ Koder |"], window=3)
+    assert _bottom_assertions_pass(capture, ["status tail"], window=3)
+
+
 def test_tui_feature_scenarios_are_multi_turn_and_not_placeholder_smoke_checks():
     manifest = _load_manifest(DEFAULT_MANIFEST)
 
@@ -32,9 +43,8 @@ def test_tui_feature_scenarios_are_multi_turn_and_not_placeholder_smoke_checks()
 
     assert all_scenarios
     for suite_name, name, payload in all_scenarios:
-        assert payload["validation_level"] in VALIDATION_LEVELS, (
-            f"{suite_name}/{name} has invalid validation level"
-        )
+        has_valid_level = payload["validation_level"] in VALIDATION_LEVELS
+        assert has_valid_level, f"{suite_name}/{name} has invalid validation level"
         assert payload["purpose"].strip(), f"{suite_name}/{name} has no purpose"
         assert len(payload["turns"]) >= 2, f"{suite_name}/{name} is not multi-turn"
         assert any(
@@ -42,6 +52,7 @@ def test_tui_feature_scenarios_are_multi_turn_and_not_placeholder_smoke_checks()
             or turn.get("expect_all")
             or turn.get("expect_regex")
             or turn.get("expect_not")
+            or turn.get("expect_bottom_all")
             or turn.get("expect_session_dead")
             or turn.get("expect_tmux_panes_min")
             or turn.get("expect_tmux_any_pane_any")
@@ -202,7 +213,7 @@ def test_schedule_scenario_is_acceptance_backed_by_cron_registry_flow():
     }
     assert scenario["turns"][1] == {
         "send": "/schedule",
-        "expect_all": ["No scheduled tasks", "cron_create", "/loop skill"],
+        "expect_all": ["No scheduled tasks", "cron_create", "/loop"],
     }
     create_turn = scenario["turns"][2]
     assert create_turn["send"].startswith('!uv --project "$PYTHONPATH" run --no-sync python -c')
@@ -247,6 +258,67 @@ def test_schedule_scenario_is_acceptance_backed_by_cron_registry_flow():
     assert scenario["post_assertions"] == [
         {"file_contains": ["$REPO/schedule-proof.txt", "schedule-delete-ok"]},
         {"file_contains": ["$HOME/.koder/scheduled_tasks.json", "{not json"]},
+    ]
+
+
+def test_loop_scenario_is_acceptance_backed_by_cron_command_flow():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["slash_commands"]["loop"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["acceptance_criteria"]
+    assert scenario["acceptance_artifacts"]
+    assert scenario["turns"][0] == {
+        "send": "/loop",
+        "expect_all": ["No loop jobs", "Usage: /loop", "@every 5m"],
+    }
+    assert scenario["turns"][1] == {
+        "send": "/loop @every 5m check build",
+        "expect_all": [
+            "Loop job created",
+            "cron: */5 * * * *",
+            "recurring: true",
+            "prompt: check build",
+        ],
+    }
+    assert scenario["turns"][2] == {
+        "send": "/loop once 30 14 * * 1 monday review",
+        "expect_all": [
+            "Loop job created",
+            "cron: 30 14 * * 1",
+            "recurring: false",
+            "prompt: monday review",
+        ],
+    }
+    assert {
+        "Loop jobs (2):",
+        "cron: */5 * * * *",
+        "prompt: check build",
+        "cron: 30 14 * * 1",
+        "recurring: false",
+        "prompt: monday review",
+    } <= set(scenario["turns"][3]["expect_all"])
+    assert scenario["turns"][4] == {
+        "send": "/loop @after-turn follow up",
+        "expect_all": ["loop: unsupported schedule", "@after-turn"],
+    }
+    delete_turn = scenario["turns"][5]
+    assert "cron_delete" in delete_turn["send"]
+    assert "loop-delete-ok" not in delete_turn["send"]
+    assert delete_turn["expect_all"] == ["loop-delete-ok"]
+    assert scenario["turns"][6] == {
+        "send": "/loop",
+        "capture": "visible",
+        "expect_all": [
+            "Loop jobs (1):",
+            "cron: 30 14 * * 1",
+            "prompt: monday review",
+        ],
+    }
+    assert scenario["post_assertions"] == [
+        {"file_contains": ["$REPO/loop-proof.txt", "loop-delete-ok"]},
+        {"file_contains": ["$HOME/.koder/scheduled_tasks.json", "monday review"]},
+        {"file_not_contains": ["$HOME/.koder/scheduled_tasks.json", "check build"]},
     ]
 
 
@@ -4578,7 +4650,10 @@ def test_prelaunch_files_are_checked():
 
 def test_fake_openai_fixture_is_checked():
     manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
-    manifest["slash_commands"]["btw"]["fake_openai"] = {"port": "19081"}
+    manifest["slash_commands"]["btw"]["fake_openai"] = {
+        "port": "19081",
+        "stream_lines": "many",
+    }
 
     errors = validate_manifest(manifest)
 
@@ -4586,6 +4661,110 @@ def test_fake_openai_fixture_is_checked():
     assert "slash_commands/btw: fake_openai.response is required" in errors
     assert "slash_commands/btw: fake_openai.log_file is required" in errors
     assert "slash_commands/btw: fake_openai.ready_file is required" in errors
+    assert "slash_commands/btw: fake_openai.stream_lines must be a positive integer" in errors
+
+
+def test_streaming_tool_queue_fixture_continuation_uses_latest_user_turn():
+    completed_previous_tool_turn = {
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "tool_calls": [{"id": "call_1"}]},
+            {"role": "tool", "content": "sample.txt", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "final answer"},
+            {"role": "user", "content": "second"},
+        ]
+    }
+    active_tool_continuation = {
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "tool_calls": [{"id": "call_1"}]},
+            {"role": "tool", "content": "sample.txt", "tool_call_id": "call_1"},
+        ]
+    }
+
+    assert not FakeOpenAIHandler._request_has_tool_output(None, completed_previous_tool_turn)
+    assert FakeOpenAIHandler._request_has_tool_output(None, active_tool_continuation)
+
+
+def test_fixed_bottom_queued_input_scenario_uses_streaming_tool_fixture():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["fixed-bottom-queued-input"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["env"] == {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19090/v1",
+        "KODER_API_KEY": "fixed-bottom-secret-token",
+    }
+    assert scenario["fake_openai"] == {
+        "port": 19090,
+        "response": "final answer after queued input",
+        "log_file": "$HOME/fake-openai-fixed-bottom-queue.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-queue.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.08,
+        "stream_lines": 80,
+    }
+    assert scenario["turns"][0]["expect_all"] == [
+        "streaming fixture long line 050",
+        "| ⚡ Koder |",
+    ]
+    assert scenario["turns"][0]["expect_bottom_all"] == ["| ⚡ Koder |"]
+    assert scenario["turns"][0]["expect_not"] == ["streaming fixture long line 001"]
+    assert scenario["turns"][1]["expect_all"] == [
+        "queued: queued from tmux while streaming",
+        "| ⚡ Koder |",
+    ]
+    assert scenario["turns"][1]["expect_bottom_all"] == ["| ⚡ Koder |"]
+    assert scenario["turns"][1]["expect_regex"] == [
+        "queued: queued from tmux while streaming\\n\\u250c.*\\| \\u26a1 Koder \\|"
+    ]
+    assert scenario["turns"][1]["expect_not"] == ["Tip:"]
+    assert scenario["turns"][2]["expect_bottom_all"] == ["| ⚡ Koder |"]
+    assert scenario["turns"][2]["expect_not"] == ["queued: queued from tmux while streaming"]
+    assert scenario["turns"][3]["send"] == "hello after prior output"
+    assert scenario["turns"][3]["wait"] == 1.1
+    assert scenario["turns"][3]["expect_all"] == [
+        "streaming fixture long line 010",
+        "final answer after queued input",
+        "| ⚡ Koder |",
+    ]
+    assert scenario["turns"][3]["expect_bottom_all"] == ["| ⚡ Koder |"]
+    assert scenario["turns"][3]["timeout"] == 0.8
+    assert scenario["turns"][4]["expect_all"] == [
+        "final answer after queued input",
+        "| ⚡ Koder |",
+    ]
+    assert scenario["turns"][4]["expect_bottom_all"] == ["Tip:", "| ⚡ Koder |"]
+    assert scenario["turns"][4]["expect_regex"] == ["Tip: .*\\n\\u250c.*\\| \\u26a1 Koder \\|"]
+    assert scenario["post_assertions"] == [
+        {
+            "file_contains": [
+                "$HOME/fake-openai-fixed-bottom-queue.log",
+                ["Queued user input", "queued from tmux while streaming", "sample.txt"],
+            ]
+        }
+    ]
+
+
+def test_fixed_bottom_idle_tip_scenario_checks_tip_with_prompt():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["fixed-bottom-idle-tip"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["fake_openai"] == {
+        "port": 19091,
+        "response": "final answer after queued input",
+        "log_file": "$HOME/fake-openai-fixed-bottom-tip.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-tip.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.01,
+        "stream_lines": 1,
+    }
+    for turn in scenario["turns"]:
+        assert turn["capture"] == "visible"
+        assert turn["expect_bottom_all"] == ["Tip:", "| ⚡ Koder |"]
+        assert turn["expect_regex"] == ["Tip: .*\\n\\u250c.*\\| \\u26a1 Koder \\|"]
 
 
 def test_strict_acceptance_requires_acceptance_metadata():

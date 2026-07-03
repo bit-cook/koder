@@ -1,7 +1,10 @@
 """Session management utilities for Koder Agent."""
 
+import logging
 from datetime import datetime
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def default_session_local_ms() -> str:
@@ -24,6 +27,7 @@ def parse_session_dt(sid: str) -> Tuple[int, Optional[datetime]]:
             dt = datetime.strptime(sid, fmt)
             return (0, dt)
         except Exception:
+            logger.debug("Failed to parse session datetime '%s'", sid, exc_info=True)
             continue
     return (1, None)
 

@@ -3,6 +3,8 @@
 from koder_agent.core.interactive import (
     _get_completion_menu_height,
     _get_completion_menu_max_rows,
+    _get_idle_prompt_spacer_height,
+    _get_prompt_scroll_padding_rows,
 )
 
 
@@ -53,3 +55,36 @@ def test_get_completion_menu_height_returns_zero_without_matches():
         max_visible_rows=20,
     )
     assert (height.min, height.preferred, height.max) == (0, 0, 0)
+
+
+def test_idle_prompt_spacer_height_is_flexible_not_terminal_sized():
+    """Idle prompts should fill live screen space without writing fixed blank scrollback."""
+    height = _get_idle_prompt_spacer_height()
+
+    assert (height.min, height.preferred, height.weight) == (0, 0, 1)
+    assert height.max > 1000
+
+
+def test_prompt_scroll_padding_uses_only_rows_needed_for_prompt_chrome():
+    """Idle prompt rendering should not inject a full-screen spacer into scrollback."""
+    assert (
+        _get_prompt_scroll_padding_rows(
+            rows_below_cursor=0,
+            input_rows=3,
+            has_status_line=True,
+            bottom_padding_rows=1,
+        )
+        == 5
+    )
+
+
+def test_prompt_scroll_padding_is_zero_when_terminal_already_has_room():
+    assert (
+        _get_prompt_scroll_padding_rows(
+            rows_below_cursor=8,
+            input_rows=3,
+            has_status_line=True,
+            bottom_padding_rows=1,
+        )
+        == 0
+    )

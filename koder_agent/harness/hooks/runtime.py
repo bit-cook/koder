@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -21,6 +22,8 @@ from koder_agent.harness.session_env import (
     apply_session_env_file_to_process,
     session_env_file,
 )
+
+logger = logging.getLogger(__name__)
 
 # Maximum characters of hook output injected into model context.
 _MAX_HOOK_OUTPUT_CHARS = 10_000
@@ -379,6 +382,7 @@ def load_hook_scopes(cwd: str | Path) -> list[HookScope]:
                 manifest_data = _json.loads(manifest_path.read_text(encoding="utf-8"))
                 plugin_name = manifest_data.get("name", "")
             except Exception:
+                logger.debug("Failed to read plugin manifest", exc_info=True)
                 continue
             if not plugin_name or not state_store.is_enabled(plugin_name):
                 continue
@@ -854,7 +858,7 @@ def dispatch_command_hooks(
                             if _pname:
                                 env.update(plugin_env_vars(_pname, scope.skill_root))
                         except Exception:
-                            pass
+                            logger.debug("Failed to load plugin env vars", exc_info=True)
                 if isinstance(payload.get("session_id"), str):
                     env["KODER_SESSION_ID"] = str(payload["session_id"])
                     if event_name in _ENV_FILE_EVENTS:

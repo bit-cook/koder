@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import numbers
 import os
 import time
@@ -18,6 +19,7 @@ from koder_agent.auth.constants import SUPPORTED_PROVIDERS, TOKEN_EXPIRY_BUFFER_
 from koder_agent.auth.providers import get_provider
 from koder_agent.auth.token_storage import get_token_storage
 
+logger = logging.getLogger(__name__)
 console = Console()
 
 PROVIDER_DESCRIPTIONS: Dict[str, str] = {
@@ -260,7 +262,7 @@ async def handle_revoke(provider_id: str) -> bool:
         provider = get_provider(provider_id)
         await provider.revoke_token(tokens.refresh_token)
     except Exception:
-        pass
+        logger.debug("Failed to revoke token for provider %s", provider_id, exc_info=True)
 
     storage.delete(provider_id)
     console.print(f"[green]Tokens revoked for {provider_id}[/green]")
@@ -304,7 +306,7 @@ async def _print_token_details(provider_id: str, tokens, storage) -> None:
                 tokens = result.tokens
                 access_token = tokens.access_token
         except Exception:
-            pass
+            logger.debug("Failed to refresh expired tokens for %s", provider_id, exc_info=True)
 
     if tokens.is_expired(0):
         status = "[red]EXPIRED[/red]"
@@ -339,7 +341,7 @@ async def _print_token_details(provider_id: str, tokens, storage) -> None:
             tokens.models_fetched_at = int(time.time() * 1000)
             storage.save(tokens)
         except Exception:
-            pass
+            logger.debug("Failed to fetch models for %s", provider_id, exc_info=True)
 
     if models:
         source_label = "[green]API[/green]" if source == "api" else "[cyan]cached[/cyan]"
@@ -363,7 +365,7 @@ async def _print_github_copilot_status() -> None:
             with open(authenticator.api_key_file, encoding="utf-8") as file:
                 api_key_info = json.load(file)
         except Exception:
-            pass
+            logger.debug("Failed to read GitHub Copilot API key file", exc_info=True)
 
         raw_expires_at = api_key_info.get("expires_at") if isinstance(api_key_info, dict) else None
         expires_at = raw_expires_at if isinstance(raw_expires_at, numbers.Real) else None

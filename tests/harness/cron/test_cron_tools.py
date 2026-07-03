@@ -37,6 +37,25 @@ def test_cron_create_invalid_expression():
     assert "error" in result
 
 
+@pytest.mark.parametrize(
+    "cron",
+    [
+        "*/0 * * * *",
+        "99 * * * *",
+        "0 24 * * *",
+        "0 9 0 * *",
+        "0 9 * 13 *",
+        "0 9 * * 8",
+        "5/2 * * * *",
+    ],
+)
+def test_cron_create_rejects_expressions_that_matcher_cannot_run(cron):
+    result = json.loads(cron_create(cron=cron, prompt="bad"))
+
+    assert "error" in result
+    assert "Invalid cron expression" in result["error"]
+
+
 def test_cron_list_empty():
     result = json.loads(cron_list())
     assert result["jobs"] == []

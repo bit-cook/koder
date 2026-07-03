@@ -9,6 +9,7 @@ the 'gemini' API key provider.
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
@@ -34,6 +35,8 @@ from koder_agent.auth.constants import (
     GOOGLE_USERINFO_URL,
 )
 from koder_agent.auth.tool_utils import merge_optional_params
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleOAuthProvider(OAuthProvider):
@@ -122,7 +125,7 @@ class GoogleOAuthProvider(OAuthProvider):
                     if response.ok:
                         return await response.json()
         except Exception:
-            pass
+            logger.debug("Failed to fetch Google user info", exc_info=True)
         return None
 
     async def revoke_token(self, token: str) -> bool:

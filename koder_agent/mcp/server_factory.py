@@ -100,7 +100,7 @@ class ChannelAwareMCPServerStdio(MCPServerStdio):
                 try:
                     await self.cleanup()
                 except Exception:
-                    pass
+                    logger.debug("MCP server cleanup failed after connection error", exc_info=True)
             raise
 
 
@@ -144,7 +144,7 @@ class _ElicitationMixin:
                 try:
                     await self.cleanup()  # type: ignore[attr-defined]
                 except Exception:
-                    pass
+                    logger.debug("MCP elicitation server cleanup failed", exc_info=True)
             raise
 
 

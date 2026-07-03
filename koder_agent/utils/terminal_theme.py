@@ -170,6 +170,9 @@ def get_adaptive_prompt_style():
             "completion-menu.completion.current": "#000000 bg:#d0d0d0",  # Dark text on selected
             "completion-menu.meta.completion": "#666666 bg:#e8e8e8",  # Gray desc on light
             "completion-menu.meta.completion.current": "#000000 bg:#c0c0c0",  # Dark desc selected
+            "stream-output": "#000000",
+            "queued-input": "#777777",  # Queued prompts while a turn is running
+            "tip-line": "#777777 italic",
             # Status line styles
             "status-label": "#666666",  # Gray labels
             "status-value": "#333333",  # Dark values
@@ -194,6 +197,9 @@ def get_adaptive_prompt_style():
             "completion-menu.completion.current": "#ffffff bg:#555555",  # Light text on selected
             "completion-menu.meta.completion": "#aaaaaa bg:#222222",  # Gray desc on dark
             "completion-menu.meta.completion.current": "#ffffff bg:#444444",  # Light desc selected
+            "stream-output": "#ffffff",
+            "queued-input": "#888888",  # Queued prompts while a turn is running
+            "tip-line": "#888888 italic",
             # Status line styles
             "status-label": "#888888",  # Gray labels
             "status-value": "#cccccc",  # Light values
@@ -218,6 +224,9 @@ def get_adaptive_prompt_style():
             "completion-menu.completion.current": "reverse",  # Just reverse colors
             "completion-menu.meta.completion": "",
             "completion-menu.meta.completion.current": "reverse",
+            "stream-output": "",
+            "queued-input": "#888888",
+            "tip-line": "#888888 italic",
             # Status line styles (neutral colors)
             "status-label": "#888888",
             "status-value": "",  # Use terminal default

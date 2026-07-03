@@ -32,6 +32,7 @@ from koder_agent.litellm_cost_map import get_litellm_cost_map_debug_lines
 from koder_agent.utils.client import get_model_name
 from koder_agent.utils.terminal_theme import get_adaptive_console
 
+logger = logging.getLogger(__name__)
 console = get_adaptive_console()
 DIRECT_COMMAND_PASSTHROUGHS = {"commit"}
 
@@ -639,6 +640,7 @@ async def run_harness_session_flow(
     # load_mcp_servers() runs (which happens lazily on first agent call).
     # load_mcp_servers() will pick up the existing router from the handler.
     _channel_task = None
+    _cron_prompt_runner = None
     if channel_entries:
         import asyncio
 
@@ -1046,6 +1048,11 @@ async def run_harness_session_flow(
                 interactive_prompt.status_line.pr_poller = _pr_poller
             _pr_poller.start()
 
+            from koder_agent.harness.cron.runtime import CronPromptRunner
+
+            _cron_prompt_runner = CronPromptRunner(lambda: scheduler)
+            _cron_prompt_runner.start()
+
             if args.debug:
                 print_reflowable(
                     console,
@@ -1075,7 +1082,7 @@ async def run_harness_session_flow(
                         if interactive_prompt.status_line:
                             interactive_prompt.status_line.update_display_name(display_name)
                     except Exception:
-                        pass
+                        logger.debug("Failed to update display name from title task", exc_info=True)
                     scheduler._title_generation_task = None
 
                 if user_input:
@@ -1112,7 +1119,10 @@ async def run_harness_session_flow(
                                             display_name
                                         )
                                     except Exception:
-                                        pass
+                                        logger.debug(
+                                            "Failed to update display name after session switch",
+                                            exc_info=True,
+                                        )
                                 if clear_viewport:
                                     _clear_interactive_viewport()
                                 print_reflowable(
@@ -1207,7 +1217,16 @@ async def run_harness_session_flow(
                                 )
                                 # Mark response start for timing
                                 interactive_prompt.mark_response_start()
-                                response = await scheduler.handle(processed_input)
+                                if streaming:
+                                    async with interactive_prompt.capture_queued_input(
+                                        scheduler.queued_input
+                                    ) as streaming_ui:
+                                        response = await scheduler.handle(
+                                            processed_input,
+                                            streaming_ui=streaming_ui,
+                                        )
+                                else:
+                                    response = await scheduler.handle(processed_input)
                                 # Mark response complete, show tip, send notification if long-running
                                 interactive_prompt.mark_response_complete(
                                     show_tip=True,
@@ -1216,6 +1235,13 @@ async def run_harness_session_flow(
                                         "model": get_model_name(),
                                     },
                                 )
+                                leftover_queued_input = (
+                                    scheduler.queued_input.drain_for_tool_result()
+                                )
+                                if leftover_queued_input:
+                                    interactive_prompt.set_next_input_text(
+                                        "\n\n".join(leftover_queued_input)
+                                    )
                                 await interactive_prompt.refresh_prompt_suggestion(
                                     user_input,
                                     response,
@@ -1250,7 +1276,9 @@ async def run_harness_session_flow(
                                 if interactive_prompt.status_line:
                                     interactive_prompt.status_line.update_display_name(display_name)
                             except Exception:
-                                pass
+                                logger.debug(
+                                    "Failed to update display name from title task", exc_info=True
+                                )
                             scheduler._title_generation_task = None
     finally:
         # Stop PR status poller if it was started.
@@ -1258,10 +1286,20 @@ async def run_harness_session_flow(
             _pr_poller.stop()
         if _channel_task is not None:
             _channel_task.cancel()
+            results = await asyncio.gather(_channel_task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.debug(
+                        "Channel task cancellation failed",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+        if _cron_prompt_runner is not None:
             try:
-                await _channel_task
+                await _cron_prompt_runner.stop()
             except Exception:
-                pass
+                logger.debug("Cron prompt runner shutdown failed", exc_info=True)
         try:
             dispatch_command_hooks(
                 cwd=Path.cwd(),
@@ -1274,7 +1312,7 @@ async def run_harness_session_flow(
                 },
             )
         except Exception:
-            pass
+            logger.debug("SessionEnd hook dispatch failed", exc_info=True)
         # Record session for AutoDream memory consolidation
         dream_manager = None
         try:
@@ -1308,16 +1346,16 @@ async def run_harness_session_flow(
             else:
                 dream_manager.save()
         except Exception:
+            logger.debug("AutoDream memory consolidation failed", exc_info=True)
             if dream_manager is not None:
                 try:
                     dream_manager.save()
                 except Exception:
-                    pass
-            pass  # Don't fail session cleanup if AutoDream fails
+                    logger.debug("Failed to save dream manager state", exc_info=True)
         try:
             await scheduler.cleanup()
         except Exception:
-            pass
+            logger.debug("Scheduler cleanup failed", exc_info=True)
         if bare_mode:
             if previous_simple is None:
                 os.environ.pop("KODER_SIMPLE", None)

@@ -91,3 +91,43 @@ def test_scheduler_deletes_one_shot_after_fire(tmp_path):
     assert len(fired) == 1
     # Job should be deleted
     assert len(storage.list_all()) == 0
+
+
+def test_scheduler_skips_invalid_job_and_continues(tmp_path):
+    storage = CronStorage(tmp_path / "crons.json")
+    fired = []
+    scheduler = CronScheduler(storage, on_fire=fired.append)
+
+    storage.create(cron="*/0 * * * *", prompt="poison")
+    storage.create(cron="* * * * *", prompt="healthy")
+
+    asyncio.run(scheduler._tick())
+
+    assert fired == ["healthy"]
+
+
+def test_scheduler_minute_dedup_uses_full_minute_key(tmp_path):
+    storage = CronStorage(tmp_path / "crons.json")
+    fired = []
+    scheduler = CronScheduler(storage, on_fire=fired.append)
+
+    scheduler._fired_this_minute.add("job-1")
+    scheduler._last_minute_key = (2026, 7, 3, 9, 0)
+    scheduler._reset_fired_set_if_needed(datetime(2026, 7, 3, 10, 0, 0))
+
+    assert scheduler._fired_this_minute == set()
+
+
+def test_scheduler_stop_async_stops_background_task(tmp_path):
+    storage = CronStorage(tmp_path / "crons.json")
+    scheduler = CronScheduler(storage, on_fire=lambda _prompt: None, check_interval=60)
+
+    async def scenario():
+        scheduler.start()
+        assert scheduler._task is not None
+
+        await scheduler.stop_async()
+
+        assert scheduler._task is None
+
+    asyncio.run(scenario())

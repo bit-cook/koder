@@ -959,6 +959,89 @@ def test_schedule_command_lists_cron_registry_and_edges(tmp_path, monkeypatch):
         cron_module._set_cron_storage(None)
 
 
+def test_loop_command_creates_lists_and_deletes_cron_jobs(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    from koder_agent.tools import cron as cron_module
+
+    cron_module._set_cron_storage(None)
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+    try:
+        empty_output = _run("/loop", handler=handler)
+        assert "No loop jobs" in empty_output
+        assert "Usage: /loop" in empty_output
+
+        created_output = _run("/loop 0 9 * * * morning standup", handler=handler)
+        assert "Loop job created" in created_output
+        assert "cron: 0 9 * * *" in created_output
+        assert "recurring: true" in created_output
+        assert "prompt: morning standup" in created_output
+
+        every_output = _run("/loop @every 5m check build", handler=handler)
+        assert "Loop job created" in every_output
+        assert "cron: */5 * * * *" in every_output
+        assert "prompt: check build" in every_output
+
+        once_output = _run("/loop once 30 14 * * 1 monday review", handler=handler)
+        assert "Loop job created" in once_output
+        assert "cron: 30 14 * * 1" in once_output
+        assert "recurring: false" in once_output
+
+        list_output = _run("/loop list", handler=handler)
+        assert "Loop jobs (3):" in list_output
+        assert "cron: 0 9 * * *" in list_output
+        assert "cron: */5 * * * *" in list_output
+        assert "cron: 30 14 * * 1" in list_output
+
+        jobs = json.loads(cron_module.cron_list())["jobs"]
+        delete_output = _run(f"/loop delete {jobs[0]['id']}", handler=handler)
+        assert delete_output == f"Loop job deleted: {jobs[0]['id']}"
+
+        after_delete_output = _run("/loop", handler=handler)
+        assert "Loop jobs (2):" in after_delete_output
+        assert jobs[0]["id"] not in after_delete_output
+
+        too_fast_output = _run("/loop @every 30s too fast", handler=handler)
+        assert "loop: unsupported schedule" in too_fast_output
+        assert "sub-minute" in too_fast_output
+
+        after_turn_output = _run("/loop @after-turn follow up", handler=handler)
+        assert "loop: unsupported schedule" in after_turn_output
+        assert "@after-turn" in after_turn_output
+    finally:
+        cron_module._set_cron_storage(None)
+
+
+def test_loop_command_reports_active_registry_path_on_read_error(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    from koder_agent.harness.cron.storage import CronStorage
+    from koder_agent.tools import cron as cron_module
+
+    custom_path = tmp_path / "custom" / "loop_tasks.json"
+    custom_path.parent.mkdir(parents=True)
+    custom_path.write_text("{not json", encoding="utf-8")
+    cron_module._set_cron_storage(CronStorage(custom_path))
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+    try:
+        output = _run("/loop", handler=handler)
+
+        assert "loop: failed to read scheduled task registry" in output
+        assert str(custom_path) in output
+        assert str(home / ".koder" / "scheduled_tasks.json") not in output
+    finally:
+        cron_module._set_cron_storage(None)
+
+
+def test_command_list_prefers_runtime_command_over_shadowed_skill():
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+    command_names = [name for name, _description in handler.get_command_list()]
+
+    assert command_names.count("loop") == 1
+
+
 def test_passes_command_reports_pytest_cache_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"

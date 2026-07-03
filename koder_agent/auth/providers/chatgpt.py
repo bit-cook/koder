@@ -471,9 +471,9 @@ class ChatGPTOAuthLLM(CustomLLM):
         self,
         messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Convert OpenAI-style messages to Codex input format.
+        """Convert OpenAI-style messages to the provider input format.
 
-        Codex API uses 'input' array with different structure:
+        The provider API uses an 'input' array with a different structure:
         - type: "message"
         - role: "user" | "assistant" | "developer" (instead of "system")
         - content: array of content objects
@@ -482,7 +482,7 @@ class ChatGPTOAuthLLM(CustomLLM):
             messages: OpenAI-style messages
 
         Returns:
-            Codex-style input array
+            Provider input array
         """
         input_items = []
 

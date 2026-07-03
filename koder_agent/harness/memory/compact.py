@@ -375,7 +375,7 @@ async def llm_compact_messages(
             }
         ]
 
-        response = await llm_completion(summary_messages)
+        response = await llm_completion(summary_messages, use_small=True)
 
         # Extract <summary> section, strip <analysis>
         summary_match = re.search(r"<summary>(.*?)</summary>", response, re.DOTALL | re.IGNORECASE)

@@ -101,7 +101,7 @@ def save_tokens(server_name: str, tokens: Dict[str, Any]) -> None:
     try:
         path.chmod(0o600)
     except OSError:
-        pass
+        logger.debug("Failed to set token file permissions", exc_info=True)
 
 
 def clear_tokens(server_name: str) -> None:
@@ -305,6 +305,7 @@ class MCPOAuthFlow:
                         self._metadata = data
                         return data
                 except Exception:
+                    logger.debug("OAuth metadata discovery attempt failed", exc_info=True)
                     continue
 
             # Fallback: try override URL directly
@@ -315,7 +316,7 @@ class MCPOAuthFlow:
                         self._metadata = resp.json()
                         return self._metadata
                 except Exception:
-                    pass
+                    logger.debug("OAuth metadata fallback URL fetch failed", exc_info=True)
 
         raise RuntimeError(
             f"Could not discover OAuth metadata for {self.server_url}. "

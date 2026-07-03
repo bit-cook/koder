@@ -87,7 +87,7 @@ async def _run_gh(*args: str, timeout: float = GH_TIMEOUT_S) -> Optional[str]:
         try:
             proc.kill()  # type: ignore[possibly-undefined]
         except Exception:
-            pass
+            logger.debug("Failed to kill timed-out gh process", exc_info=True)
         return None
     except Exception:
         return None

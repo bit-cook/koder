@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from .budget import estimate_text_tokens
+
+logger = logging.getLogger(__name__)
 
 # Upstream constants
 MAX_FILE_RESTORE_COUNT = 5
@@ -32,6 +35,9 @@ class PostCompactRepair:
                         seen.add(fp)
                         paths.append(fp)
                 except (json.JSONDecodeError, TypeError):
+                    logger.debug(
+                        "Failed to parse tool call arguments for file restore", exc_info=True
+                    )
                     continue
         return paths[:MAX_FILE_RESTORE_COUNT]
 
@@ -61,6 +67,7 @@ class PostCompactRepair:
                 )
                 tokens_used += content_tokens
             except OSError:
+                logger.debug("Failed to read file for post-compact restore: %s", fp, exc_info=True)
                 continue
 
         return attachments

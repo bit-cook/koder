@@ -3,75 +3,33 @@
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 
-from koder_agent.harness.cron.storage import CronStorage
+from koder_agent.harness.cron.expression import human_schedule, validate_cron
+from koder_agent.harness.cron.storage import (
+    CronStorage,
+    default_cron_storage,
+    set_default_cron_storage,
+)
 
 from .compat import function_tool
 
-# --- Storage singleton ---
-
-_storage: CronStorage | None = None
-
 
 def _get_cron_storage() -> CronStorage:
-    global _storage
-    if _storage is None:
-        root = Path.home() / ".koder"
-        _storage = CronStorage(root / "scheduled_tasks.json")
-    return _storage
+    return default_cron_storage()
 
 
 def _set_cron_storage(storage: CronStorage | None) -> None:
-    global _storage
-    _storage = storage
-
-
-# --- Cron validation ---
-
-_CRON_FIELD_RE = re.compile(r"^(\*|(\d+(-\d+)?(,\d+(-\d+)?)*)(\/\d+)?|\*\/\d+)$")
+    set_default_cron_storage(storage)
 
 
 def _validate_cron(expr: str) -> str | None:
     """Validate a 5-field cron expression. Returns error or None."""
-    fields = expr.strip().split()
-    if len(fields) != 5:
-        return f"Expected 5 fields (M H DoM Mon DoW), got {len(fields)}"
-    for i, field in enumerate(fields):
-        if not _CRON_FIELD_RE.match(field):
-            return f"Invalid cron field {i + 1}: {field}"
-    return None
+    return validate_cron(expr)
 
 
 def _human_schedule(cron: str) -> str:
     """Convert cron expression to rough human-readable schedule."""
-    fields = cron.strip().split()
-    if len(fields) != 5:
-        return cron
-    minute, hour, dom, month, dow = fields
-
-    parts = []
-    if dow != "*":
-        day_names = {
-            "0": "Sun",
-            "1": "Mon",
-            "2": "Tue",
-            "3": "Wed",
-            "4": "Thu",
-            "5": "Fri",
-            "6": "Sat",
-            "7": "Sun",
-        }
-        days = [day_names.get(d, d) for d in dow.split(",")]
-        parts.append(f"on {','.join(days)}")
-
-    if hour != "*" and minute != "*":
-        parts.append(f"at {hour}:{minute.zfill(2)}")
-    elif hour != "*":
-        parts.append(f"at {hour}:00")
-
-    return " ".join(parts) if parts else cron
+    return human_schedule(cron)
 
 
 # --- Plain implementations ---

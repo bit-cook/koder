@@ -143,12 +143,14 @@ def _is_openai_native_model(raw_model: str) -> bool:
 
     Handles plain names ("gpt-4o") and provider-prefixed strings
     ("openai/gpt-4o", "litellm/openai/gpt-4o").
+
+    Also checks for "dall-e-" prefix to cover image models.
     """
     if not raw_model:
         return False
     _, model_part, _ = _split_model_identifier(raw_model)
     ml = model_part.lower()
-    return ml.startswith(("gpt-", "o1-", "o3-", "o4-", "chatgpt-"))
+    return ml.startswith(("gpt-", "o1-", "o3-", "o4-", "chatgpt-", "dall-e-"))
 
 
 def _strip_matching_provider(raw_model: str, provider: str) -> str:
@@ -241,12 +243,21 @@ def _setup_provider_env_vars(config, provider: str):
         if config.model.vertex_ai_location and not os.environ.get("VERTEXAI_LOCATION"):
             os.environ["VERTEXAI_LOCATION"] = config.model.vertex_ai_location
 
-    # Set API key if configured and not in env
-    api_key = config.model.api_key
-    if api_key:
-        env_var_name = _get_provider_env_var_name(config_provider)
-        if not os.environ.get(env_var_name):
-            os.environ[env_var_name] = api_key
+    # SECURITY (P1): Deliberately do NOT write the provider API key into os.environ.
+    #
+    # Subprocesses spawned by run_shell inherit the parent environment, so any
+    # secret placed here would be readable by the model via `env`/`printenv`.
+    # The output filter only masks a narrow set of patterns, so most provider
+    # keys would leak. Keys must therefore flow ONLY through explicit call kwargs:
+    #   - llm_completion()  -> litellm.acompletion/aresponses(api_key=...)
+    #   - setup_openai_client() native path -> AsyncOpenAI(api_key=...)
+    #   - get_litellm_model_kwargs() -> LitellmModel(api_key=...)
+    # All of these resolve the key via _get_provider_api_key() and pass it
+    # explicitly, so the previous os.environ[...] = api_key write was redundant.
+    #
+    # Only non-secret routing vars (Azure API version/base, Vertex location, and
+    # GOOGLE_APPLICATION_CREDENTIALS which is a file path, not a secret) are set
+    # above, because some provider SDK / LiteLLM routing paths read them from env.
 
 
 def _map_oauth_to_litellm_provider(provider: str) -> str:
@@ -358,10 +369,40 @@ def _normalize_model_name(provider: str, raw_model: str, model_from_env: bool = 
     return f"litellm/{litellm_provider}/{raw_model}"
 
 
+_native_vs_litellm_logged = False
+
+
 def _compute_effective_model(config, config_manager, provider, raw_model, model_from_env=False):
     """Determine the model name and whether to use native OpenAI integration."""
+    global _native_vs_litellm_logged
     api_key = _get_provider_api_key(config, config_manager, provider)
-    use_native = provider in ("openai", "custom") and api_key and _is_openai_native_model(raw_model)
+
+    # Determine whether to use native OpenAI client:
+    # 1. Primary: known OpenAI model prefix (gpt-, o1-, o3-, o4-, chatgpt-, dall-e-)
+    # 2. Secondary: provider is "openai" with a key, model name is a simple name
+    #    (no sub-path like "x-ai/grok-...") and no custom base URL override.
+    #    This catches new OpenAI model families whose names don't match known prefixes.
+    use_native = False
+    if provider in ("openai", "custom") and api_key is not None:
+        if _is_openai_native_model(raw_model):
+            use_native = True
+        elif provider == "openai":
+            # Secondary detection: treat as native if model looks like a direct
+            # OpenAI model (no sub-routing path) and no custom base URL is set.
+            # Check both: the model_part after splitting AND the raw_model itself
+            # (since raw_model like "x-ai/grok-..." is a compound routing name).
+            stripped = _strip_matching_provider(raw_model, provider)
+            has_routing_path = "/" in stripped
+            has_custom_base = os.environ.get("KODER_BASE_URL") is not None
+            if not has_routing_path and not has_custom_base:
+                use_native = True
+
+    if not _native_vs_litellm_logged:
+        _native_vs_litellm_logged = True
+        logger = logging.getLogger(__name__)
+        if logger.isEnabledFor(logging.INFO):
+            path = "native-openai" if use_native else "litellm"
+            logger.info("Model routing: provider=%s model=%s path=%s", provider, raw_model, path)
 
     if use_native:
         # If the raw model string included a provider prefix, strip it for native calls
@@ -541,13 +582,33 @@ def is_native_openai_provider(model_override: Optional[str] = None) -> bool:
     )
 
 
+def get_small_model_name() -> Optional[str]:
+    """Resolve the small/cheap model for auxiliary LLM calls.
+
+    Priority: KODER_SMALL_MODEL env > config.model.small_model > None.
+    When None is returned, callers should use the main model.
+    """
+    env_val = os.environ.get("KODER_SMALL_MODEL")
+    if env_val:
+        return env_val
+    try:
+        config = get_config()
+        if config.model.small_model:
+            return config.model.small_model
+    except Exception:
+        pass
+    return None
+
+
 @backoff.on_exception(
     backoff.expo,
     LITELLM_RETRYABLE_ERRORS,
     max_tries=3,
     jitter=backoff.full_jitter,
 )
-async def llm_completion(messages: list, model: Optional[str] = None) -> str:
+async def llm_completion(
+    messages: list, model: Optional[str] = None, use_small: bool = False
+) -> str:
     """
     Make an LLM completion call using the configured provider settings.
 
@@ -557,10 +618,18 @@ async def llm_completion(messages: list, model: Optional[str] = None) -> str:
     Args:
         messages: List of message dicts with 'role' and 'content' keys
         model: Optional model override. If None, uses configured model.
+        use_small: If True and a small model is configured (via KODER_SMALL_MODEL
+                   env or config.model.small_model), override the model for this call.
+                   When no small model is configured, this flag is ignored.
 
     Returns:
         The completion response content as string
     """
+    # If use_small requested and no explicit model override, try small model
+    if use_small and model is None:
+        small = get_small_model_name()
+        if small:
+            model = small
 
     config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
         model

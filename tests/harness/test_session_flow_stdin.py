@@ -102,7 +102,7 @@ class _FakeEnhancedSQLiteSession:
         return None
 
 
-def _patch_session_flow(monkeypatch, stdin_text: str) -> None:
+def _patch_session_flow(monkeypatch, stdin_text: str, *, stdin_is_tty: bool = False) -> None:
     fake_config = SimpleNamespace(cli=SimpleNamespace(stream=False, session=None))
     fake_manager = SimpleNamespace(get_effective_value=lambda _value, _default: None)
 
@@ -110,7 +110,7 @@ def _patch_session_flow(monkeypatch, stdin_text: str) -> None:
     monkeypatch.setattr(session_flow, "get_config_manager", lambda: fake_manager)
     monkeypatch.setattr(session_flow, "load_context", _async_value(""))
     monkeypatch.setattr(session_flow, "HarnessInteractiveCommandHandler", _FakeCommandHandler)
-    monkeypatch.setattr(session_flow.sys, "stdin", _FakeStdin(stdin_text, is_tty=False))
+    monkeypatch.setattr(session_flow.sys, "stdin", _FakeStdin(stdin_text, is_tty=stdin_is_tty))
 
     monkeypatch.setattr("koder_agent.utils.setup_openai_client", lambda: None)
     monkeypatch.setattr("koder_agent.utils.default_session_local_ms", lambda: "test-session")
@@ -153,3 +153,32 @@ def test_run_harness_session_flow_combines_prompt_with_piped_stdin(monkeypatch):
             True,
         )
     ]
+
+
+def test_run_harness_session_flow_dispatches_session_end_when_cron_stop_fails(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+    events = []
+
+    class _FailingCronPromptRunner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            raise RuntimeError("cron stop failed")
+
+    def _fake_dispatch_command_hooks(*, event_name, **_kwargs):
+        events.append(event_name)
+        return SimpleNamespace(blocked=False, block_reason=None, watch_paths=[])
+
+    from koder_agent.harness.cron import runtime as cron_runtime
+
+    monkeypatch.setattr(cron_runtime, "CronPromptRunner", _FailingCronPromptRunner)
+    monkeypatch.setattr(session_flow, "dispatch_command_hooks", _fake_dispatch_command_hooks)
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=[]))
+
+    assert exit_code == 0
+    assert "SessionEnd" in events

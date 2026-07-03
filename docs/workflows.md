@@ -34,11 +34,11 @@ Use planning commands when you want structure before implementation:
 /brief
 /torch
 /ultraplan
-/stuck
-/simplify
 ```
 
 `/advisor` reviews session and git context with an advisor model route. `/brief` toggles concise responses. `/torch` explores a codebase topic with a structured plan. `/ultraplan` creates a deeper implementation plan without mutating the workspace.
+
+Use `/goal` for long-running implementation objectives that should keep status, token budget, and continuation state across turns.
 
 ## Git Readiness
 

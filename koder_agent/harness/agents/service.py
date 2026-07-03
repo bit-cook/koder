@@ -578,6 +578,7 @@ class AgentService:
                     data["model_config"] = None
                 record = AgentRecord(**data)
             except Exception:
+                logger.debug("Failed to parse agent record from file", exc_info=True)
                 continue
             if not record.summary:
                 record = self._with_summary(

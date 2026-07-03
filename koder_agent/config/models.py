@@ -24,6 +24,12 @@ class ModelConfig(BaseModel):
     api_key: Optional[str] = Field(default=None, description="API key for the provider")
     base_url: Optional[str] = Field(default=None, description="Custom base URL")
 
+    # Small model for auxiliary calls (title generation, compaction, etc.)
+    small_model: Optional[str] = Field(
+        default=None,
+        description="Small/cheap model for auxiliary LLM calls (title gen, compaction). Env: KODER_SMALL_MODEL",
+    )
+
     # Azure-specific settings
     azure_api_version: Optional[str] = Field(
         default=None, description="Azure API version (e.g., 2025-04-01-preview)"

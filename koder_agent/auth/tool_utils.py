@@ -1183,8 +1183,6 @@ def _convert_anyof_to_nullable(anyof_items: List[Any]) -> Optional[Dict[str, Any
 def to_gemini_schema(schema: Any) -> Any:
     """Transform a JSON Schema to Gemini-compatible format.
 
-    Based on @google/genai SDK's processJsonSchema() function.
-
     Key transformations:
     - Converts type values to uppercase (object -> OBJECT, string -> STRING)
     - Removes unsupported fields ($schema, additionalProperties, etc.)

@@ -193,6 +193,113 @@ class TestSkillContextFunctions:
         assert restrictions.is_tool_allowed("run_shell") is False
 
 
+class TestGetSkillDoesNotSelfClearRestrictions:
+    """Tests for the corrected, safer get_skill restriction semantics (S2).
+
+    Previously, calling get_skill on a skill with no `allowed_tools` invoked
+    clear_restrictions(), wiping the restrictions of a previously-loaded
+    restricted skill. That let the model escape its own sandbox by loading any
+    benign, unrestricted skill. The corrected semantics: loading an
+    unrestricted skill is a no-op for restrictions (only loading a restricted
+    skill adds its allowed_tools). clear_restrictions() remains an explicit API.
+    """
+
+    # NOTE: We test the restriction-application logic via the module-level
+    # _apply_skill_restrictions helper that get_skill calls. The get_skill
+    # FunctionTool wrapper runs in an isolated copied context (an SDK
+    # implementation detail), so contextvar mutations made inside on_invoke_tool
+    # are not observable from the caller's context -- testing through the wrapper
+    # would only exercise the SDK, not the S2 logic. The helper is the exact
+    # code path get_skill executes, so this faithfully covers the fix.
+
+    def test_loading_unrestricted_skill_does_not_clear_restrictions(self):
+        """An unrestricted skill loaded after a restricted one must NOT clear it."""
+        from koder_agent.tools.skill import _apply_skill_restrictions
+
+        restricted = Skill(
+            name="restricted-skill",
+            description="Restricted",
+            content="Content",
+            allowed_tools=["read_file"],
+        )
+        unrestricted = Skill(
+            name="unrestricted-skill",
+            description="No restrictions",
+            content="Content",
+            allowed_tools=None,
+        )
+
+        # Load the restricted skill -> restrictions become active.
+        _apply_skill_restrictions(restricted)
+        assert has_active_restrictions() is True
+        assert get_active_restrictions().allowed_tools == {"read_file"}
+
+        # Load an unrestricted skill -> restrictions must be PRESERVED (no-op).
+        _apply_skill_restrictions(unrestricted)
+        assert has_active_restrictions() is True
+        restrictions = get_active_restrictions()
+        assert restrictions is not None
+        assert restrictions.allowed_tools == {"read_file"}
+        assert "restricted-skill" in restrictions.loaded_skills
+
+    def test_loading_unrestricted_skill_with_no_active_restrictions_stays_unrestricted(self):
+        """Loading an unrestricted skill when nothing is active leaves no restrictions."""
+        from koder_agent.tools.skill import _apply_skill_restrictions
+
+        unrestricted = Skill(
+            name="unrestricted-skill",
+            description="No restrictions",
+            content="Content",
+            allowed_tools=None,
+        )
+
+        _apply_skill_restrictions(unrestricted)
+        assert get_active_restrictions() is None
+        assert has_active_restrictions() is False
+
+    def test_loading_second_restricted_skill_unions(self):
+        """Loading two restricted skills unions their tools (accumulate, not clear)."""
+        from koder_agent.tools.skill import _apply_skill_restrictions
+
+        skill1 = Skill(
+            name="skill1",
+            description="First",
+            content="Content",
+            allowed_tools=["read_file"],
+        )
+        skill2 = Skill(
+            name="skill2",
+            description="Second",
+            content="Content",
+            allowed_tools=["write_file"],
+        )
+
+        _apply_skill_restrictions(skill1)
+        _apply_skill_restrictions(skill2)
+
+        restrictions = get_active_restrictions()
+        assert restrictions is not None
+        assert restrictions.allowed_tools == {"read_file", "write_file"}
+        assert restrictions.loaded_skills == ["skill1", "skill2"]
+
+    def test_unrestricted_skill_between_two_restricted_preserves_union(self):
+        """An unrestricted skill loaded between restricted ones must not wipe state."""
+        from koder_agent.tools.skill import _apply_skill_restrictions
+
+        skill1 = Skill(name="skill1", description="d", content="c", allowed_tools=["read_file"])
+        benign = Skill(name="benign", description="d", content="c", allowed_tools=None)
+        skill2 = Skill(name="skill2", description="d", content="c", allowed_tools=["write_file"])
+
+        _apply_skill_restrictions(skill1)
+        _apply_skill_restrictions(benign)  # must be a no-op, not a clear
+        _apply_skill_restrictions(skill2)
+
+        restrictions = get_active_restrictions()
+        assert restrictions is not None
+        assert restrictions.allowed_tools == {"read_file", "write_file"}
+        assert restrictions.loaded_skills == ["skill1", "skill2"]
+
+
 class TestSkillGuardrail:
     """Tests for the skill tool restriction guardrail."""
 

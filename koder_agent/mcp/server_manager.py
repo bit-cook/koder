@@ -6,13 +6,22 @@ import asyncio
 import json
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Generator, List, Optional
 
 import aiosqlite
 
 from ..config import MCPLocalProjectConfigYaml, MCPServerConfigYaml, get_config_manager
 from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
+
+# File-based locking: use fcntl on Unix, fall back to no-op on Windows/other platforms.
+try:
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover
+    _HAS_FCNTL = False
 
 _PROJECT_MCP_FILENAME = ".mcp.json"
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
@@ -25,6 +34,28 @@ class MCPServerManager:
         self.config_manager = get_config_manager()
         self._migration_lock = asyncio.Lock()
         self._migration_completed = False
+
+    @contextmanager
+    def _config_lock(self) -> Generator[None, None, None]:
+        """Acquire an exclusive file lock around config write operations.
+
+        Uses fcntl.flock on Unix to prevent concurrent koder instances from
+        clobbering each other's config writes. Falls back to a no-op on
+        platforms where fcntl is unavailable (e.g. Windows).
+        """
+        if not _HAS_FCNTL:
+            yield
+            return
+
+        lock_path = Path(str(self.config_manager.config_path) + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = lock_path.open("w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     @staticmethod
     def _legacy_db_path() -> Path:
@@ -340,29 +371,32 @@ class MCPServerManager:
         await self._ensure_legacy_migration()
         normalized_scope = self._normalize_scope(scope)
         if normalized_scope == MCPServerScope.USER:
-            koder_config = self.config_manager.load()
-            if any(server.name == config.name for server in koder_config.mcp_servers):
-                raise ValueError(f"MCP server already exists in user scope: {config.name}")
-            koder_config.mcp_servers.append(self._mcp_config_to_yaml(config))
-            self.config_manager.save(koder_config)
+            with self._config_lock():
+                koder_config = self.config_manager.load()
+                if any(server.name == config.name for server in koder_config.mcp_servers):
+                    raise ValueError(f"MCP server already exists in user scope: {config.name}")
+                koder_config.mcp_servers.append(self._mcp_config_to_yaml(config))
+                self.config_manager.save(koder_config)
             return
 
         if normalized_scope == MCPServerScope.LOCAL:
-            koder_config = self.config_manager.load()
-            entry = self._local_scope_entry(cwd, create=True)
-            assert entry is not None
-            if any(server.name == config.name for server in entry.servers):
-                raise ValueError(f"MCP server already exists in local scope: {config.name}")
-            entry.servers.append(self._mcp_config_to_yaml(config))
-            self.config_manager.save(koder_config)
+            with self._config_lock():
+                koder_config = self.config_manager.load()
+                entry = self._local_scope_entry(cwd, create=True)
+                assert entry is not None
+                if any(server.name == config.name for server in entry.servers):
+                    raise ValueError(f"MCP server already exists in local scope: {config.name}")
+                entry.servers.append(self._mcp_config_to_yaml(config))
+                self.config_manager.save(koder_config)
             return
 
         project_path = self._project_config_path(cwd)
-        raw = self._read_project_config(project_path)
-        if config.name in raw["mcpServers"]:
-            raise ValueError(f"MCP server already exists in project scope: {config.name}")
-        raw["mcpServers"][config.name] = self._serialize_project_server(config)
-        self._write_project_config(project_path, raw["mcpServers"])
+        with self._config_lock():
+            raw = self._read_project_config(project_path)
+            if config.name in raw["mcpServers"]:
+                raise ValueError(f"MCP server already exists in project scope: {config.name}")
+            raw["mcpServers"][config.name] = self._serialize_project_server(config)
+            self._write_project_config(project_path, raw["mcpServers"])
 
     async def import_json_server(
         self,
@@ -427,6 +461,11 @@ class MCPServerManager:
         scope: MCPServerScope | str | None = None,
         cwd: str | Path | None = None,
     ) -> bool:
+        # Note: update_server delegates to remove_server + add_server which each
+        # acquire their own _config_lock. This is safe because fcntl locks are
+        # re-entrant within the same process (same fd not reused, each call opens
+        # a fresh fd). For cross-process safety the remove+add is NOT atomic, but
+        # this matches the pre-existing semantics.
         target_scope = scope or config.scope
         if target_scope is None:
             existing = await self.get_server(config.name, cwd=cwd)
@@ -455,33 +494,36 @@ class MCPServerManager:
         normalized_scope = self._normalize_scope(target_scope)
 
         if normalized_scope == MCPServerScope.USER:
-            koder_config = self.config_manager.load()
-            initial_count = len(koder_config.mcp_servers)
-            koder_config.mcp_servers = [s for s in koder_config.mcp_servers if s.name != name]
-            if len(koder_config.mcp_servers) < initial_count:
-                self.config_manager.save(koder_config)
-                return True
-            return False
+            with self._config_lock():
+                koder_config = self.config_manager.load()
+                initial_count = len(koder_config.mcp_servers)
+                koder_config.mcp_servers = [s for s in koder_config.mcp_servers if s.name != name]
+                if len(koder_config.mcp_servers) < initial_count:
+                    self.config_manager.save(koder_config)
+                    return True
+                return False
 
         if normalized_scope == MCPServerScope.LOCAL:
-            koder_config = self.config_manager.load()
-            entry = self._local_scope_entry(cwd, create=False)
-            if entry is None:
-                return False
-            initial_count = len(entry.servers)
-            entry.servers = [server for server in entry.servers if server.name != name]
-            if len(entry.servers) == initial_count:
-                return False
-            self.config_manager.save(koder_config)
-            return True
+            with self._config_lock():
+                koder_config = self.config_manager.load()
+                entry = self._local_scope_entry(cwd, create=False)
+                if entry is None:
+                    return False
+                initial_count = len(entry.servers)
+                entry.servers = [server for server in entry.servers if server.name != name]
+                if len(entry.servers) == initial_count:
+                    return False
+                self.config_manager.save(koder_config)
+                return True
 
         project_path = self._project_config_path(cwd)
-        raw = self._read_project_config(project_path)
-        if name not in raw["mcpServers"]:
-            return False
-        del raw["mcpServers"][name]
-        self._write_project_config(project_path, raw["mcpServers"])
-        return True
+        with self._config_lock():
+            raw = self._read_project_config(project_path)
+            if name not in raw["mcpServers"]:
+                return False
+            del raw["mcpServers"][name]
+            self._write_project_config(project_path, raw["mcpServers"])
+            return True
 
     async def server_exists(
         self,

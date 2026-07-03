@@ -120,8 +120,14 @@ _EVAL_VAR_RE = re.compile(r"\beval\s+.*\$")
 # Device file redirect (not to safe device)
 _DEV_REDIRECT_RE = re.compile(r"(?:\d*)>>?\s*/dev/\S+")
 
-# Dangerous system commands
-_SYSTEM_CMDS_RE = re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b|" r"\binit\s+[06]\b")
+# Dangerous system commands.
+# Only match when the dangerous word is in *command position*: at the start of
+# the string, after a command separator (; | & newline), or after sudo/doas.
+# This avoids false positives like `echo "reboot done"` where the word appears
+# as a quoted argument. A leading optional `sudo`/`doas` (with optional flags)
+# is consumed so `sudo reboot` still matches.
+_CMD_START = r"(?:^|[;|&\n])\s*(?:(?:sudo|doas)(?:\s+-\w+)*\s+)?"
+_SYSTEM_CMDS_RE = re.compile(_CMD_START + r"(?:(?:shutdown|reboot|halt|poweroff)\b|init\s+[06]\b)")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +158,10 @@ def _is_sensitive_path(path: str) -> bool:
 
     # Check home-relative sensitive paths
     if normalized.startswith("~") or normalized.startswith("$HOME"):
-        suffix = normalized.lstrip("~").lstrip("$HOME").lstrip("/")
+        # Strip the home prefix using proper prefix removal (NOT lstrip, which
+        # strips any leading chars in the set, mangling paths like ~/Music).
+        suffix = normalized.removeprefix("$HOME").removeprefix("~")
+        suffix = suffix.removeprefix("/")
         for pattern in _HOME_SENSITIVE_PATTERNS:
             if suffix == pattern or suffix.startswith(pattern):
                 return True

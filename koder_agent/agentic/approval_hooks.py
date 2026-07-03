@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,20 @@ if TYPE_CHECKING:
     from koder_agent.harness.permissions.service import PermissionService
 
 logger = logging.getLogger(__name__)
+
+
+class ToolPermissionError(PermissionError):
+    """Raised by :meth:`ApprovalHooks.on_tool_start` when a tool is denied.
+
+    A dedicated subclass lets callers (e.g. the scheduler) classify and present
+    permission denials distinctly from arbitrary ``PermissionError``s raised by
+    tool bodies, without corrupting any run state.
+    """
+
+    def __init__(self, tool_name: str, reason: str | None):
+        self.tool_name = tool_name
+        self.reason = reason
+        super().__init__(f"Permission denied for {tool_name}: {reason}")
 
 
 class ApprovalHooks(RunHooks):
@@ -34,9 +49,16 @@ class ApprovalHooks(RunHooks):
         """
         self.wrapped_hooks = wrapped_hooks
         self._permission_service = permission_service
+        # Tracks whether the previous agent completion was blocked by a Stop
+        # hook. Initialized here (and reset in on_agent_start) so a one-time
+        # block cannot permanently wedge the scheduler for its entire lifetime.
+        self._stop_hook_active = False
 
     async def on_agent_start(self, context: RunContextWrapper, agent: Agent) -> None:
         """Called before the agent is invoked."""
+        # Reset the Stop-hook flag at the start of every agent run so a block
+        # from a prior run does not persist across independent runs.
+        self._stop_hook_active = False
         if self.wrapped_hooks:
             await self.wrapped_hooks.on_agent_start(context, agent)
 
@@ -52,10 +74,14 @@ class ApprovalHooks(RunHooks):
                 "event": "Stop",
                 "agent_type": getattr(agent, "name", None),
                 "last_assistant_message": str(output),
-                "stop_hook_active": getattr(self, "_stop_hook_active", False),
+                "stop_hook_active": self._stop_hook_active,
             },
         )
         if result.blocked:
+            # A Stop hook is *meant* to block completion, so we keep raising to
+            # halt the turn. We record the block so a re-entrant Stop hook can
+            # see stop_hook_active=True; on_agent_start resets it for the next
+            # independent run so this cannot permanently wedge the scheduler.
             self._stop_hook_active = True
             raise RuntimeError(result.block_reason or "Blocked by Stop hook")
 
@@ -69,8 +95,21 @@ class ApprovalHooks(RunHooks):
     async def on_tool_start(self, context: RunContextWrapper, agent: Agent, tool: Tool) -> None:
         """Check permissions, then forward to wrapped hooks for tool display.
 
+        The openai-agents ``RunHooks.on_tool_start`` contract returns ``None``
+        and provides no mechanism to substitute a tool result from inside the
+        hook: the runner awaits ``on_tool_start`` (via ``asyncio.gather``)
+        *before* invoking the tool, and only the tool body — not the hook — is
+        wrapped in the try/except that converts failures into a tool message.
+        The only SDK-supported way to turn a denial into a tool result is the
+        approval flow (``needs_approval`` / ``ToolApprovalItem``), which is
+        driven by the tool/run-config and runs *before* hooks, not by a
+        ``RunHooks`` object. Therefore raising is the only supported way to
+        stop a denied tool from here; we raise a dedicated, classified
+        exception and hold no mutable state on this path, so a denial cannot
+        corrupt scheduler state.
+
         Raises:
-            PermissionError: When the permission service denies the tool call.
+            ToolPermissionError: When the permission service denies the tool.
         """
         if self._permission_service is not None:
             # on_tool_start receives the Tool but NOT its arguments,
@@ -83,7 +122,7 @@ class ApprovalHooks(RunHooks):
             )
             if not result.allowed and not result.requires_approval:
                 logger.warning("Permission denied for tool %s: %s", tool.name, result.reason)
-                raise PermissionError(f"Permission denied for {tool.name}: {result.reason}")
+                raise ToolPermissionError(tool.name, result.reason)
             if result.requires_approval:
                 # In non-interactive contexts approval cannot be obtained;
                 # log and allow so the existing interactive approval flow
@@ -99,6 +138,22 @@ class ApprovalHooks(RunHooks):
         """Called after a tool is invoked."""
         if self.wrapped_hooks:
             await self.wrapped_hooks.on_tool_end(context, agent, tool, result)
+
+        # The SDK's ToolContext (a RunContextWrapper subclass) carries
+        # tool_arguments as a raw JSON string.  We parse it to pass structured
+        # input to PostToolUse hooks so they can write rules based on what the
+        # tool was actually called with.  If the context is not a ToolContext or
+        # parsing fails, we fall back to an empty dict gracefully.
+        tool_input: dict[str, Any] = {}
+        raw_args = getattr(context, "tool_arguments", None)
+        if raw_args:
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict):
+                    tool_input = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         dispatch_command_hooks(
             cwd=Path.cwd(),
             event_name="PostToolUse",
@@ -106,7 +161,7 @@ class ApprovalHooks(RunHooks):
             payload={
                 "event": "PostToolUse",
                 "tool_name": tool.name,
-                "tool_input": {},
+                "tool_input": tool_input,
                 "result": str(result),
             },
         )

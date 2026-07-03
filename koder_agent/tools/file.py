@@ -1,5 +1,6 @@
 """File operation tools."""
 
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -11,6 +12,7 @@ from ..core.security import SecurityGuard
 from .compat import function_tool
 from .file_state import ReadFileState
 
+logger = logging.getLogger(__name__)
 _file_state = ReadFileState()
 
 # ---------------------------------------------------------------------------
@@ -217,7 +219,7 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
 
                 register_magic_doc(p, "".join(lines))
             except Exception:
-                pass
+                logger.debug("Failed to register magic doc", exc_info=True)
 
         # Apply token truncation if needed
         content = truncate_text_by_tokens(content)

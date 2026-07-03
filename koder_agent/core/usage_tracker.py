@@ -1,6 +1,7 @@
 """Token usage and cost tracking for API calls."""
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -10,6 +11,8 @@ import litellm
 
 from ..utils.client import get_model_name
 from ..utils.model_info import get_model_name_variants_for_lookup
+
+logger = logging.getLogger(__name__)
 
 
 def usage_snapshot_path(session_id: str, *, home: Path | None = None) -> Path:
@@ -83,6 +86,7 @@ class UsageTracker:
                     self._cached_costs = (input_cost, output_cost)
                     return self._cached_costs
             except Exception:
+                logger.debug("Failed to lookup model cost info", exc_info=True)
                 continue
 
         self._cached_costs = (0.0, 0.0)

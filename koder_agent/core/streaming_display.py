@@ -9,6 +9,8 @@ from rich.console import Console, Group
 from rich.syntax import Syntax
 from rich.text import Text
 
+from .queued_input import strip_queued_input_from_tool_output
+
 TODO_TOOL_NAMES = {"todo_read", "todo_write"}
 
 
@@ -262,6 +264,7 @@ class StreamingDisplayManager:
                 "output"
             ):
                 output = str(tool_output_item.raw_item["output"])
+        output = strip_queued_input_from_tool_output(output)
 
         # Try multiple ways to extract call_id
         if hasattr(tool_output_item, "tool_call_id"):
@@ -609,7 +612,7 @@ class StreamingDisplayManager:
         output: str,
         tracker: Optional[ToolCallTracker],
     ) -> List[Text]:
-        """Render todo tools like a compact Codex-style plan update."""
+        """Render todo tools like a compact plan update."""
         clean_output = output.strip()
         if not clean_output:
             return []

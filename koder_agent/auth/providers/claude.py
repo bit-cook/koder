@@ -9,6 +9,7 @@ the 'anthropic' API key provider.
 """
 
 import json
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
@@ -32,6 +33,8 @@ from koder_agent.auth.constants import (
     ANTHROPIC_TOKEN_URL,
 )
 from koder_agent.auth.tool_utils import merge_optional_params
+
+logger = logging.getLogger(__name__)
 
 
 class ClaudeOAuthProvider(OAuthProvider):
@@ -215,7 +218,7 @@ class ClaudeOAuthProvider(OAuthProvider):
                         data = await response.json()
                         return data.get("raw_key")
         except Exception:
-            pass
+            logger.debug("Failed to fetch raw API key from Claude", exc_info=True)
         return None
 
     def get_auth_headers(self, access_token: str) -> Dict[str, str]:

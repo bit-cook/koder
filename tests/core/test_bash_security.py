@@ -1,6 +1,7 @@
 """Tests for bash command security analysis."""
 
 from koder_agent.core.bash_security import (
+    _is_sensitive_path,
     analyze_command,
 )
 
@@ -131,4 +132,79 @@ class TestAnalysisResult:
 
     def test_multiline_command(self):
         result = analyze_command("echo hello && echo world")
+        assert not result.blocked
+
+
+class TestHomePathPrefixStripping:
+    """Regression tests for the lstrip->removeprefix fix in _is_sensitive_path.
+
+    str.lstrip(chars) strips any leading char in the set, which mangled paths
+    like ~/Music (strips a leading 'M' via "$HOME") and could mis-detect
+    benign paths. Proper prefix removal must be used instead.
+    """
+
+    def test_tilde_ssh_authorized_keys_is_sensitive(self):
+        assert _is_sensitive_path("~/.ssh/authorized_keys")
+
+    def test_home_ssh_config_is_sensitive(self):
+        assert _is_sensitive_path("$HOME/.ssh/config")
+
+    def test_tilde_bashrc_is_sensitive(self):
+        assert _is_sensitive_path("~/.bashrc")
+
+    def test_tilde_music_is_not_sensitive(self):
+        # 'M' is in the "$HOME" char set -- lstrip would have mangled this.
+        assert not _is_sensitive_path("~/Music/track.mp3")
+
+    def test_tilde_eggs_is_not_sensitive(self):
+        # 'E' is in the "$HOME" char set -- lstrip would have mangled this.
+        assert not _is_sensitive_path("~/Eggs")
+
+    def test_home_prefix_word_not_mistaken(self):
+        assert not _is_sensitive_path("$HOMEYstuff")
+
+    def test_blocks_redirect_to_home_music_allowed(self):
+        result = analyze_command("echo data > ~/Music/track.mp3")
+        assert not result.blocked
+
+    def test_blocks_redirect_to_home_ssh_config(self):
+        result = analyze_command("echo 'Host *' >> $HOME/.ssh/config")
+        assert result.blocked
+        assert result.has_sensitive_path_write
+
+
+class TestSystemCommandCommandPosition:
+    """The dangerous-system-command regex must only match at command position,
+    not when the word appears as a quoted argument/string."""
+
+    def test_blocks_bare_reboot(self):
+        result = analyze_command("reboot")
+        assert result.blocked
+
+    def test_blocks_sudo_reboot(self):
+        result = analyze_command("sudo reboot")
+        assert result.blocked
+
+    def test_blocks_shutdown_after_separator(self):
+        result = analyze_command("foo; shutdown -h now")
+        assert result.blocked
+
+    def test_blocks_halt_after_semicolon(self):
+        result = analyze_command("do_thing; halt")
+        assert result.blocked
+
+    def test_blocks_init_runlevel(self):
+        result = analyze_command("init 0")
+        assert result.blocked
+
+    def test_allows_reboot_in_echo_string(self):
+        result = analyze_command('echo "reboot done"')
+        assert not result.blocked
+
+    def test_allows_reboot_in_commit_message(self):
+        result = analyze_command('git commit -m "reboot fix"')
+        assert not result.blocked
+
+    def test_allows_init_word_in_string(self):
+        result = analyze_command('echo "init 0 complete"')
         assert not result.blocked

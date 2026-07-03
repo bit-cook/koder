@@ -1,14 +1,17 @@
 """Interactive prompt with slash command completion using prompt_toolkit."""
 
 import asyncio
+import io
 import time
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from prompt_toolkit import search as prompt_search
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, control_is_searchable, is_searching
 from prompt_toolkit.history import InMemoryHistory
@@ -21,6 +24,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import AppendAutoSuggestion, BeforeInput
 from prompt_toolkit.shortcuts import confirm
 from prompt_toolkit.widgets import Frame, SearchToolbar
+from rich.console import Console
 
 from ..config import get_config
 from ..harness.buddy import MIN_COLS_FOR_FULL_SPRITE, build_prompt_toolkit_text, get_companion
@@ -30,11 +34,12 @@ from ..harness.voice.service import VoiceDictationController, should_start_voice
 from ..utils.client import get_model_name
 from ..utils.terminal_theme import get_adaptive_console, get_adaptive_prompt_style
 from .keybindings import KeybindingManager
-from .terminal_reflow import attach_prompt_resize_reflow
+from .terminal_reflow import attach_prompt_resize_reflow, print_reflowable
 from .vim_mode import VimModeManager
 
 if TYPE_CHECKING:
     from .file_index import ProjectFileIndex
+    from .queued_input import QueuedInputManager
     from .usage_tracker import UsageTracker
 
 console = get_adaptive_console()
@@ -91,6 +96,33 @@ def _get_completion_menu_max_rows(
         input_rows + (STATUS_LINE_HEIGHT if has_status_line else 0) + bottom_padding_rows
     )
     return min(MAX_COMPLETION_MENU_VISIBLE_ROWS, max(0, rows - reserved_rows))
+
+
+def _get_idle_prompt_spacer_height() -> Dimension:
+    """Return flexible live space above an idle prompt without fixed scrollback rows."""
+    return Dimension(weight=1)
+
+
+def _get_prompt_scroll_padding_rows(
+    *,
+    rows_below_cursor: int,
+    input_rows: int,
+    has_status_line: bool,
+    bottom_padding_rows: int,
+) -> int:
+    """Return only the extra rows needed to make room for prompt chrome."""
+    prompt_rows = input_rows + (STATUS_LINE_HEIGHT if has_status_line else 0) + bottom_padding_rows
+    return max(0, prompt_rows - max(0, rows_below_cursor))
+
+
+def _should_show_prompt_tip(
+    tip_text: str | None,
+    *,
+    queue_mode: bool,
+    has_pending_queue: bool,
+) -> bool:
+    """Return True when a pending tip belongs with the idle bottom prompt."""
+    return bool(tip_text) and not queue_mode and not has_pending_queue
 
 
 def _get_completion_menu_height(
@@ -187,6 +219,82 @@ class DynamicCompletionsMenu(CompletionsMenu):
         except Exception:
             # Fallback to no height if there's any error
             return Dimension.exact(0)
+
+
+class StreamingOutputController:
+    """Prompt-toolkit owned output pane for interactive streaming turns."""
+
+    def __init__(self) -> None:
+        self._text = "thinking..."
+        self._app: Application | None = None
+        self._final_content: Any = None
+        self._final_text: str | None = None
+
+    def attach_app(self, app: Application) -> None:
+        self._app = app
+        app.invalidate()
+
+    def set_message(self, text: str) -> None:
+        self._text = text
+        self._invalidate()
+
+    def update_output(self, renderable: Any) -> None:
+        self._text = self._render_to_text(renderable)
+        self._invalidate()
+
+    def set_final_content(self, renderable: Any) -> None:
+        self._final_content = renderable
+
+    def set_final_text(self, text: str) -> None:
+        self._final_text = text
+
+    def visible_fragments(self):
+        text = self._text
+        if text and not text.endswith("\n"):
+            text = f"{text}\n"
+        return [("class:stream-output", text)]
+
+    def line_count(self) -> int:
+        if not self._text:
+            return 1
+        return max(1, len(self._text.splitlines()))
+
+    def cursor_position(self) -> Point:
+        return Point(x=0, y=self.line_count() - 1)
+
+    def render_final(self) -> None:
+        if self._final_content is not None:
+            print()
+            print_reflowable(console, self._final_content)
+            print()
+        elif self._final_text:
+            print()
+            print_reflowable(console, self._final_text)
+            print()
+
+    def _invalidate(self) -> None:
+        if self._app is not None:
+            self._app.invalidate()
+
+    def _render_to_text(self, renderable: Any) -> str:
+        stream = io.StringIO()
+        render_console = Console(
+            file=stream,
+            force_terminal=False,
+            color_system=None,
+            width=self._terminal_width(),
+            soft_wrap=False,
+        )
+        render_console.print(renderable)
+        return stream.getvalue().rstrip()
+
+    def _terminal_width(self) -> int:
+        if self._app is not None:
+            try:
+                return max(20, self._app.output.get_size().columns)
+            except Exception:
+                pass
+        return 80
 
 
 class SlashCommandCompleter(Completer):
@@ -288,7 +396,6 @@ class InteractivePrompt:
         )
         self._last_space_pressed_at: Optional[float] = None
         self.history = InMemoryHistory()
-
         # Status line (optional)
         self.status_line = None
         if usage_tracker is not None:
@@ -309,6 +416,7 @@ class InteractivePrompt:
 
         # Tip manager
         self.tip_manager = TipManager()
+        self._pending_tip_text: str | None = None
 
         # Response completion tracking for tips/notifications
         self._last_response_start_time: Optional[float] = None
@@ -354,8 +462,7 @@ class InteractivePrompt:
             context: Optional context dict for relevance checking (e.g., vim_mode, model).
         """
         tip = self.tip_manager.get_tip(context or {})
-        if tip:
-            console.print(f"\n[dim italic]{tip}[/dim italic]")
+        self._pending_tip_text = tip
 
     def mark_response_start(self) -> None:
         """Mark the start of an agent response for timing notifications."""
@@ -371,6 +478,8 @@ class InteractivePrompt:
         # Show tip after response
         if show_tip:
             self.show_tip(context)
+        else:
+            self._pending_tip_text = None
 
         # Send notification for long operations
         if self._last_response_start_time is not None:
@@ -412,9 +521,45 @@ class InteractivePrompt:
 
     async def get_input(self) -> str:
         """Get user input with Rich panel display and prompt_toolkit completion."""
+        result = await self._run_input_app()
+        if result is None:
+            raise EOFError("Empty input received")
+        return result.strip()
+
+    @asynccontextmanager
+    async def capture_queued_input(self, queue_manager: "QueuedInputManager"):
+        """Keep a bottom input box alive while a response is streaming."""
+        stop_event = asyncio.Event()
+        stream_output = StreamingOutputController()
+        task = asyncio.create_task(
+            self._run_input_app(
+                queue_manager=queue_manager,
+                stop_event=stop_event,
+                stream_output=stream_output,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            yield stream_output
+        finally:
+            stop_event.set()
+            with suppress(asyncio.CancelledError, EOFError, KeyboardInterrupt):
+                await task
+            stream_output.render_final()
+
+    async def _run_input_app(
+        self,
+        *,
+        queue_manager: "QueuedInputManager | None" = None,
+        stop_event: asyncio.Event | None = None,
+        stream_output: StreamingOutputController | None = None,
+    ) -> str | None:
+        """Run the prompt application once, or continuously for queued input."""
         voice_message_visible = False
-        initial_text = self._next_input_text
-        self._next_input_text = ""
+        queue_mode = queue_manager is not None
+        initial_text = "" if queue_mode else self._next_input_text
+        if not queue_mode:
+            self._next_input_text = ""
 
         # Create buffer
         buffer = Buffer(
@@ -431,9 +576,22 @@ class InteractivePrompt:
 
         def submit_buffer(app: Application) -> None:
             """Record and submit the current prompt buffer."""
-            self.auto_suggest.record_input(buffer.text)
-            self.history.append_string(buffer.text)
-            app.exit(result=buffer.text)
+            nonlocal voice_message_visible
+            text = buffer.text
+            if queue_manager is not None:
+                if text.strip():
+                    self.auto_suggest.record_input(text)
+                    self.history.append_string(text)
+                    queue_manager.enqueue(text)
+                self._pending_tip_text = None
+                buffer.set_document(Document(""), bypass_readonly=True)
+                voice_message_visible = False
+                app.invalidate()
+                return
+            self.auto_suggest.record_input(text)
+            self.history.append_string(text)
+            self._pending_tip_text = None
+            app.exit(result=text)
 
         def submit_search_match(app: Application) -> None:
             """Accept and submit the active history-search match."""
@@ -532,6 +690,53 @@ class InteractivePrompt:
             height=Dimension.exact(COMPACT_BUDDY_HEIGHT),
             dont_extend_height=True,
         )
+
+        def _queued_lines_text():
+            if queue_manager is None:
+                return []
+            lines = queue_manager.visible_lines()
+            fragments = []
+            for index, line in enumerate(lines):
+                suffix = "\n" if index < len(lines) - 1 else ""
+                fragments.append(("class:queued-input", f"{line}{suffix}"))
+            return fragments
+
+        queued_lines_window = Window(
+            content=FormattedTextControl(_queued_lines_text),
+            dont_extend_height=True,
+        )
+
+        def _tip_line_text():
+            if not self._pending_tip_text:
+                return []
+            return [("class:tip-line", self._pending_tip_text)]
+
+        tip_line_window = Window(
+            content=FormattedTextControl(_tip_line_text),
+            height=Dimension.exact(1),
+            wrap_lines=False,
+            dont_extend_height=True,
+        )
+
+        def _stream_output_scroll(window: Window) -> int:
+            visible_height = 1
+            if window.render_info is not None:
+                visible_height = max(1, window.render_info.window_height)
+            return max(0, stream_output.line_count() - visible_height) if stream_output else 0
+
+        stream_output_window = None
+        if stream_output is not None:
+            stream_output_window = Window(
+                content=FormattedTextControl(
+                    stream_output.visible_fragments,
+                    show_cursor=False,
+                    get_cursor_position=stream_output.cursor_position,
+                ),
+                height=Dimension(weight=1, min=1),
+                wrap_lines=False,
+                get_vertical_scroll=_stream_output_scroll,
+                always_hide_cursor=True,
+            )
 
         @kb.add("right", eager=True)
         @kb.add("escape", "[", "C", eager=True)
@@ -771,34 +976,67 @@ class InteractivePrompt:
         )
 
         # Create layout with completion menu and optional status line
-        components = [
+        components = []
+        if stream_output_window is not None:
+            components.append(stream_output_window)
+        else:
+            components.append(
+                Window(
+                    height=_get_idle_prompt_spacer_height(),
+                    dont_extend_height=False,
+                )
+            )
+        if queue_manager is not None:
+            components.append(
+                ConditionalContainer(
+                    queued_lines_window,
+                    filter=Condition(lambda: queue_manager.has_pending()),
+                )
+            )
+        components.append(
             ConditionalContainer(
-                VSplit([framed_input, buddy_full_window], padding=1),
-                filter=Condition(_buddy_is_full),
-            ),
-            ConditionalContainer(
-                framed_input,
-                filter=Condition(lambda: not _buddy_is_full()),
-            ),
-            ConditionalContainer(
-                buddy_compact_window,
-                filter=Condition(_buddy_is_compact),
-            ),
-            search_toolbar,
-            ConditionalContainer(
-                DynamicCompletionsMenu(
-                    scroll_offset=1,
-                    max_visible_rows_getter=lambda: _get_completion_menu_max_rows(
-                        rows=_get_terminal_size()[1],
-                        has_status_line=self.status_line is not None
-                        and _should_show_status_line(rows=_get_terminal_size()[1]),
-                        input_rows=_input_reserved_rows(),
-                        bottom_padding_rows=_bottom_padding_rows(),
-                    ),
+                tip_line_window,
+                filter=Condition(
+                    lambda: _should_show_prompt_tip(
+                        self._pending_tip_text,
+                        queue_mode=queue_manager is not None,
+                        has_pending_queue=(
+                            queue_manager.has_pending() if queue_manager is not None else False
+                        ),
+                    )
                 ),
-                filter=show_completion_menu,
-            ),
-        ]
+            )
+        )
+        components.extend(
+            [
+                ConditionalContainer(
+                    VSplit([framed_input, buddy_full_window], padding=1),
+                    filter=Condition(_buddy_is_full),
+                ),
+                ConditionalContainer(
+                    framed_input,
+                    filter=Condition(lambda: not _buddy_is_full()),
+                ),
+                ConditionalContainer(
+                    buddy_compact_window,
+                    filter=Condition(_buddy_is_compact),
+                ),
+                search_toolbar,
+                ConditionalContainer(
+                    DynamicCompletionsMenu(
+                        scroll_offset=1,
+                        max_visible_rows_getter=lambda: _get_completion_menu_max_rows(
+                            rows=_get_terminal_size()[1],
+                            has_status_line=self.status_line is not None
+                            and _should_show_status_line(rows=_get_terminal_size()[1]),
+                            input_rows=_input_reserved_rows(),
+                            bottom_padding_rows=_bottom_padding_rows(),
+                        ),
+                    ),
+                    filter=show_completion_menu,
+                ),
+            ]
+        )
         if self.status_line:
             components.append(
                 ConditionalContainer(self.status_line.create_window(), filter=show_status_line)
@@ -883,16 +1121,43 @@ class InteractivePrompt:
             key_bindings=kb,
             style=style,
             full_screen=False,
+            erase_when_done=stream_output is not None,
             mouse_support=False,  # Disable mouse support to allow terminal scrolling
             refresh_interval=0.25,
             editing_mode=self.vim_mode_manager.get_editing_mode(),
         )
         attach_prompt_resize_reflow(app)
+        if stream_output is not None:
+            stream_output.attach_app(app)
 
-        result = await app.run_async()
-        if result is None:
-            raise EOFError("Empty input received")
-        return result.strip()
+        remove_queue_callback = None
+        if queue_manager is not None:
+            remove_queue_callback = queue_manager.on_change(app.invalidate)
+
+        async def _run_until_stopped() -> str | None:
+            run_task = asyncio.create_task(app.run_async())
+            if stop_event is None:
+                return await run_task
+
+            stop_task = asyncio.create_task(stop_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {run_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done and not run_task.done():
+                    app.exit(result=None)
+                return await run_task
+            finally:
+                stop_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stop_task
+
+        try:
+            return await _run_until_stopped()
+        finally:
+            if remove_queue_callback is not None:
+                remove_queue_callback()
 
     def confirm_action(self, message: str) -> bool:
         """Ask for confirmation with yes/no prompt."""

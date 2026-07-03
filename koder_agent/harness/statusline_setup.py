@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .statusline_settings import update_user_statusline_config
+
+logger = logging.getLogger(__name__)
 
 _PS1_RE = re.compile(r'(?:^|\n)\s*(?:export\s+)?PS1\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
 
@@ -143,6 +146,7 @@ def auto_configure_statusline_from_shell_prompt() -> AutoConfiguredStatusLine | 
         try:
             content = prompt_file.read_text(encoding="utf-8")
         except Exception:
+            logger.debug("Failed to read prompt file %s", prompt_file, exc_info=True)
             continue
         match = _PS1_RE.search(content)
         if match is None:

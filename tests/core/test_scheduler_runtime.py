@@ -1,5 +1,6 @@
 """Tests for scheduler runtime wiring: tool call counting, auto-compact, session memory."""
 
+import asyncio
 import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -61,6 +62,55 @@ def test_format_execution_error_hides_copilot_raw_details():
     assert "koder auth login github_copilot" in message
     assert "Details:" not in message
     assert "original model" not in message
+
+
+@pytest.mark.asyncio
+async def test_scheduler_serializes_concurrent_handle_calls():
+    from koder_agent.core.scheduler import AgentScheduler
+
+    active = 0
+    max_active = 0
+
+    async def fake_run(*_args, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+
+        class Result:
+            final_output = "ok"
+            context_wrapper = None
+
+        return Result()
+
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run", side_effect=fake_run),
+        patch("koder_agent.core.scheduler.get_companion", return_value=None),
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "old"}])
+        mock_session.db_path = ":memory:"
+        mock_session_cls.return_value = mock_session
+
+        scheduler = AgentScheduler(session_id="test-session")
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+        scheduler._refresh_magic_docs_after_turn = AsyncMock()
+
+        await asyncio.gather(
+            scheduler.handle("first", render_output=False),
+            scheduler.handle("second", render_output=False),
+        )
+
+    assert max_active == 1
 
 
 @pytest.mark.asyncio
@@ -138,6 +188,137 @@ async def test_stream_json_emits_reasoning_deltas_when_enabled(tmp_path, monkeyp
         "type": "text_delta",
         "text": "Visible answer.",
     }
+
+
+@pytest.mark.asyncio
+async def test_stream_json_continues_active_goal_until_complete(tmp_path, monkeypatch):
+    from koder_agent.core.goals import GoalStatus, GoalUpdate
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    calls = []
+    scheduler = None
+
+    class FakeResult:
+        def __init__(self, final_output: str, *, complete_goal: bool = False):
+            self.final_output = final_output
+            self.complete_goal = complete_goal
+
+        async def stream_events(self):
+            if self.complete_goal:
+                await scheduler.goal_store.update_goal(
+                    "stream-goal",
+                    GoalUpdate(status=GoalStatus.COMPLETE),
+                )
+            for event in ():
+                yield event
+
+    def fake_run_streamed(_agent, user_input, **_kwargs):
+        calls.append(user_input)
+        return FakeResult(f"turn {len(calls)}", complete_goal=len(calls) >= 2)
+
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run_streamed", side_effect=fake_run_streamed),
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "stream-goal"
+        mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "old"}])
+        mock_session.db_path = str(tmp_path / "koder.db")
+        mock_session_cls.return_value = mock_session
+
+        from koder_agent.core.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(session_id="stream-goal")
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+        scheduler._refresh_magic_docs_after_turn = AsyncMock()
+
+        goal = await scheduler.goal_store.replace_goal(
+            "stream-goal", "finish the streamed goal", GoalStatus.ACTIVE, token_budget=None
+        )
+
+        events = []
+        response = await scheduler.handle_stream_json("start", on_event=events.append)
+        final = await scheduler.goal_store.get_goal("stream-goal")
+        await scheduler.goal_store.close()
+
+    assert response == "turn 2"
+    assert len(calls) == 2
+    assert calls[0] == "start"
+    assert calls[1].startswith("[Goal continuation]")
+    assert "finish the streamed goal" in calls[1]
+    assert final.status is GoalStatus.COMPLETE
+    assert final.goal_id == goal.goal_id
+
+
+@pytest.mark.asyncio
+async def test_streaming_ui_receives_stream_updates_without_rich_live(monkeypatch):
+    """Interactive streaming should let the fixed-bottom TUI own terminal rendering."""
+    from agents import RawResponsesStreamEvent
+    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+
+    class FakeResult:
+        final_output = "Visible answer."
+
+        async def stream_events(self):
+            yield RawResponsesStreamEvent(
+                data=ResponseTextDeltaEvent(
+                    content_index=0,
+                    delta="Visible answer.",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                    sequence_number=1,
+                    type="response.output_text.delta",
+                )
+            )
+
+    class FakeStreamingUI:
+        def __init__(self):
+            self.updates = []
+            self.final_content = None
+
+        def update_output(self, renderable):
+            self.updates.append(renderable)
+
+        def set_final_content(self, renderable):
+            self.final_content = renderable
+
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run_streamed", return_value=FakeResult()),
+        patch("koder_agent.core.scheduler.Live") as mock_live,
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.get_items = AsyncMock(return_value=[])
+        mock_session.db_path = ":memory:"
+        mock_session_cls.return_value = mock_session
+
+        from koder_agent.core.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(session_id="test-session", streaming=True)
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+
+        streaming_ui = FakeStreamingUI()
+        response = await scheduler._handle_streaming("hello", streaming_ui=streaming_ui)
+
+    assert response == "Visible answer."
+    assert streaming_ui.updates
+    assert streaming_ui.final_content is not None
+    mock_live.assert_not_called()
 
 
 class TestToolCallCounter:

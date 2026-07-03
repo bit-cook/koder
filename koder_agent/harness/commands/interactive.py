@@ -373,6 +373,7 @@ class HarnessInteractiveCommandHandler:
             "plugin": self._execute_plugin,
             "reload-plugins": self._execute_reload_plugins,
             "files": self._execute_files,
+            "goal": self._execute_goal,
             "magic-docs": self._execute_magic_docs,
             "diff": self._execute_diff,
             "context": self._execute_context,
@@ -425,6 +426,7 @@ class HarnessInteractiveCommandHandler:
             "btw": self._execute_btw,
             "insights": self._execute_insights,
             "sandbox": self._execute_sandbox,
+            "loop": self._execute_loop,
             "schedule": self._execute_schedule,
             "torch": self._execute_torch,
             "ultraplan": self._execute_ultraplan,
@@ -503,6 +505,8 @@ class HarnessInteractiveCommandHandler:
             description = spec.help_text if spec else f"Execute /{name}"
             command_list.append((name, description))
         for skill in self._user_visible_skills().values():
+            if skill.name in self.commands:
+                continue
             description = skill.description or "Execute skill"
             if skill.argument_hint:
                 description = f"{description} {skill.argument_hint}"
@@ -1649,6 +1653,191 @@ Koder understands your codebase, edits files with your permission, and runs loca
             status = "exists" if absolute_path.exists() else "missing"
             lines.append(f"- {display_path} ({status})")
         return "\n".join(lines)
+
+    @staticmethod
+    def _parse_goal_objective_args(args: list[str]) -> tuple[str, str | None, int | None]:
+        """Split ``/goal`` args into (objective, error, token_budget).
+
+        Supports an optional trailing ``--budget N`` since the text UI has no
+        other way to attach a budget when creating a goal.
+        """
+        budget: int | None = None
+        if "--budget" in args:
+            idx = args.index("--budget")
+            budget_args = args[idx + 1 :]
+            if len(budget_args) != 1:
+                return "", "Usage: /goal <objective> [--budget <tokens>]", None
+            try:
+                budget = int(budget_args[0].replace(",", "").replace("_", ""))
+            except ValueError:
+                return "", f"Invalid token budget: {budget_args[0]}", None
+            args = args[:idx]
+        objective = " ".join(args).strip()
+        return objective, None, budget
+
+    async def _start_goal_turn(self, scheduler, goal) -> None:
+        """Kick off the goal continuation loop for a freshly activated goal."""
+        from koder_agent.core.goal_prompts import GOAL_CONTEXT_MARKER, continuation_prompt
+
+        await scheduler.handle(
+            f"{GOAL_CONTEXT_MARKER}\n\n{continuation_prompt(goal)}",
+            render_output=self.emit_console,
+        )
+
+    async def _execute_goal(self, scheduler, args: list[str]) -> str:
+        from koder_agent.core.goal_display import (
+            GOAL_USAGE,
+            GOAL_USAGE_HINT,
+            goal_status_label,
+            goal_summary_text,
+            goal_usage_summary,
+            should_confirm_before_replacing_goal,
+        )
+        from koder_agent.core.goals import (
+            GoalStatus,
+            GoalUpdate,
+            validate_goal_budget,
+            validate_goal_objective,
+        )
+
+        goal_store = getattr(scheduler, "goal_store", None)
+        session = getattr(scheduler, "session", None)
+        if goal_store is None or session is None:
+            return (
+                "Goals need a saved session. This session is temporary.\n"
+                "Start Koder normally to use goals."
+            )
+        session_id = str(session.session_id)
+
+        if not args:
+            goal = await goal_store.get_goal(session_id)
+            if goal is None:
+                return f"{GOAL_USAGE}\nNo goal is currently set.\n{GOAL_USAGE_HINT}"
+            return goal_summary_text(goal)
+
+        subcommand = args[0].lower()
+
+        if subcommand == "clear" and len(args) == 1:
+            cleared = await goal_store.delete_goal(session_id)
+            if cleared is None:
+                return "No goal to clear\nThis thread does not currently have a goal."
+            return "Goal cleared"
+
+        if subcommand == "pause" and len(args) == 1:
+            goal = await goal_store.pause_active_goal(session_id)
+            if goal is None:
+                current = await goal_store.get_goal(session_id)
+                if current is None:
+                    return f"No goal is currently set.\n{GOAL_USAGE}"
+                return (
+                    f"Goal is {goal_status_label(current.status)}; only active goals can be paused."
+                )
+            return f"Goal {goal_status_label(goal.status)}\n{goal_usage_summary(goal)}"
+
+        if subcommand == "resume" and len(args) == 1:
+            current = await goal_store.get_goal(session_id)
+            if current is None:
+                return f"No goal is currently set.\n{GOAL_USAGE}"
+            goal = await goal_store.update_goal(
+                session_id,
+                GoalUpdate(status=GoalStatus.ACTIVE, expected_goal_id=current.goal_id),
+            )
+            if goal is None:
+                return "Failed to resume goal: the goal changed while resuming."
+            header = f"Goal {goal_status_label(goal.status)}\n{goal_usage_summary(goal)}"
+            if goal.status is GoalStatus.ACTIVE:
+                await self._start_goal_turn(scheduler, goal)
+            return header
+
+        if subcommand == "budget":
+            if len(args) != 2:
+                return "Usage: /goal budget <tokens>"
+            try:
+                budget = int(args[1].replace(",", "").replace("_", ""))
+            except ValueError:
+                return f"Invalid token budget: {args[1]}"
+            try:
+                validate_goal_budget(budget)
+            except ValueError as exc:
+                return str(exc)
+            current = await goal_store.get_goal(session_id)
+            if current is None:
+                return f"No goal is currently set.\n{GOAL_USAGE}"
+            goal = await goal_store.update_goal(
+                session_id,
+                GoalUpdate(token_budget=budget, expected_goal_id=current.goal_id),
+            )
+            if goal is None:
+                return "Failed to update goal budget: the goal changed while updating."
+            return f"Goal {goal_status_label(goal.status)}\n{goal_usage_summary(goal)}"
+
+        if subcommand == "edit":
+            objective, error, budget = self._parse_goal_objective_args(args[1:])
+            if error:
+                return error
+            current = await goal_store.get_goal(session_id)
+            if current is None:
+                return f"No goal is currently set.\nCreate a goal before editing it.\n{GOAL_USAGE}"
+            if not objective:
+                return f"Usage: /goal edit <objective>\nCurrent objective: {current.objective}"
+            try:
+                validate_goal_objective(objective)
+                validate_goal_budget(budget)
+            except ValueError as exc:
+                return str(exc)
+            # Editing a budget-limited/complete goal reactivates it; stopped
+            # statuses (paused/blocked/usage-limited) are preserved.
+            if current.status in (GoalStatus.BUDGET_LIMITED, GoalStatus.COMPLETE):
+                new_status = GoalStatus.ACTIVE
+            else:
+                new_status = current.status
+            update = GoalUpdate(
+                objective=objective,
+                status=new_status,
+                expected_goal_id=current.goal_id,
+            )
+            if budget is not None:
+                update.token_budget = budget
+            goal = await goal_store.update_goal(session_id, update)
+            if goal is None:
+                return "Failed to edit goal: the goal changed while editing."
+            header = f"Goal {goal_status_label(goal.status)}\n{goal_usage_summary(goal)}"
+            if goal.status is GoalStatus.ACTIVE:
+                await self._start_goal_turn(scheduler, goal)
+            return header
+
+        replace_requested = subcommand == "replace"
+        objective_args = args[1:] if replace_requested else args
+        objective, error, budget = self._parse_goal_objective_args(objective_args)
+        if error:
+            return error
+        if not objective:
+            return GOAL_USAGE
+        try:
+            validate_goal_objective(objective)
+            validate_goal_budget(budget)
+        except ValueError as exc:
+            return str(exc)
+
+        existing = await goal_store.get_goal(session_id)
+        if (
+            existing is not None
+            and should_confirm_before_replacing_goal(existing)
+            and not replace_requested
+        ):
+            return (
+                "Replace goal?\n"
+                f"Current objective: {existing.objective}\n"
+                f"New objective: {objective}\n"
+                "Run /goal replace <objective> to replace the current goal, "
+                "or /goal to view it."
+            )
+
+        goal = await goal_store.replace_goal(session_id, objective, GoalStatus.ACTIVE, budget)
+        header = f"Goal {goal_status_label(goal.status)}\n{goal_usage_summary(goal)}"
+        if goal.status is GoalStatus.ACTIVE:
+            await self._start_goal_turn(scheduler, goal)
+        return header
 
     async def _execute_diff(self, _scheduler, _args: list[str]) -> str:
         git_stats, git_files = self._collect_git_diff()
@@ -4436,6 +4625,87 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             'Usage: /sandbox [status|backends|enable <backend>|disable|exclude "command pattern"]'
         )
 
+    async def _execute_loop(self, _scheduler, args: list[str]) -> str:
+        """Create, list, and delete scheduled loop jobs."""
+        from koder_agent.harness.cron.loop import (
+            LOOP_USAGE,
+            LoopSpecError,
+            format_loop_jobs,
+            parse_loop_spec,
+        )
+        from koder_agent.tools.cron import _get_cron_storage, cron_create, cron_delete
+
+        lowered = [arg.lower() for arg in args]
+        if lowered and lowered[0] in {"help", "--help", "-h"}:
+            return LOOP_USAGE
+
+        default_storage_path = Path.home() / ".koder" / "scheduled_tasks.json"
+
+        def _active_storage_path() -> Path:
+            try:
+                storage = _get_cron_storage()
+            except Exception:
+                return default_storage_path
+            return Path(getattr(storage, "_path", default_storage_path))
+
+        if not args or lowered[0] in {"list", "ls"}:
+            if args and len(args) != 1:
+                return LOOP_USAGE
+            storage_path = default_storage_path
+            try:
+                storage = _get_cron_storage()
+                storage_path = Path(getattr(storage, "_path", default_storage_path))
+                jobs = storage.list_all()
+            except Exception as exc:
+                return (
+                    "loop: failed to read scheduled task registry\n"
+                    f"path: {storage_path}\n"
+                    f"error: {exc}"
+                )
+            return format_loop_jobs(jobs)
+
+        if lowered[0] in {"delete", "remove", "rm"}:
+            if len(args) != 2:
+                return "Usage: /loop delete <id>"
+            try:
+                result = json.loads(cron_delete(args[1]))
+            except Exception as exc:
+                return (
+                    "loop: failed to update scheduled task registry\n"
+                    f"path: {_active_storage_path()}\n"
+                    f"error: {exc}"
+                )
+            if "error" in result:
+                return f"loop: {result['error']}"
+            return f"Loop job deleted: {result['id']}"
+
+        try:
+            spec = parse_loop_spec(args)
+        except LoopSpecError as exc:
+            return f"loop: {exc}\n{LOOP_USAGE}"
+
+        try:
+            result = json.loads(cron_create(spec.cron, spec.prompt, recurring=spec.recurring))
+        except Exception as exc:
+            return (
+                "loop: failed to update scheduled task registry\n"
+                f"path: {_active_storage_path()}\n"
+                f"error: {exc}"
+            )
+        if "error" in result:
+            return f"loop: {result['error']}"
+
+        return "\n".join(
+            [
+                "Loop job created",
+                f"id: {result['id']}",
+                f"cron: {spec.cron}",
+                f"human_schedule: {result.get('human_schedule', spec.cron)}",
+                f"recurring: {str(spec.recurring).lower()}",
+                f"prompt: {spec.prompt[:80]}",
+            ]
+        )
+
     async def _execute_schedule(self, _scheduler, _args: list[str]) -> str:
         """Show/manage cron tasks."""
         if _args:
@@ -4456,9 +4726,7 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             )
 
         if not jobs:
-            return (
-                "No scheduled tasks. Use cron_create or the /loop skill to create recurring tasks."
-            )
+            return "No scheduled tasks. Use cron_create or /loop to create recurring tasks."
 
         lines = [f"Scheduled tasks ({len(jobs)}):"]
         for index, job in enumerate(jobs, start=1):

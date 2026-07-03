@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
 from agents import (
     AgentUpdatedStreamEvent,
@@ -23,7 +25,11 @@ from rich.text import Text
 
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
 from ..agentic.api_errors import ApiErrorCategory, classify_api_error
+from ..core.goal_prompts import GOAL_CONTEXT_MARKER
+from ..core.goal_runtime import GoalRuntime
+from ..core.goals import GoalStore
 from ..core.keyboard_listener import CancellationToken, escape_listener, iter_with_cancellation
+from ..core.queued_input import QueuedInputManager, wrap_function_tool_for_queued_input
 from ..core.session import EnhancedSQLiteSession, migrate_legacy_sessions
 from ..core.streaming_display import StreamingDisplayManager
 from ..core.terminal_reflow import print_reflowable
@@ -55,6 +61,11 @@ from ..harness.memory.extraction import llm_extract_memories
 from ..harness.memory.session_memory import SessionMemoryManager
 from ..harness.reasoning_display import normalize_reasoning_display_mode
 from ..tools import BackgroundShellManager, get_all_tools
+from ..tools.goal import reset_goal_context, set_goal_context
+from ..tools.permission_context import (
+    reset_tool_permission_context,
+    set_tool_permission_context,
+)
 from ..utils.client import get_model_name
 from ..utils.model_info import get_context_window_size, get_maximum_output_tokens
 from ..utils.terminal_theme import get_adaptive_console
@@ -62,6 +73,71 @@ from ..utils.terminal_theme import get_adaptive_console
 logger = logging.getLogger(__name__)
 
 console = get_adaptive_console()
+
+# Recognizable marker for the ephemeral memory block injected into the first
+# turn. The SDK persists the run input verbatim (there is no SDK hook to attach
+# truly ephemeral per-turn context), so we tag the block with this prefix and
+# strip it from display and memory extraction. A fully non-persisted injection
+# would require an upstream SDK change and is out of scope.
+MEMORY_CONTEXT_MARKER = "[Relevant memories from previous sessions]"
+
+# Marker prefixed to hidden goal-continuation prompts so display filtering can
+# recognize them (same convention as MEMORY_CONTEXT_MARKER). The prompt itself
+# is persisted into session history by the SDK like any other run input.
+GOAL_CONTINUATION_MARKER = GOAL_CONTEXT_MARKER
+
+# Backstop for the automatic goal-continuation loop inside a single handle()
+# call. Codex's loop is purely status-driven (budget crossing, update_goal, or
+# an error terminates it); this cap only guards against a model that never
+# calls update_goal on an unbudgeted goal.
+DEFAULT_GOAL_MAX_CONTINUATIONS = 25
+
+
+def _goal_max_continuations() -> int:
+    raw = os.environ.get("KODER_GOAL_MAX_CONTINUATIONS")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_GOAL_MAX_CONTINUATIONS
+
+
+@dataclass
+class _HandoffToolItem:
+    """Lightweight stand-in for a ToolCallItem during handoff events."""
+
+    @dataclass
+    class _RawItem:
+        name: str = "agent_handoff"
+        arguments: str = "{}"
+        id: str = "handoff"
+
+    raw_item: "_HandoffToolItem._RawItem" = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.raw_item is None:
+            self.raw_item = self._RawItem()
+
+
+@dataclass
+class _HandoffOutputItem:
+    """Lightweight stand-in for a ToolCallOutputItem during handoff events."""
+
+    output: str = "Agent switched"
+    tool_call_id: str = "handoff"
+
+
+class StreamingOutputUI(Protocol):
+    """External renderer used by interactive mode while streaming."""
+
+    def update_output(self, renderable: Any) -> None: ...
+
+    def set_final_content(self, renderable: Any) -> None: ...
+
+    def set_final_text(self, text: str) -> None: ...
 
 
 def _format_execution_error(error: Exception) -> str:
@@ -151,16 +227,19 @@ class AgentScheduler:
         instructions_append: str | None = None,
         permission_service=None,
     ):
-        self.semaphore = asyncio.Semaphore(10)
         self.session = EnhancedSQLiteSession(session_id=session_id)
         self.agent_definition = agent_definition
         self.instructions_override = instructions_override
         self.instructions_append = instructions_append
-        self.tools = (
+        self.queued_input = QueuedInputManager()
+        base_tools = (
             filter_tools_for_agent_definition(agent_definition, get_all_tools())
             if agent_definition is not None
             else get_all_tools()
         )
+        self.tools = [
+            wrap_function_tool_for_queued_input(tool, self.queued_input) for tool in base_tools
+        ]
         self.dev_agent = None  # Will be initialized in async method
         self.streaming = streaming
         self.permission_service = permission_service
@@ -192,6 +271,14 @@ class AgentScheduler:
         self._session_memory = SessionMemoryManager(project_dir=os.getcwd())
         self._tool_call_count = 0  # Track tool calls for session memory extraction
         self._static_context_tokens_cache: int | None = None
+        self._turn_lock = asyncio.Lock()
+        # Goal runtime: long-running objectives with token budgets and hidden
+        # continuation turns. Uses an in-memory store when the session does.
+        goal_db_path = getattr(self.session, "db_path", None)
+        self.goal_store = GoalStore(db_path=goal_db_path)
+        self.goal_runtime = GoalRuntime(session_id=session_id, store=self.goal_store)
+        self._last_turn_cancelled = False
+        self._last_turn_errored = False
         # NOTE: micro_compact_messages is NOT wired here because the openai-agents
         # SDK's Runner manages tool results internally.  Individual tool outputs are
         # fed back into the conversation by the SDK before session.add_items is
@@ -310,8 +397,60 @@ class AgentScheduler:
         except Exception:
             pass  # Silent failure - best effort
 
-    async def handle(self, user_input: str, *, render_output: bool = True) -> str:
-        """Handle user input and execute agent."""
+    async def handle(
+        self,
+        user_input: str,
+        *,
+        render_output: bool = True,
+        streaming_ui: StreamingOutputUI | None = None,
+    ) -> str:
+        """Handle user input and execute agent.
+
+        After each completed turn, an active session goal triggers hidden
+        continuation turns (still under the turn lock) until the goal leaves
+        the active state, the token budget is crossed, or the backstop cap is
+        reached — mirroring codex's idle goal continuation.
+        """
+        async with self._turn_lock:
+            response = await self._handle_unlocked(
+                user_input,
+                render_output=render_output,
+                streaming_ui=streaming_ui,
+            )
+
+            async def run_continuation(prompt: str) -> str:
+                return await self._handle_unlocked(
+                    prompt,
+                    render_output=render_output,
+                    streaming_ui=streaming_ui,
+                )
+
+            return await self._run_goal_continuations(response, run_continuation)
+
+    async def _run_goal_continuations(self, response: str, run_turn) -> str:
+        """Run hidden continuation turns while the active goal asks for them."""
+        max_continuations = _goal_max_continuations()
+        continuations = 0
+        while continuations < max_continuations:
+            try:
+                continuation = await self.goal_runtime.next_continuation_prompt()
+            except Exception:
+                logger.debug("Goal continuation check failed", exc_info=True)
+                break
+            if continuation is None:
+                break
+            continuations += 1
+            response = await run_turn(f"{GOAL_CONTINUATION_MARKER}\n\n{continuation}")
+        return response
+
+    async def _handle_unlocked(
+        self,
+        user_input: str,
+        *,
+        render_output: bool = True,
+        streaming_ui: StreamingOutputUI | None = None,
+    ) -> str:
+        """Handle a single turn after the turn lock has been acquired."""
         turn_user_input = user_input
 
         # Ensure agent is initialized with MCP servers and migration complete
@@ -336,13 +475,17 @@ class AgentScheduler:
                 self._generate_title_background(actual_request)
             )
 
-            # Inject relevant memories on first turn
+            # Inject relevant memories on first turn. The block is tagged with
+            # MEMORY_CONTEXT_MARKER so display (_get_display_input) and memory
+            # extraction can recognize and exclude it. Title generation is
+            # unaffected because it uses the clean `actual_request` captured
+            # above, before this injection.
             memory_context = await self._load_memory_context(actual_request)
             if memory_context:
                 # Prepend memory context to user input
-                user_input = f"[Relevant memories from previous sessions]\n\n{memory_context}\n\n---\n\n{user_input}"
+                user_input = f"{MEMORY_CONTEXT_MARKER}\n\n{memory_context}\n\n---\n\n{user_input}"
 
-        if render_output:
+        if render_output and streaming_ui is None:
             console.print()
             console.print("[dim]thinking...[/dim]")
 
@@ -350,11 +493,22 @@ class AgentScheduler:
         companion_config = self._runtime_config_service.load()
         companion = get_companion(companion_config)
 
-        async with self.semaphore:
+        # Publish the permission service into the tool layer so the function_tool
+        # wrapper can enforce argument-level deny/approval on shell & file tools.
+        # Set before Runner.run so the run-loop task copies a context that has it.
+        perm_token = set_tool_permission_context(self.permission_service)
+        goal_token = set_goal_context(self.goal_runtime)
+        await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
+        self._last_turn_cancelled = False
+        self._last_turn_errored = False
+        try:
             buddy_runtime.mark_task_start()
             try:
                 if self.streaming:
-                    response = await self._handle_streaming(user_input)
+                    response = await self._handle_streaming(
+                        user_input,
+                        streaming_ui=streaming_ui,
+                    )
                 else:
                     result = await Runner.run(
                         self.dev_agent,
@@ -377,12 +531,23 @@ class AgentScheduler:
                         print()  # Add space after response
             except Exception as e:
                 # Handle execution errors gracefully
-                response = f"[red]Execution error: {_format_execution_error(e)}[/red]\n\nPlease provide new instructions."
+                await self._finish_goal_turn(error=True)
+                error_text = f"Execution error: {_format_execution_error(e)}"
+                response = f"{error_text}\n\nPlease provide new instructions."
                 if render_output:
-                    print_reflowable(console, response)
+                    print_reflowable(
+                        console, f"[red]{error_text}[/red]\n\nPlease provide new instructions."
+                    )
                 return response
             finally:
                 buddy_runtime.mark_task_complete()
+            await self._finish_goal_turn(
+                error=self._last_turn_errored,
+                cancelled=self._last_turn_cancelled,
+            )
+        finally:
+            reset_goal_context(goal_token)
+            reset_tool_permission_context(perm_token)
 
         if companion is not None and not companion_config.harness.companion_muted:
             reaction = observe_turn(
@@ -408,6 +573,30 @@ class AgentScheduler:
         include_partial_messages: bool = False,
     ) -> str:
         """Handle headless stream-json execution and emit NDJSON-friendly events."""
+        async with self._turn_lock:
+            response = await self._handle_stream_json_unlocked(
+                user_input,
+                on_event=on_event,
+                include_partial_messages=include_partial_messages,
+            )
+
+            async def run_continuation(prompt: str) -> str:
+                return await self._handle_stream_json_unlocked(
+                    prompt,
+                    on_event=on_event,
+                    include_partial_messages=include_partial_messages,
+                )
+
+            return await self._run_goal_continuations(response, run_continuation)
+
+    async def _handle_stream_json_unlocked(
+        self,
+        user_input: str,
+        *,
+        on_event,
+        include_partial_messages: bool = False,
+    ) -> str:
+        """Handle a single headless stream-json turn after the turn lock is held."""
         await self._ensure_agent_initialized()
 
         if self.dev_agent is None:
@@ -424,20 +613,23 @@ class AgentScheduler:
                 self._generate_title_background(actual_request)
             )
 
-        result = Runner.run_streamed(
-            self.dev_agent,
-            user_input,
-            session=self.session,
-            run_config=RunConfig(),
-            hooks=self.hooks,
-            max_turns=50,
-        )
+        perm_token = set_tool_permission_context(self.permission_service)
+        goal_token = set_goal_context(self.goal_runtime)
+        await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
+        try:
+            result = Runner.run_streamed(
+                self.dev_agent,
+                user_input,
+                session=self.session,
+                run_config=RunConfig(),
+                hooks=self.hooks,
+                max_turns=50,
+            )
 
-        partial_text_chunks: list[str] = []
-        tool_names: dict[str, str] = {}
-        reasoning_display_mode = self._reasoning_display_mode()
+            partial_text_chunks: list[str] = []
+            tool_names: dict[str, str] = {}
+            reasoning_display_mode = self._reasoning_display_mode()
 
-        async with self.semaphore:
             async for event in result.stream_events():
                 if isinstance(event, RawResponsesStreamEvent):
                     reasoning_payload = _reasoning_stream_payload(
@@ -531,16 +723,36 @@ class AgentScheduler:
                     }
                     on_event(payload)
 
-        await self._capture_usage(result)
+            await self._capture_usage(result)
+            await self._finish_goal_turn()
 
-        final_response = result.final_output
-        if final_response is None:
-            final_response = "".join(partial_text_chunks)
-        else:
-            final_response = str(final_response)
-        filtered_response = self._filter_output(final_response)
-        await self._refresh_magic_docs_after_turn(user_input, filtered_response)
-        return filtered_response
+            final_response = result.final_output
+            if final_response is None:
+                final_response = "".join(partial_text_chunks)
+            else:
+                final_response = str(final_response)
+            filtered_response = self._filter_output(final_response)
+            await self._refresh_magic_docs_after_turn(user_input, filtered_response)
+            return filtered_response
+        finally:
+            reset_goal_context(goal_token)
+            reset_tool_permission_context(perm_token)
+
+    def _goal_cumulative_tokens(self) -> int:
+        """Cumulative billable tokens used as the goal accounting baseline."""
+        usage = self.usage_tracker.session_usage
+        return int(getattr(usage, "input_tokens", 0)) + int(getattr(usage, "output_tokens", 0))
+
+    async def _finish_goal_turn(self, *, error: bool = False, cancelled: bool = False) -> None:
+        """Charge the finished turn against the session goal (best effort)."""
+        try:
+            await self.goal_runtime.on_turn_end(
+                self._goal_cumulative_tokens(),
+                error=error,
+                cancelled=cancelled,
+            )
+        except Exception:
+            logger.debug("Goal turn accounting failed", exc_info=True)
 
     async def _refresh_magic_docs_after_turn(self, user_input: str, response: str) -> None:
         """Best-effort Magic Doc refresh after a completed Koder turn."""
@@ -557,7 +769,12 @@ class AgentScheduler:
         except Exception:
             logger.debug("Magic Doc refresh failed", exc_info=True)
 
-    async def _handle_streaming(self, user_input: str) -> str:
+    async def _handle_streaming(
+        self,
+        user_input: str,
+        *,
+        streaming_ui: StreamingOutputUI | None = None,
+    ) -> str:
         """Handle streaming execution while preserving terminal scrollback."""
         import sys
 
@@ -568,11 +785,15 @@ class AgentScheduler:
             config_getter=self._runtime_config_service.load,
         )
 
-        # Check if ESC listener should be enabled (Unix TTY only)
-        esc_enabled = sys.platform != "win32" and sys.stdin.isatty()
+        # Check if ESC listener should be enabled (Unix TTY only). In interactive
+        # fixed-bottom mode, prompt_toolkit owns stdin while the model streams.
+        esc_enabled = streaming_ui is None and sys.platform != "win32" and sys.stdin.isatty()
 
         # Add space before streaming starts
-        print()
+        if streaming_ui is None:
+            print()
+        else:
+            streaming_ui.update_output(live_renderable)
 
         # Run the agent in streaming mode
         if self.dev_agent is None:
@@ -617,14 +838,8 @@ class AgentScheduler:
                     pass
                 esc_hint_shown = False
 
-        # Use Rich Live for proper formatting during streaming
-        with Live(
-            live_renderable,
-            console=console,
-            refresh_per_second=8,
-            transient=True,
-            vertical_overflow="crop",
-        ) as live:
+        async def consume_stream_events(on_update) -> None:
+            nonlocal execution_error
             try:
                 async with escape_listener(on_escape=handle_escape, enabled=esc_enabled):
                     stream_iter = result.stream_events()
@@ -694,29 +909,11 @@ class AgentScheduler:
                                 elif event.name == "handoff_requested":
                                     buddy_runtime.mark_tool_call("agent_handoff")
                                     should_update = display_manager.handle_tool_called(
-                                        type(
-                                            "HandoffItem",
-                                            (),
-                                            {
-                                                "raw_item": type(
-                                                    "RawItem",
-                                                    (),
-                                                    {
-                                                        "name": "agent_handoff",
-                                                        "arguments": "{}",
-                                                        "id": "handoff",
-                                                    },
-                                                )()
-                                            },
-                                        )()
+                                        _HandoffToolItem()
                                     )
                                 elif event.name == "handoff_occured":
                                     should_update = display_manager.handle_tool_output(
-                                        type(
-                                            "HandoffOutput",
-                                            (),
-                                            {"output": "Agent switched", "tool_call_id": "handoff"},
-                                        )()
+                                        _HandoffOutputItem()
                                     )
                                 elif event.name == "reasoning_item_created":
                                     if reasoning_display_mode != "off" and hasattr(event, "item"):
@@ -729,7 +926,7 @@ class AgentScheduler:
                                 pass
 
                             if should_update:
-                                live.refresh()
+                                on_update()
 
                         except Exception as e:
                             console.print(f"[dim red]Event processing error: {e}[/dim red]")
@@ -737,36 +934,67 @@ class AgentScheduler:
             except Exception as e:
                 execution_error = e
 
+        if streaming_ui is None:
+            # Use Rich Live for proper formatting during streaming.
+            with Live(
+                live_renderable,
+                console=console,
+                refresh_per_second=8,
+                transient=True,
+                vertical_overflow="crop",
+            ) as live:
+                await consume_stream_events(live.refresh)
+        else:
+            await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))
+
         # After Rich Live context ends, perform intelligent cleanup
         display_manager.finalize_text_sections()
+        if streaming_ui is not None:
+            streaming_ui.update_output(live_renderable)
 
         # Clear the ESC hint line (now outside Live context)
         clear_esc_hint()
 
         # Handle execution error after Live context has properly closed
         if execution_error is not None:
+            # Record for goal accounting: a terminal turn error blocks the goal
+            # so automatic continuation cannot loop on the same failure.
+            self._last_turn_errored = True
             error_msg = f"Execution error: {_format_execution_error(execution_error)}"
-            console.print(f"[red]{error_msg}[/red]")
+            if streaming_ui is None:
+                console.print(f"[red]{error_msg}[/red]")
+            else:
+                streaming_ui.set_final_text(
+                    f"[red]{error_msg}[/red]\n\nPlease provide new instructions."
+                )
             return f"{error_msg}\n\nPlease provide new instructions."
 
         # Handle cancellation case
         if cancelled:
+            # Record for goal accounting: a user interrupt pauses the active goal.
+            self._last_turn_cancelled = True
             # Rich Live with transient=True clears content on exit, so we need to re-print
             # Get partial content that was accumulated during streaming (as Rich renderable)
             partial_content = display_manager.get_display_content()
             partial_text = display_manager.get_final_text()
 
-            # Show the partial output with proper formatting (colors and markdown preserved)
-            if self._has_content(partial_content):
-                print()  # Add spacing
-                print_reflowable(console, partial_content)
-            elif partial_text and partial_text.strip():
-                print()  # Add spacing
-                print_reflowable(console, partial_text)
+            if streaming_ui is None:
+                # Show the partial output with proper formatting (colors and markdown preserved)
+                if self._has_content(partial_content):
+                    print()  # Add spacing
+                    print_reflowable(console, partial_content)
+                elif partial_text and partial_text.strip():
+                    print()  # Add spacing
+                    print_reflowable(console, partial_text)
 
-            # Show cancellation message
-            console.print("\n[yellow]Operation cancelled by user[/yellow]")
-            console.print()
+                # Show cancellation message
+                console.print("\n[yellow]Operation cancelled by user[/yellow]")
+                console.print()
+            else:
+                if self._has_content(partial_content):
+                    streaming_ui.set_final_content(partial_content)
+                elif partial_text and partial_text.strip():
+                    streaming_ui.set_final_text(partial_text)
 
             # Capture any usage data we can
             await self._capture_usage(result)
@@ -782,9 +1010,12 @@ class AgentScheduler:
         # reviewable after the next prompt is drawn.
         has_content = self._has_content(final_content)
         if has_content:
-            print()  # Add spacing
-            print_reflowable(console, final_content)
-            print()  # Add spacing after
+            if streaming_ui is None:
+                print()  # Add spacing
+                print_reflowable(console, final_content)
+                print()  # Add spacing after
+            else:
+                streaming_ui.set_final_content(final_content)
 
         # Capture token usage from streaming result
         await self._capture_usage(result)
@@ -801,6 +1032,19 @@ class AgentScheduler:
 
     def _get_display_input(self, user_input: str) -> str:
         """Get a filtered version of user input for display purposes."""
+        # Hidden goal-continuation prompts are collapsed to their marker line.
+        if user_input.startswith(GOAL_CONTINUATION_MARKER):
+            return GOAL_CONTINUATION_MARKER
+
+        # Strip the injected ephemeral memory block so it never shows up in the
+        # displayed user message. The block ends at the "---" separator that the
+        # injection adds between memories and the real user request.
+        if user_input.startswith(MEMORY_CONTEXT_MARKER):
+            separator = "\n\n---\n\n"
+            idx = user_input.find(separator)
+            if idx != -1:
+                user_input = user_input[idx + len(separator) :]
+
         # Check if input contains AGENTS.md content
         if "AGENTS.md content:" in user_input:
             lines = user_input.split("\n")
@@ -970,9 +1214,13 @@ class AgentScheduler:
     async def _capture_usage(self, result) -> None:
         """Capture token usage from a Runner result.
 
-        API usage is best for billing, while the status line needs the effective
-        context window.  Use the largest credible context estimate so we do not
-        under-report when a provider returns only per-request deltas.
+        Billing tokens (``input_tokens`` / ``output_tokens`` passed to
+        ``record_usage``) ALWAYS trust the real API usage when it is present;
+        tiktoken estimates are only used as a fallback when the API returned
+        nothing. The separate ``context_tokens`` value drives the status-line
+        "context window size" and may use the larger of the API or estimated
+        context so we do not under-report the effective context — this never
+        inflates billing/cost.
         """
         try:
             input_tokens = 0
@@ -1016,9 +1264,15 @@ class AgentScheduler:
             static_tokens = self._estimate_static_context_tokens()
             estimated_context_tokens = static_tokens + session_tokens
 
+            # BILLING fallback ONLY: if the API returned no input tokens, bill
+            # using the estimated context size. When the API DID return real
+            # input tokens we keep them untouched so cost is never inflated.
             if input_tokens <= 0 and session_tokens > 0:
                 input_tokens = estimated_context_tokens
 
+            # CONTEXT (status line) — independent of billing. Use the larger of
+            # the API-reported context and our estimate so we do not under-report
+            # the effective context window.
             if api_context_tokens > 0 or estimated_context_tokens > 0:
                 context_tokens = max(api_context_tokens, estimated_context_tokens)
                 if api_context_tokens <= 0 and output_tokens > 0:
@@ -1049,8 +1303,25 @@ class AgentScheduler:
                             context_tokens, self._tool_call_count
                         )
         except Exception:
-            # Silently ignore usage capture errors
-            pass
+            logger.debug("Failed to capture usage from result", exc_info=True)
+
+    @staticmethod
+    def _compact_keep_recent(default: int = 6) -> int:
+        """Number of recent plain-text messages to keep during compaction.
+
+        Configurable via ``KODER_COMPACT_KEEP_RECENT``. Defaults to 6 (vs the
+        helper's own default of 2) so meaningfully more recent conversation
+        survives a compaction.
+        """
+        raw = os.environ.get("KODER_COMPACT_KEEP_RECENT")
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+        return default
 
     async def _run_auto_compact(self) -> None:
         """Run LLM-based auto-compaction on the session history."""
@@ -1065,7 +1336,17 @@ class AgentScheduler:
                 [item for item in items if isinstance(item, dict)]
             )
             console.print("[dim]compacting...[/dim]")
-            result = await llm_compact_messages(messages)
+            # Keep more recent conversation so the model retains working context
+            # after a compaction instead of re-reading everything.
+            #
+            # LIMITATION: llm_compact_messages only preserves recent PLAIN
+            # messages (user/assistant text) via _recent_plain_context_items;
+            # raising keep_recent keeps more of that text but does NOT preserve
+            # raw tool-call / tool-output items (e.g. recently-read files). Full
+            # tool-output retention would require changing the read-only
+            # harness/memory/compact.py and is out of scope here.
+            keep_recent = self._compact_keep_recent()
+            result = await llm_compact_messages(messages, keep_recent=keep_recent)
 
             original_dict_items = [item for item in items if isinstance(item, dict)]
             compacted_items = (
@@ -1083,8 +1364,11 @@ class AgentScheduler:
                 # Replace with summary plus compact plain-text tail.
 
                 # Replace session contents with compacted version.
-                # Temporarily raise the summarization threshold so the override's
-                # own token check does not re-summarize the already-compacted items.
+                # NOTE: the session no longer performs any summarization in
+                # add_items (the scheduler owns compaction now), so toggling
+                # summarization_threshold is a harmless no-op. It is retained
+                # only for backwards compatibility with any callers/tests that
+                # still reference the attribute.
                 await self.session.clear_session()
                 saved_threshold = self.session.summarization_threshold
                 self.session.summarization_threshold = 2**31
@@ -1117,6 +1401,12 @@ class AgentScheduler:
                 {"role": item.get("role", "unknown"), "content": item.get("content", "")}
                 for item in items
                 if isinstance(item, dict)
+                # Exclude the injected ephemeral memory block so we never
+                # re-extract previously-retrieved memories.
+                and not (
+                    isinstance(item.get("content"), str)
+                    and item.get("content", "").startswith(MEMORY_CONTEXT_MARKER)
+                )
             ]
             if not messages:
                 return
@@ -1148,6 +1438,11 @@ class AgentScheduler:
         """Clean up resources, including MCP servers."""
         try:
             self._save_usage_snapshot()
+
+            try:
+                await self.goal_store.close()
+            except Exception:
+                logger.debug("Goal store cleanup failed", exc_info=True)
 
             # Cancel pending title generation task
             if self._title_generation_task and not self._title_generation_task.done():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
@@ -18,6 +19,8 @@ from koder_agent.harness.skills.bundled import get_bundled_skills
 from koder_agent.harness.skills.discovery import discover_skills_for_paths
 
 from .compat import function_tool
+
+logger = logging.getLogger(__name__)
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -117,7 +120,16 @@ class Skill:
     def _run_inline_command(self, command: str) -> str:
         if not command:
             return ""
+
+        # Security gate 1: allow operators to disable inline command execution
+        # entirely via env flag (consistent with the codebase's env-flag style).
+        # When disabled, never execute -- substitute a clear placeholder.
+        if not _inline_commands_enabled():
+            return "[inline command execution disabled]"
+
         if self.shell == "powershell":
+            # The bash security analyzer is bash-oriented and cannot reason about
+            # PowerShell syntax, so we only honor the disable gate here.
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", command],
                 capture_output=True,
@@ -126,6 +138,17 @@ class Skill:
                 check=False,
             )
         else:
+            # Security gate 2: route the candidate command through the existing
+            # bash security analyzer BEFORE executing. This prevents a malicious
+            # third-party skill from gaining arbitrary code execution simply by
+            # rendering its prompt. Blocked commands are never run -- a clear
+            # placeholder is substituted instead of the command output.
+            from koder_agent.core.bash_security import analyze_command
+
+            analysis = analyze_command(command)
+            if analysis.blocked:
+                return f"[blocked: {analysis.reason}]"
+
             result = subprocess.run(
                 ["/bin/bash", "-lc", command],
                 capture_output=True,
@@ -137,6 +160,23 @@ class Skill:
         if output:
             return output
         return result.stderr.strip()
+
+
+SKILL_INLINE_COMMANDS_ENV = "KODER_SKILL_INLINE_COMMANDS"
+
+
+def _inline_commands_enabled() -> bool:
+    """Whether skill inline ``!`cmd`` expansion may execute commands.
+
+    Honors the ``KODER_SKILL_INLINE_COMMANDS`` env flag. Default is enabled so
+    first-party skills keep working, but when set to a falsy value (``0``/
+    ``false``/``no``/``off``) inline execution is skipped entirely. Even when
+    enabled, bash commands still pass through the security analyzer.
+    """
+    raw = os.environ.get(SKILL_INLINE_COMMANDS_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _validate_skill_name(name: str, skill_path: Path) -> list[str]:
@@ -238,7 +278,7 @@ class SkillLoader:
         try:
             raw = skill_path.read_text(encoding="utf-8")
         except OSError as exc:
-            print(f"Warning: failed to read skill file {skill_path}: {exc}")
+            logger.warning("Failed to read skill file %s: %s", skill_path, exc)
             return None
 
         text = raw.lstrip("\ufeff")
@@ -254,11 +294,11 @@ class SkillLoader:
                 if isinstance(loaded, dict):
                     meta = loaded
                 else:
-                    print(f"Warning: frontmatter in {skill_path} must be a mapping")
+                    logger.warning("Frontmatter in %s must be a mapping", skill_path)
             except yaml.YAMLError as exc:
-                print(f"Warning: invalid YAML in {skill_path}: {exc}")
+                logger.warning("invalid YAML in %s: %s", skill_path, exc)
         else:
-            print(f"Warning: no frontmatter found in {skill_path}")
+            logger.warning("no frontmatter found in %s", skill_path)
 
         resolved_name = str(meta.get("name") or _skill_default_name(skill_path))
         if plugin_name:
@@ -266,9 +306,9 @@ class SkillLoader:
         description = str(meta.get("description") or "")
 
         for warning in _validate_skill_name(resolved_name, skill_path):
-            print(f"Warning: {warning}")
+            logger.warning("%s", warning)
         for warning in _validate_skill_description(description, skill_path):
-            print(f"Warning: {warning}")
+            logger.warning("%s", warning)
 
         tools_raw = meta["allowed-tools"] if "allowed-tools" in meta else meta.get("allowed_tools")
         allowed_tools = _parse_list(tools_raw)
@@ -352,7 +392,7 @@ class SkillLoader:
         self._cache.clear()
 
         if not self.skills_dir.exists():
-            print(f"Warning: skills directory does not exist: {self.skills_dir}")
+            logger.debug("Skills directory does not exist: %s", self.skills_dir)
             self._discovered = True
             return []
 
@@ -362,7 +402,7 @@ class SkillLoader:
             if not skill:
                 continue
             if skill.name in self._cache:
-                print(f"Warning: duplicate skill name '{skill.name}' in {skill_file}")
+                logger.warning("duplicate skill name '%s' in %s", skill.name, skill_file)
                 continue
             self._cache[skill.name] = skill
 
@@ -412,6 +452,39 @@ class SkillLoader:
             self.discover_skills()
 
 
+def _bounded_find_koder_skills(root: Path, max_depth: int = 3) -> list[Path]:
+    """Walk up to *max_depth* levels below *root* looking for .koder/skills dirs.
+
+    This replaces an unbounded ``rglob(".koder/skills")`` which is prohibitively
+    slow on large monorepos.
+    """
+    results: list[Path] = []
+    resolved = root.resolve()
+
+    def _walk(current: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = list(current.iterdir())
+        except (PermissionError, OSError):
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if entry.name == ".koder":
+                candidate = entry / "skills"
+                if candidate.is_dir():
+                    results.append(candidate.resolve())
+            else:
+                # Skip hidden directories and common heavy dirs for speed
+                if entry.name.startswith("."):
+                    continue
+                _walk(entry, depth + 1)
+
+    _walk(resolved, 1)
+    return results
+
+
 def _project_skill_dirs(cwd: Path) -> list[Path]:
     dirs: list[Path] = []
     current = cwd.resolve()
@@ -427,7 +500,7 @@ def _project_skill_dirs(cwd: Path) -> list[Path]:
         current = current.parent
 
     nested = sorted(
-        {path.resolve() for path in cwd.resolve().rglob(".koder/skills") if path.is_dir()},
+        _bounded_find_koder_skills(cwd.resolve(), max_depth=3),
         key=lambda path: (len(path.parts), str(path)),
     )
     for path in nested:
@@ -592,7 +665,36 @@ class SkillModel(BaseModel):
 
 
 _merged_skills: Optional[dict[str, Skill]] = None
-_merged_skills_key: Optional[tuple[str, str, str, tuple[str, ...]]] = None
+_merged_skills_key: Optional[tuple] = None
+
+
+def _dir_max_mtime(path: Path) -> float:
+    """Return the latest mtime of skill files in *path*, or 0.0 if empty/missing.
+
+    Scans using the same patterns as ``SkillLoader.discover_skills``:
+    ``rglob("SKILL.md")`` + ``glob("*.md")``.
+    """
+    if not path.exists():
+        return 0.0
+    max_mt = 0.0
+    try:
+        for md_file in path.rglob("SKILL.md"):
+            try:
+                mt = md_file.stat().st_mtime
+                if mt > max_mt:
+                    max_mt = mt
+            except OSError:
+                pass
+        for md_file in path.glob("*.md"):
+            try:
+                mt = md_file.stat().st_mtime
+                if mt > max_mt:
+                    max_mt = mt
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return max_mt
 
 
 def _get_merged_skills() -> dict[str, Skill]:
@@ -604,7 +706,25 @@ def _get_merged_skills() -> dict[str, Skill]:
     project_dir = str(_expand_path(config.skills.project_skills_dir))
     plugin_root = str((harness_home_dir() / "plugins").resolve())
     additional = tuple(str(path) for path in _additional_dirs_from_env())
-    cache_key = (cwd, user_dir, project_dir, plugin_root, additional)
+
+    # Include max mtime of each skills directory in the cache key so edits
+    # to skill files invalidate the cache without a process restart.
+    user_mtime = _dir_max_mtime(Path(user_dir))
+    project_mtime = _dir_max_mtime(Path(project_dir))
+    plugin_mtime = _dir_max_mtime(Path(plugin_root))
+    additional_mtimes = tuple(_dir_max_mtime(Path(p)) for p in additional)
+
+    cache_key = (
+        cwd,
+        user_dir,
+        project_dir,
+        plugin_root,
+        additional,
+        user_mtime,
+        project_mtime,
+        plugin_mtime,
+        additional_mtimes,
+    )
 
     if _merged_skills is None or _merged_skills_key != cache_key:
         _merged_skills = discover_merged_skills(
@@ -619,10 +739,24 @@ def _get_merged_skills() -> dict[str, Skill]:
     return _merged_skills
 
 
+def _apply_skill_restrictions(skill: Skill) -> None:
+    """Apply a loaded skill's tool restrictions.
+
+    Loading a skill only ADDS its restrictions (when it declares
+    ``allowed_tools``). Loading an unrestricted skill is a NO-OP for
+    restrictions -- it must NOT silently erase the restrictions contributed by a
+    previously-loaded restricted skill, otherwise the model could self-clear its
+    own sandbox just by loading any benign skill. ``clear_restrictions()``
+    remains an explicit API for callers that genuinely need to reset state.
+    """
+    from .skill_context import add_skill_restrictions
+
+    if skill.allowed_tools:
+        add_skill_restrictions(skill)
+
+
 @function_tool
 def get_skill(skill_name: str) -> str:
-    from .skill_context import add_skill_restrictions, clear_restrictions
-
     if not skill_name:
         return "Invalid skill name: skill_name cannot be empty"
 
@@ -630,10 +764,7 @@ def get_skill(skill_name: str) -> str:
     skill = skills.get(skill_name)
 
     if skill:
-        if skill.allowed_tools:
-            add_skill_restrictions(skill)
-        else:
-            clear_restrictions()
+        _apply_skill_restrictions(skill)
         return skill.to_prompt()
 
     available = sorted(skills.keys())

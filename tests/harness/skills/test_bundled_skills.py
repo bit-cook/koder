@@ -55,6 +55,15 @@ def test_update_config_skill():
     assert s.content
 
 
+def test_loop_skill_delegates_to_runtime_command():
+    skills = get_bundled_skills()
+    s = skills["loop"]
+
+    assert s.disable_model_invocation is True
+    assert "/loop" in s.content
+    assert "execute the prompt once immediately" not in s.content
+
+
 def test_all_skills_have_descriptions():
     for defn in _definitions():
         assert defn.description, f"Skill '{defn.name}' missing description"

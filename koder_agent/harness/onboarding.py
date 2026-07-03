@@ -1,9 +1,12 @@
 """Onboarding wizard state management for Koder setup."""
 
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,7 +91,7 @@ def check_onboarding_state(
             config = get_config()
             model_selected = bool(config.model.name)
         except Exception:
-            pass
+            logger.debug("Failed to load config for onboarding check", exc_info=True)
 
     # Check if workspace has .koder directory
     workspace_trusted = (project_dir / ".koder").exists()

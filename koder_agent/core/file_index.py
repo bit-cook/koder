@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _WALK_EXCLUDES = frozenset(
     {
@@ -132,7 +135,7 @@ class ProjectFileIndex:
                 if item.is_file():
                     paths.append(str(item.relative_to(self._cwd)))
         except (OSError, ValueError):
-            pass
+            logger.debug("Failed to walk directory for file index", exc_info=True)
         return paths
 
     def search(self, query: str, *, max_results: int = 15) -> list[str]:

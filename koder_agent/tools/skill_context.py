@@ -6,7 +6,11 @@ those tools (plus always-allowed tools) can be used.
 
 The restriction model uses UNION semantics:
 - Multiple skills with `allowed_tools` accumulate their allowed tools
-- Loading a skill without `allowed_tools` clears all restrictions
+- Loading a skill without `allowed_tools` is a NO-OP for restrictions; it does
+  NOT clear restrictions contributed by previously-loaded restricted skills.
+  (Allowing an unrestricted skill to clear restrictions would let the model
+  self-escape its sandbox by loading any benign skill.) Use the explicit
+  `clear_restrictions()` API to reset state.
 
 Pattern syntax for allowed_tools:
 - "read_file"           - Exact tool name match
@@ -195,7 +199,9 @@ def get_active_restrictions() -> Optional[SkillRestrictions]:
 def clear_restrictions() -> None:
     """Clear any active skill restrictions.
 
-    Called when a skill without `allowed_tools` is loaded, or to reset state.
+    This is an explicit reset API. It is intentionally NOT called when a skill
+    without `allowed_tools` is loaded (see module docstring) -- loading an
+    unrestricted skill must not erase another skill's active restrictions.
     """
     _active_restrictions.set(None)
 

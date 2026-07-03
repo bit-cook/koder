@@ -49,8 +49,8 @@ Command families:
 | Model and UI | `/model`, `/effort`, `/theme`, `/color`, `/vim`, `/statusline`, `/output-style` |
 | Context | `/files`, `/context`, `/ctx_viz`, `/summary`, `/insights`, `/doctor` |
 | Workflows | `/review`, `/security-review`, `/advisor`, `/brief`, `/branch`, `/passes` |
-| Memory | `/memory`, `/remember`, `/thinkback`, `/thinkback-play`, `/compact`, `/rewind` |
-| Agents | `/agents`, `/fork`, `/peers`, `/tasks`, `/teleport`, `/schedule` |
+| Memory and goals | `/memory`, `/remember`, `/thinkback`, `/thinkback-play`, `/compact`, `/rewind`, `/goal` |
+| Agents and loops | `/agents`, `/fork`, `/peers`, `/tasks`, `/teleport`, `/loop`, `/schedule` |
 | Extensions | `/skills`, `/plugin`, `/reload-plugins`, `/mcp`, `/channels`, `/magic-docs` |
 | Permissions | `/permissions`, `/sandbox`, `/managed-settings`, `/privacy-settings`, `/add-dir` |
 | GitHub | `/pr-comments`, `/install-github-app`, `/release-notes`, `/subscribe-pr`, `/autofix-pr` |

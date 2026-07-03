@@ -2,8 +2,11 @@
 
 This module extends the official agents.SQLiteSession to add:
 - Session titles with LLM-based generation
-- Token-aware message summarization
+- Token estimation helpers
 - Separate metadata storage for extensibility
+
+Conversation compaction is intentionally NOT handled here; it is owned by the
+scheduler so there is a single, modern compaction path.
 """
 
 import json
@@ -16,8 +19,7 @@ import tiktoken
 from agents import SQLiteSession
 from agents.items import TResponseInputItem
 
-from ..utils.client import get_model_name, llm_completion
-from ..utils.model_info import get_summarization_threshold
+from ..utils.client import llm_completion
 
 
 async def migrate_legacy_sessions(db_path: str) -> int:
@@ -113,15 +115,17 @@ async def migrate_legacy_sessions(db_path: str) -> int:
 
 
 class EnhancedSQLiteSession(SQLiteSession):
-    """Extended SQLiteSession with title management and auto-summarization.
+    """Extended SQLiteSession with title and metadata management.
 
     This class wraps the official SQLiteSession and adds:
     1. Session titles stored in a separate metadata table
-    2. Automatic message summarization when token threshold is exceeded
-    3. LLM-based title generation from first user message
+    2. LLM-based title generation from first user message
+    3. Token estimation helpers used by the scheduler
 
-    The underlying SQLiteSession handles all conversation history persistence,
-    while this class adds the custom features in a non-intrusive way.
+    The session itself is a pure storage layer. Conversation compaction is
+    owned entirely by the scheduler (``AutoCompactManager`` +
+    ``llm_compact_messages``); ``add_items`` no longer performs any
+    summarization.
     """
 
     def __init__(
@@ -135,8 +139,10 @@ class EnhancedSQLiteSession(SQLiteSession):
         Args:
             session_id: Unique identifier for this session
             db_path: Path to SQLite database file (default: ~/.koder/koder.db)
-            summarization_threshold: Token count threshold for summarization
-                                   (default: model-specific from config)
+            summarization_threshold: Deprecated/inert. Kept only for backwards
+                                   compatibility with callers that still set it
+                                   (e.g. the scheduler's legacy suppression
+                                   hack). It no longer triggers any behavior.
         """
         # Set up database path
         if db_path is None:
@@ -148,7 +154,7 @@ class EnhancedSQLiteSession(SQLiteSession):
         # Initialize base SQLiteSession
         super().__init__(session_id, db_path)
 
-        # Store configuration
+        # Inert attribute kept for backwards compatibility (see docstring).
         self.summarization_threshold = summarization_threshold
         self._title: Optional[str] = None
         self._tag: Optional[str] = None
@@ -351,12 +357,15 @@ class EnhancedSQLiteSession(SQLiteSession):
             return None
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
-        """Add items to session with automatic summarization if needed.
+        """Persist items to the session storage.
 
-        This override intercepts the items before they're saved and:
-        1. Estimates the total token count
-        2. If threshold exceeded, summarizes assistant responses
-        3. Passes processed items to the base class
+        This session is a pure storage layer: compaction is owned entirely by
+        the scheduler's ``AutoCompactManager`` + ``llm_compact_messages`` path.
+        The legacy per-user-turn summarizer that previously lived here has been
+        removed (it competed with the scheduler's modern path and used bare
+        ``print()`` which corrupted the Rich Live UI). The
+        ``summarization_threshold`` attribute is kept for backwards
+        compatibility with callers that still set it, but it is now inert.
 
         Args:
             items: List of message dictionaries to add
@@ -365,35 +374,7 @@ class EnhancedSQLiteSession(SQLiteSession):
             await super().add_items(items)
             return
 
-        # Get current session history
-        existing_items = await self.get_items()
-
-        # Combine existing and new items for token calculation
-        all_items = existing_items + items
-
-        # Estimate token count
-        total_tokens = self._estimate_tokens(all_items)
-
-        # Check if summarization is needed
-        threshold = self.summarization_threshold
-        if threshold is None:
-            model = get_model_name()
-            threshold = get_summarization_threshold(model)
-
-        # Summarize if threshold exceeded
-        if total_tokens > threshold:
-            print(f"\n[Session] Token count: {total_tokens} exceeds threshold: {threshold}")
-            print("[Session] Triggering message history summarization...")
-            all_items = await self._summarize_messages(all_items, total_tokens)
-            new_tokens = self._estimate_tokens(all_items)
-            print(f"[Session] Summarization complete: {total_tokens} -> {new_tokens} tokens")
-
-            # Clear existing items and replace with summarized version
-            await self.clear_session()
-            await super().add_items(all_items)
-        else:
-            # No summarization needed, just add new items
-            await super().add_items(items)
+        await super().add_items(items)
 
     def _estimate_tokens(self, messages: List[Dict]) -> int:
         """Accurately calculate token count for message history.
@@ -430,138 +411,6 @@ class EnhancedSQLiteSession(SQLiteSession):
             total_tokens += 4
 
         return total_tokens
-
-    async def _summarize_messages(self, messages: List[Dict], current_tokens: int) -> List[Dict]:
-        """Summarize message history using LLM when tokens exceed threshold.
-
-        Strategy:
-        - Keep all user messages (these represent user intents)
-        - Summarize assistant responses between user messages
-        - Structure: system -> user1 -> summary1 -> user2 -> summary2 -> ...
-
-        Args:
-            messages: Original message list
-            current_tokens: Current token count
-
-        Returns:
-            Summarized message list
-        """
-        # Find all user message indices
-        user_indices = [i for i, msg in enumerate(messages) if msg.get("role") == "user"]
-
-        if len(user_indices) < 1:
-            print("[Session] Insufficient messages, cannot summarize")
-            return messages
-
-        # Build new message list
-        new_messages = []
-        summary_count = 0
-
-        # Keep system message if present
-        if messages and messages[0].get("role") == "system":
-            new_messages.append(messages[0])
-
-        # Iterate through each user message and summarize execution after it
-        for i, user_idx in enumerate(user_indices):
-            # Add current user message
-            new_messages.append(messages[user_idx])
-
-            # Determine message range to summarize
-            if i < len(user_indices) - 1:
-                next_user_idx = user_indices[i + 1]
-            else:
-                next_user_idx = len(messages)
-
-            # Extract execution messages for this round
-            execution_messages = messages[user_idx + 1 : next_user_idx]
-
-            # If there are execution messages, summarize them
-            if execution_messages:
-                summary_text = await self._create_summary(execution_messages, i + 1)
-                if summary_text:
-                    summary_message = {
-                        "role": "assistant",
-                        "content": f"[Previous Response Summary]\n\n{summary_text}",
-                    }
-                    new_messages.append(summary_message)
-                    summary_count += 1
-
-        print(f"[Session] Structure: {len(user_indices)} user messages + {summary_count} summaries")
-        return new_messages
-
-    async def _create_summary(self, messages: List[Dict], round_num: int) -> str:
-        """Create a summary for one execution round using LLM.
-
-        Args:
-            messages: List of messages to summarize
-            round_num: Round number for logging
-
-        Returns:
-            Summary text, or empty string if summarization fails
-        """
-        if not messages:
-            return ""
-
-        # Build content to summarize
-        summary_content = f"Round {round_num} execution:\n\n"
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-
-            # Normalize content to string
-            if isinstance(content, (dict, list)):
-                try:
-                    content_str = json.dumps(content, ensure_ascii=False)
-                except TypeError:
-                    content_str = str(content)
-            else:
-                content_str = str(content)
-
-            if role == "assistant":
-                summary_content += f"Assistant: {content_str}\n"
-            elif role == "tool":
-                tool_name = msg.get("name", "unknown")
-                if len(content_str) > 500:
-                    content_preview = content_str[:500] + "..."
-                else:
-                    content_preview = content_str
-                summary_content += f"Tool ({tool_name}): {content_preview}\n"
-            elif role != "system":
-                summary_content += f"{role.capitalize()}: {content_str}\n"
-
-        # Call LLM to generate concise summary
-        try:
-            summary_prompt = f"""Please provide a concise summary of the following Agent execution process:
-
-{summary_content}
-
-Requirements:
-1. Focus on what tasks were completed and which tools were called
-2. Keep key execution results and important findings
-3. Be concise and clear, within 500 words
-4. Use the same language as the original content
-5. Only summarize the Agent's execution process, not user requests"""
-
-            summary_text = await llm_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an assistant skilled at summarizing Agent execution processes concisely.",
-                    },
-                    {"role": "user", "content": summary_prompt},
-                ]
-            )
-
-            print(f"[Session] Summary for round {round_num} generated successfully")
-            return summary_text
-
-        except Exception as e:
-            print(f"[Session] Summary generation failed for round {round_num}: {e}")
-            # Fallback: use truncated original content
-            truncated = (
-                summary_content[:1000] + "..." if len(summary_content) > 1000 else summary_content
-            )
-            return f"[Summary generation failed - truncated content]\n{truncated}"
 
     async def get_title(self) -> Optional[str]:
         """Get the title for this session.
@@ -717,7 +566,8 @@ Examples of good titles:
                         "content": "You are a concise title generator. Return only the title, no quotes or extra text.",
                     },
                     {"role": "user", "content": prompt},
-                ]
+                ],
+                use_small=True,
             )
             # Clean up the title
             title = title.strip().strip("\"'").strip()

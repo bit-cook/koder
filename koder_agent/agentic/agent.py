@@ -1,5 +1,6 @@
 """Agent definitions and hooks for Koder."""
 
+import asyncio
 import logging
 import os
 import uuid
@@ -35,6 +36,18 @@ from ..utils.prompts import KODER_SYSTEM_PROMPT
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+# GitHub Copilot spoof headers (shared constant, excludes x-request-id which
+# ideally should rotate per-request).
+GITHUB_COPILOT_HEADERS: dict[str, str] = {
+    "copilot-integration-id": "vscode-chat",
+    "editor-version": "vscode/1.98.1",
+    "editor-plugin-version": "copilot-chat/0.26.7",
+    "user-agent": "GitHubCopilotChat/0.26.7",
+    "openai-intent": "conversation-panel",
+    "x-github-api-version": "2025-04-01",
+    "x-vscode-user-agent-library-version": "electron-fetch",
+}
 
 
 def _log_api_error_on_retry(details):
@@ -284,45 +297,24 @@ class RetryingLitellmModel(LitellmModel):
             response_id=getattr(response, "id", None),
         )
 
-    @backoff.on_exception(
-        backoff.expo,
-        LITELLM_RETRYABLE_ERRORS,
-        max_tries=5,
-        jitter=backoff.full_jitter,
-        on_backoff=_log_api_error_on_retry,
-    )
-    async def stream_response(
+    async def _stream_via_responses_api(
         self,
         system_instructions: str | None,
         input: str | list,
         model_settings: ModelSettings,
-        tools: list,
+        cleaned_tools: list,
         output_schema,
         handoffs: list,
         tracing,
-        previous_response_id: str | None = None,
-        conversation_id: str | None = None,  # unused for LiteLLM responses
-        prompt: Any | None = None,
+        *,
+        previous_response_id: str | None,
+        prompt: Any | None,
     ):
-        # Clean tools for GitHub Copilot compatibility
-        cleaned_tools = self._clean_tools_for_github_copilot(tools)
+        """Stream via the custom LiteLLM Responses API path.
 
-        if not self._should_use_responses_api():
-            async for chunk in super().stream_response(
-                system_instructions,
-                input,
-                model_settings,
-                cleaned_tools,
-                output_schema,
-                handoffs,
-                tracing,
-                previous_response_id=previous_response_id,
-                conversation_id=conversation_id,
-                prompt=prompt,
-            ):
-                yield chunk
-            return
-
+        Yields ``TResponseStreamEvent`` objects identical to the original
+        implementation. The caller is responsible for retry handling.
+        """
         with generation_span(
             model=str(self.model),
             model_config=model_settings.to_json_dict()
@@ -380,6 +372,92 @@ class RetryingLitellmModel(LitellmModel):
                     )
                 except Exception:
                     pass
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list,
+        model_settings: ModelSettings,
+        tools: list,
+        output_schema,
+        handoffs: list,
+        tracing,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,  # unused for LiteLLM responses
+        prompt: Any | None = None,
+    ):
+        """Stream model output with retry-before-first-chunk semantics.
+
+        ``backoff.on_exception`` cannot wrap an async-generator function: it
+        only detects coroutine functions, so for an async generator it would
+        return the generator object without ever wrapping the iteration, and
+        retries would never fire. Instead we implement the retry loop manually
+        here.
+
+        A retryable error is only retried while NO chunk has been yielded
+        downstream yet. Once any chunk has reached the consumer, retrying would
+        replay partial output (duplicate tokens), so the error is re-raised
+        instead.
+        """
+        # Clean tools for GitHub Copilot compatibility
+        cleaned_tools = self._clean_tools_for_github_copilot(tools)
+
+        max_tries = 5
+        attempt = 0
+        # backoff.expo yields 1, 2, 4, 8, ... seconds; full_jitter randomizes
+        # each wait within [0, value]. We mirror that timing manually.
+        wait_gen = backoff.expo()
+        next(wait_gen)  # prime the generator (first value is the base)
+
+        while True:
+            attempt += 1
+            yielded_any = False
+            try:
+                if self._should_use_responses_api():
+                    source = self._stream_via_responses_api(
+                        system_instructions,
+                        input,
+                        model_settings,
+                        cleaned_tools,
+                        output_schema,
+                        handoffs,
+                        tracing,
+                        previous_response_id=previous_response_id,
+                        prompt=prompt,
+                    )
+                else:
+                    source = super().stream_response(
+                        system_instructions,
+                        input,
+                        model_settings,
+                        cleaned_tools,
+                        output_schema,
+                        handoffs,
+                        tracing,
+                        previous_response_id=previous_response_id,
+                        conversation_id=conversation_id,
+                        prompt=prompt,
+                    )
+
+                async for chunk in source:
+                    yielded_any = True
+                    yield chunk
+                return
+            except LITELLM_RETRYABLE_ERRORS as exc:
+                # Once any chunk has been emitted downstream, a retry would
+                # replay partial output. Propagate instead.
+                if yielded_any or attempt >= max_tries:
+                    raise
+                _log_api_error_on_retry(
+                    {
+                        "exception": exc,
+                        "tries": attempt,
+                        "max_tries": max_tries,
+                    }
+                )
+                wait = backoff.full_jitter(next(wait_gen))
+                await asyncio.sleep(wait)
+                continue
 
 
 def _get_skills_metadata(config) -> str:
@@ -464,12 +542,17 @@ async def create_dev_agent(
     )
 
     all_deferred = list(tools)  # Start with regular tools
-    for server in mcp_servers:
-        try:
-            server_tools = await server.list_tools()
-            all_deferred.extend(server_tools)
-        except Exception:
-            pass  # Server may not support list_tools or may not be connected yet
+    # Start all MCP servers in parallel for faster initialization
+    if mcp_servers:
+        results = await asyncio.gather(
+            *[server.list_tools() for server in mcp_servers], return_exceptions=True
+        )
+        for server, result in zip(mcp_servers, results):
+            if isinstance(result, BaseException):
+                server_name = getattr(server, "name", "unknown")
+                logger.warning("MCP server '%s' failed to list tools: %s", server_name, result)
+            else:
+                all_deferred.extend(result)
     _set_deferred_tools(all_deferred if tool_search_mode != "false" else None)
 
     model_override_value = None if model_override in (None, "", "inherit") else str(model_override)
@@ -539,15 +622,14 @@ async def create_dev_agent(
     )
 
     if "github_copilot" in model_name_str:
+        # NOTE: x-request-id is generated once here and reused for all requests
+        # in this agent's lifetime. The openai-agents SDK applies extra_headers
+        # statically — it does not support per-request dynamic header generation.
+        # A truly rotating request id would require SDK-level support (e.g. a
+        # callable header factory). This is a known limitation.
         dev_agent.model_settings.extra_headers = {
-            "copilot-integration-id": "vscode-chat",
-            "editor-version": "vscode/1.98.1",
-            "editor-plugin-version": "copilot-chat/0.26.7",
-            "user-agent": "GitHubCopilotChat/0.26.7",
-            "openai-intent": "conversation-panel",
-            "x-github-api-version": "2025-04-01",
+            **GITHUB_COPILOT_HEADERS,
             "x-request-id": str(uuid.uuid4()),
-            "x-vscode-user-agent-library-version": "electron-fetch",
         }
 
     # planner.handoffs.append(dev_agent)

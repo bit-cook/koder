@@ -28,6 +28,7 @@ TURN_ASSERTION_KEYS = (
     "expect_all",
     "expect_regex",
     "expect_not",
+    "expect_bottom_all",
     "expect_session_dead",
     "expect_tmux_panes_min",
     "expect_tmux_any_pane_any",
@@ -283,6 +284,30 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                 for key in ("log_file", "ready_file"):
                     if not isinstance(fake_openai.get(key), str) or not fake_openai[key].strip():
                         errors.append(f"{ref.suite}/{ref.name}: fake_openai.{key} is required")
+                scenario_name = fake_openai.get("scenario")
+                if scenario_name is not None and scenario_name not in {
+                    "single",
+                    "streaming_tool_queue",
+                }:
+                    errors.append(
+                        f"{ref.suite}/{ref.name}: fake_openai.scenario must be single "
+                        "or streaming_tool_queue"
+                    )
+                stream_delay = fake_openai.get("stream_delay")
+                if stream_delay is not None and not isinstance(stream_delay, (int, float)):
+                    errors.append(
+                        f"{ref.suite}/{ref.name}: fake_openai.stream_delay must be a number"
+                    )
+                stream_lines = fake_openai.get("stream_lines")
+                if stream_lines is not None and (
+                    not isinstance(stream_lines, int)
+                    or isinstance(stream_lines, bool)
+                    or stream_lines <= 0
+                ):
+                    errors.append(
+                        f"{ref.suite}/{ref.name}: fake_openai.stream_lines must be a "
+                        "positive integer"
+                    )
         turns = payload.get("turns")
         if not isinstance(turns, list) or len(turns) < 2:
             errors.append(f"{ref.suite}/{ref.name}: at least two interactive turns are required")
@@ -336,11 +361,13 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
             expect_all = turn.get("expect_all", [])
             expect_regex = turn.get("expect_regex", [])
             expect_not = turn.get("expect_not", [])
+            expect_bottom_all = turn.get("expect_bottom_all", [])
             for field_name, field_value in (
                 ("expect_any", expect_any),
                 ("expect_all", expect_all),
                 ("expect_regex", expect_regex),
                 ("expect_not", expect_not),
+                ("expect_bottom_all", expect_bottom_all),
             ):
                 if field_value and (
                     not isinstance(field_value, list)
@@ -372,6 +399,7 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                 and not expect_all
                 and not expect_regex
                 and not expect_not
+                and not expect_bottom_all
                 and not has_tmux_pane_assertion
             ):
                 errors.append(f"{ref.suite}/{ref.name}: turn {index} needs an assertion")
@@ -587,19 +615,27 @@ def _start_fake_openai(scenario: ScenarioRef, *, home: Path, repo: Path) -> subp
     if ready_file.exists():
         ready_file.unlink()
 
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "fake_openai_chat_server.py"),
+        "--port",
+        str(fake_openai["port"]),
+        "--response",
+        fake_openai["response"],
+        "--log-file",
+        str(log_file),
+        "--ready-file",
+        str(ready_file),
+    ]
+    if fake_openai.get("scenario"):
+        command.extend(["--scenario", str(fake_openai["scenario"])])
+    if fake_openai.get("stream_delay") is not None:
+        command.extend(["--stream-delay", str(fake_openai["stream_delay"])])
+    if fake_openai.get("stream_lines") is not None:
+        command.extend(["--stream-lines", str(fake_openai["stream_lines"])])
+
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(PROJECT_ROOT / "scripts" / "fake_openai_chat_server.py"),
-            "--port",
-            str(fake_openai["port"]),
-            "--response",
-            fake_openai["response"],
-            "--log-file",
-            str(log_file),
-            "--ready-file",
-            str(ready_file),
-        ],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -688,6 +724,13 @@ def _capture_for_turn(session: str, turn: dict[str, Any]) -> str:
     if turn.get("capture") == "visible":
         return _capture_visible(session)
     return _capture(session)
+
+
+def _bottom_assertions_pass(capture: str, expected: list[str], *, window: int) -> bool:
+    if not expected:
+        return True
+    tail = "\n".join(capture.splitlines()[-max(1, window) :])
+    return all(item in tail for item in expected)
 
 
 def _list_panes(session: str) -> list[str]:
@@ -798,12 +841,20 @@ def _wait_for_assertions(
             expect_any = _expected_strings(turn.get("expect_any", []), home=home, repo=repo)
             expect_regex = _expected_strings(turn.get("expect_regex", []), home=home, repo=repo)
             expect_not = _expected_strings(turn.get("expect_not", []), home=home, repo=repo)
+            expect_bottom_all = _expected_strings(
+                turn.get("expect_bottom_all", []), home=home, repo=repo
+            )
             all_ok = all(item in last for item in expect_all)
             any_ok = True if not expect_any else any(item in last for item in expect_any)
             regex_ok = all(re.search(pattern, last) for pattern in expect_regex)
             not_ok = all(item not in last for item in expect_not)
+            bottom_ok = _bottom_assertions_pass(
+                last,
+                expect_bottom_all,
+                window=int(turn.get("expect_bottom_window", 6)),
+            )
             pane_ok, _pane_outputs = _tmux_pane_assertions_pass(session, turn)
-            if all_ok and any_ok and regex_ok and not_ok and pane_ok:
+            if all_ok and any_ok and regex_ok and not_ok and bottom_ok and pane_ok:
                 return True, last
         time.sleep(0.5)
     if _session_exists(session):

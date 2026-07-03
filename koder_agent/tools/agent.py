@@ -9,6 +9,7 @@ for prompt cache sharing and context continuity.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import replace as _replace
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Optional
 from pydantic import BaseModel
 
 from .compat import function_tool
+
+logger = logging.getLogger(__name__)
 
 # Fork context available via tools/fork_agent.py build_fork_context()
 # Pass result via AgentService seed_items parameter for context inheritance
@@ -105,8 +108,7 @@ async def _agent_tool_impl(
                 fork_ctx = build_fork_context(parent_messages)
                 seed_items = fork_ctx.to_messages()
         except Exception:
-            # If we can't get parent messages, just proceed without fork context
-            pass
+            logger.debug("Failed to get parent session messages for fork context", exc_info=True)
 
     # Check if background tasks are disabled via env var
     bg_disabled = os.environ.get("KODER_DISABLE_BACKGROUND_TASKS", "").strip().lower() in {

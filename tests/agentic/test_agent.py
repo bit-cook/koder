@@ -1,9 +1,18 @@
 import asyncio
 import copy
 
+import litellm.exceptions
+from agents.extensions.models.litellm_model import LitellmModel
+
 from koder_agent.agentic.agent import RetryingLitellmModel, create_dev_agent
 
 _MISSING = object()
+
+
+def _retryable_error(message="boom"):
+    return litellm.exceptions.InternalServerError(
+        message=message, model="test-model", llm_provider="test-provider"
+    )
 
 
 class DummyTool:
@@ -98,6 +107,113 @@ def test_clean_tools_handles_empty_list():
 
     assert result is tools
     assert result == []
+
+
+def test_stream_response_retries_before_first_chunk(monkeypatch):
+    """A retryable error raised before any chunk is yielded triggers a retry
+    and ultimately succeeds."""
+    model = _make_model("gpt-4")  # not the responses API path
+    calls = {"n": 0}
+
+    async def fake_super_stream(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _retryable_error("transient")
+        for chunk in ["a", "b", "c"]:
+            yield chunk
+
+    monkeypatch.setattr(LitellmModel, "stream_response", fake_super_stream)
+    # Avoid real sleeps between retries.
+    monkeypatch.setattr("koder_agent.agentic.agent.asyncio.sleep", _no_sleep)
+
+    async def run():
+        out = []
+        async for chunk in model.stream_response(
+            None, "in", _DummySettings(), [], None, [], _DummyTracing()
+        ):
+            out.append(chunk)
+        return out
+
+    result = asyncio.run(run())
+
+    assert result == ["a", "b", "c"]
+    assert calls["n"] == 2  # failed once, retried, succeeded
+
+
+def test_stream_response_does_not_retry_after_first_chunk(monkeypatch):
+    """A retryable error raised AFTER a chunk has been yielded propagates and is
+    NOT retried (retrying would replay partial output)."""
+    model = _make_model("gpt-4")
+    calls = {"n": 0}
+
+    async def fake_super_stream(*args, **kwargs):
+        calls["n"] += 1
+        yield "first"
+        raise _retryable_error("mid-stream")
+
+    monkeypatch.setattr(LitellmModel, "stream_response", fake_super_stream)
+    monkeypatch.setattr("koder_agent.agentic.agent.asyncio.sleep", _no_sleep)
+
+    async def run():
+        out = []
+        async for chunk in model.stream_response(
+            None, "in", _DummySettings(), [], None, [], _DummyTracing()
+        ):
+            out.append(chunk)
+        return out
+
+    raised = None
+    try:
+        asyncio.run(run())
+    except litellm.exceptions.InternalServerError as exc:
+        raised = exc
+
+    assert raised is not None  # error propagated
+    assert calls["n"] == 1  # only one attempt, no retry
+
+
+def test_get_response_retries(monkeypatch):
+    """get_response retry still works (fails once then succeeds)."""
+    model = _make_model("gpt-4")
+    calls = {"n": 0}
+    sentinel = object()
+
+    async def fake_super_get(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _retryable_error("transient-get")
+        return sentinel
+
+    monkeypatch.setattr(LitellmModel, "get_response", fake_super_get)
+    monkeypatch.setattr("koder_agent.agentic.agent.asyncio.sleep", _no_sleep)
+    # backoff uses time.sleep for the sync wrapper around the coroutine driver;
+    # patch the module the decorator uses so retries don't actually wait.
+    monkeypatch.setattr("backoff._async.asyncio.sleep", _no_sleep, raising=False)
+
+    async def run():
+        return await model.get_response(None, "in", _DummySettings(), [], None, [], _DummyTracing())
+
+    result = asyncio.run(run())
+
+    assert result is sentinel
+    assert calls["n"] == 2  # failed once, retried, succeeded
+
+
+class _DummySettings:
+    def to_json_dict(self):
+        return {}
+
+
+class _DummyTracing:
+    def is_disabled(self):
+        return True
+
+    def include_data(self):
+        return False
+
+
+async def _no_sleep(_seconds):
+    return None
 
 
 def test_create_dev_agent_uses_model_client_snapshot_for_litellm(monkeypatch):

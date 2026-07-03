@@ -2729,6 +2729,95 @@
         }
       ]
     },
+    "goal": {
+      "validation_level": "acceptance",
+      "purpose": "Inspect and manage a durable session goal without invoking a provider-backed turn.",
+      "acceptance_criteria": [
+        "an empty session reports goal usage and a clear no-goal state",
+        "a seeded goal is rendered with status, objective, time, token usage, and budget",
+        "goal budget updates preserve accumulated usage",
+        "pausing and editing a stopped goal avoid starting a model turn",
+        "clearing the goal removes it from the active session"
+      ],
+      "acceptance_artifacts": [
+        "empty goal capture",
+        "seeded goal capture",
+        "budget, pause, edit, and clear captures",
+        "goal-proof.txt seed marker"
+      ],
+      "turns": [
+        {
+          "send": "/goal",
+          "expect_all": [
+            "No goal is currently set.",
+            "Usage: /goal",
+            "Example: /goal improve benchmark coverage"
+          ]
+        },
+        {
+          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import asyncio,sqlite3; from pathlib import Path; from koder_agent.core.goals import GoalAccountingMode, GoalStatus, GoalStore; db=Path.home()/\".koder\"/\"koder.db\"; conn=sqlite3.connect(db); sid=conn.execute(\"select session_id from session_metadata order by updated_at desc limit 1\").fetchone()[0]; store=GoalStore(db_path=str(db)); asyncio.run(store.replace_goal(sid, \"ship durable goals\", GoalStatus.ACTIVE, token_budget=50000)); asyncio.run(store.account_usage(sid, time_delta_seconds=90, token_delta=1200, mode=GoalAccountingMode.ACTIVE_ONLY)); asyncio.run(store.close()); Path(\"goal-proof.txt\").write_text(\"goal-seeded\\n\", encoding=\"utf-8\"); print(\"goal-seeded\", sid)'",
+          "expect_all": [
+            "goal-seeded"
+          ]
+        },
+        {
+          "send": "/goal",
+          "expect_all": [
+            "Status: active",
+            "Objective: ship durable goals",
+            "Time used: 1m",
+            "Tokens used: 1.2K",
+            "Token budget: 50K",
+            "Commands: /goal edit, /goal pause, /goal clear"
+          ]
+        },
+        {
+          "send": "/goal budget 75000",
+          "expect_all": [
+            "Goal active",
+            "Objective: ship durable goals",
+            "Tokens: 1.2K/75K."
+          ]
+        },
+        {
+          "send": "/goal pause",
+          "expect_all": [
+            "Goal paused",
+            "Objective: ship durable goals",
+            "Tokens: 1.2K/75K."
+          ]
+        },
+        {
+          "send": "/goal edit ship durable goals carefully --budget 80000",
+          "expect_all": [
+            "Goal paused",
+            "Objective: ship durable goals carefully",
+            "Tokens: 1.2K/80K."
+          ]
+        },
+        {
+          "send": "/goal clear",
+          "expect_all": [
+            "Goal cleared"
+          ]
+        },
+        {
+          "send": "/goal",
+          "expect_all": [
+            "No goal is currently set.",
+            "Usage: /goal"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$REPO/goal-proof.txt",
+            "goal-seeded"
+          ]
+        }
+      ]
+    },
     "help": {
       "validation_level": "acceptance",
       "purpose": "Display the full command catalog with real descriptions, command-specific help, and unknown-command guidance.",
@@ -5782,7 +5871,7 @@
           "expect_all": [
             "No scheduled tasks",
             "cron_create",
-            "/loop skill"
+            "/loop"
           ]
         },
         {
@@ -5847,6 +5936,106 @@
           "file_contains": [
             "$HOME/.koder/scheduled_tasks.json",
             "{not json"
+          ]
+        }
+      ]
+    },
+    "loop": {
+      "validation_level": "acceptance",
+      "purpose": "Create, inspect, and delete scheduled loop jobs through the real slash command backed by cron storage.",
+      "acceptance_criteria": [
+        "an empty loop registry renders usage and creation examples",
+        "/loop creates recurring jobs from @every aliases",
+        "/loop creates one-shot jobs from an explicit once prefix",
+        "/loop list renders id, cron expression, human-readable schedule, recurring flag, and prompt",
+        "unsupported thread-local @after-turn schedules return a clear error",
+        "deleting a backing cron job is reflected by /loop"
+      ],
+      "acceptance_artifacts": [
+        "empty-state capture",
+        "loop create/list captures",
+        "unsupported schedule capture",
+        "scheduled_tasks.json fixture",
+        "loop-proof.txt deletion proof"
+      ],
+      "turns": [
+        {
+          "send": "/loop",
+          "expect_all": [
+            "No loop jobs",
+            "Usage: /loop",
+            "@every 5m"
+          ]
+        },
+        {
+          "send": "/loop @every 5m check build",
+          "expect_all": [
+            "Loop job created",
+            "cron: */5 * * * *",
+            "recurring: true",
+            "prompt: check build"
+          ]
+        },
+        {
+          "send": "/loop once 30 14 * * 1 monday review",
+          "expect_all": [
+            "Loop job created",
+            "cron: 30 14 * * 1",
+            "recurring: false",
+            "prompt: monday review"
+          ]
+        },
+        {
+          "send": "/loop list",
+          "expect_all": [
+            "Loop jobs (2):",
+            "cron: */5 * * * *",
+            "prompt: check build",
+            "cron: 30 14 * * 1",
+            "recurring: false",
+            "prompt: monday review"
+          ]
+        },
+        {
+          "send": "/loop @after-turn follow up",
+          "expect_all": [
+            "loop: unsupported schedule",
+            "@after-turn"
+          ]
+        },
+        {
+          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import json; from pathlib import Path; from koder_agent.tools.cron import cron_delete, cron_list; jobs=json.loads(cron_list())[\"jobs\"]; cron_delete(jobs[0][\"id\"]); content=Path.home().joinpath(\".koder\", \"scheduled_tasks.json\").read_text(encoding=\"utf-8\"); ok=(\"monday review\" in content and \"check build\" not in content); marker=\"loop-\"+\"delete-ok\"; fail=\"loop-\"+\"delete-failed\"; Path(\"loop-proof.txt\").write_text((marker if ok else fail)+\"\\n\", encoding=\"utf-8\"); print(marker if ok else fail)'",
+          "expect_all": [
+            "loop-delete-ok"
+          ]
+        },
+        {
+          "send": "/loop",
+          "capture": "visible",
+          "expect_all": [
+            "Loop jobs (1):",
+            "cron: 30 14 * * 1",
+            "prompt: monday review"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$REPO/loop-proof.txt",
+            "loop-delete-ok"
+          ]
+        },
+        {
+          "file_contains": [
+            "$HOME/.koder/scheduled_tasks.json",
+            "monday review"
+          ]
+        },
+        {
+          "file_not_contains": [
+            "$HOME/.koder/scheduled_tasks.json",
+            "check build"
           ]
         }
       ]
@@ -9513,6 +9702,192 @@
           "expect_not": [
             "scenario-secret-worker-key"
           ]
+        }
+      ]
+    },
+    "fixed-bottom-queued-input": {
+      "validation_level": "acceptance",
+      "purpose": "Validate that interactive streaming keeps output above a fixed bottom input/status area, accepts mid-stream input, displays queued rows, and injects queued prompts into the next tool result.",
+      "env": {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19090/v1",
+        "KODER_API_KEY": "fixed-bottom-secret-token"
+      },
+      "fake_openai": {
+        "port": 19090,
+        "response": "final answer after queued input",
+        "log_file": "$HOME/fake-openai-fixed-bottom-queue.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-queue.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.08,
+        "stream_lines": 80
+      },
+      "acceptance_criteria": [
+        "streaming output remains visible while the bottom input frame is still visible",
+        "typing and submitting during streaming creates a gray queued row above the input frame",
+        "the queued row is cleared after the next tool output is delivered",
+        "the next model request contains the queued user input appended to the tool result"
+      ],
+      "acceptance_artifacts": [
+        "streaming visible capture with fixed prompt",
+        "queued-row visible capture",
+        "post-tool visible capture with queue cleared",
+        "fake provider request log with queued input in tool output"
+      ],
+      "turns": [
+        {
+          "send": "Use the sample file tool before answering.",
+          "capture": "visible",
+          "expect_all": [
+            "streaming fixture long line 050",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "streaming fixture long line 001"
+          ],
+          "timeout": 8
+        },
+        {
+          "type": "queued from tmux while streaming",
+          "keys": [
+            "Enter"
+          ],
+          "capture": "visible",
+          "expect_all": [
+            "queued: queued from tmux while streaming",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ],
+          "expect_regex": [
+            "queued: queued from tmux while streaming\\n\\u250c.*\\| \\u26a1 Koder \\|"
+          ],
+          "expect_not": [
+            "Tip:"
+          ],
+          "timeout": 8
+        },
+        {
+          "wait": 4,
+          "capture": "visible",
+          "expect_all": [
+            "final answer after queued input",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "queued: queued from tmux while streaming"
+          ],
+          "timeout": 16
+        },
+        {
+          "send": "hello after prior output",
+          "wait": 1.1,
+          "capture": "visible",
+          "expect_all": [
+            "streaming fixture long line 010",
+            "final answer after queued input",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ],
+          "timeout": 0.8
+        },
+        {
+          "wait": 4,
+          "capture": "visible",
+          "expect_all": [
+            "final answer after queued input",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "Tip:",
+            "| \u26a1 Koder |"
+          ],
+          "expect_regex": [
+            "Tip: .*\\n\\u250c.*\\| \\u26a1 Koder \\|"
+          ],
+          "timeout": 16
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$HOME/fake-openai-fixed-bottom-queue.log",
+            [
+              "Queued user input",
+              "queued from tmux while streaming",
+              "sample.txt"
+            ]
+          ]
+        }
+      ]
+    },
+    "fixed-bottom-idle-tip": {
+      "validation_level": "acceptance",
+      "purpose": "Validate that a short response leaves the tip, input frame, and status line together at the bottom of the visible terminal.",
+      "env": {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19091/v1",
+        "KODER_API_KEY": "fixed-bottom-tip-secret-token"
+      },
+      "fake_openai": {
+        "port": 19091,
+        "response": "final answer after queued input",
+        "log_file": "$HOME/fake-openai-fixed-bottom-tip.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-tip.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.01,
+        "stream_lines": 1
+      },
+      "acceptance_criteria": [
+        "short output is visible without scrolling after the prompt returns",
+        "the tip line stays attached to the bottom input/status area",
+        "the bottom prompt remains visible after the short response completes"
+      ],
+      "acceptance_artifacts": [
+        "short-response visible capture with bottom tip and prompt",
+        "bottom-window text assertion containing both Tip and Koder prompt"
+      ],
+      "turns": [
+        {
+          "send": "Use the sample file tool for a short answer.",
+          "capture": "visible",
+          "expect_all": [
+            "final answer after queued input",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "Tip:",
+            "| \u26a1 Koder |"
+          ],
+          "expect_regex": [
+            "Tip: .*\\n\\u250c.*\\| \\u26a1 Koder \\|"
+          ],
+          "timeout": 12
+        },
+        {
+          "send": "another short answer after prior output",
+          "capture": "visible",
+          "expect_all": [
+            "final answer after queued input",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "Tip:",
+            "| \u26a1 Koder |"
+          ],
+          "expect_regex": [
+            "Tip: .*\\n\\u250c.*\\| \\u26a1 Koder \\|"
+          ],
+          "timeout": 12
         }
       ]
     },

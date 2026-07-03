@@ -164,7 +164,7 @@ class AntigravityOAuthProvider(OAuthProvider):
                     if response.ok:
                         return await response.json()
         except Exception:
-            pass
+            logger.debug("Failed to fetch Antigravity user info", exc_info=True)
         return None
 
     async def revoke_token(self, token: str) -> bool:
@@ -253,7 +253,7 @@ class AntigravityOAuthProvider(OAuthProvider):
                         tier_id = paid_tier.get("id") or current_tier.get("id")
                         return project_id, tier_id
         except Exception:
-            pass
+            logger.debug("Failed to fetch Antigravity project context", exc_info=True)
         return None, None
 
     async def _fetch_available_models(
@@ -743,6 +743,7 @@ class AntigravityOAuthLLM(CustomLLM):
                             if isinstance(project, dict) and project.get("id"):
                                 return project["id"]
                 except Exception:
+                    logger.debug("Failed to discover Antigravity project ID", exc_info=True)
                     continue
 
         return None

@@ -4,8 +4,11 @@ import asyncio
 import time
 from unittest.mock import patch
 
-from koder_agent.core.interactive import InteractivePrompt
+import pytest
+
+from koder_agent.core.interactive import InteractivePrompt, StreamingOutputController
 from koder_agent.core.keybindings import KeybindingManager
+from koder_agent.core.queued_input import QueuedInputManager
 from koder_agent.harness.tips import TipManager
 
 
@@ -67,17 +70,15 @@ class TestTipsDisplay:
         tip3 = mgr.get_tip()
         assert tip3 is not None
 
-    def test_show_tip_displays_message(self, capsys):
-        """show_tip should display a tip from TipManager."""
+    def test_show_tip_stores_message_for_bottom_prompt(self):
+        """show_tip should render with the next bottom prompt, not in scrollback."""
         prompt = InteractivePrompt(commands={})
 
         # Mock TipManager to return a specific tip
         with patch.object(prompt.tip_manager, "get_tip", return_value="Test tip message"):
             prompt.show_tip()
 
-        # Can't easily capture Rich console output in pytest,
-        # but we can verify the method doesn't crash
-        assert True
+        assert prompt._pending_tip_text == "Test tip message"
 
     def test_show_tip_handles_no_tip(self):
         """show_tip should handle gracefully when no tip is available."""
@@ -87,7 +88,16 @@ class TestTipsDisplay:
         with patch.object(prompt.tip_manager, "get_tip", return_value=None):
             prompt.show_tip()  # Should not crash
 
-        assert True
+        assert prompt._pending_tip_text is None
+
+    def test_prompt_tip_hides_while_streaming_or_queueing(self):
+        """Tips should not steal rows from active streaming/queued input UI."""
+        from koder_agent.core.interactive import _should_show_prompt_tip
+
+        assert _should_show_prompt_tip("Tip: hello", queue_mode=False, has_pending_queue=False)
+        assert not _should_show_prompt_tip("Tip: hello", queue_mode=True, has_pending_queue=False)
+        assert not _should_show_prompt_tip("Tip: hello", queue_mode=True, has_pending_queue=True)
+        assert not _should_show_prompt_tip(None, queue_mode=False, has_pending_queue=False)
 
 
 class TestNotifications:
@@ -170,6 +180,15 @@ class TestNotifications:
 class TestIntegration:
     """Integration tests for runtime features."""
 
+    def test_streaming_output_cursor_tracks_latest_line(self):
+        """The streaming output pane should keep prompt_toolkit scrolled to the tail."""
+        controller = StreamingOutputController()
+
+        controller.set_message("one\ntwo\nthree")
+
+        cursor = controller.cursor_position()
+        assert (cursor.x, cursor.y) == (0, 2)
+
     def test_full_response_lifecycle(self):
         """Test full lifecycle: start -> complete -> tip + notification."""
         prompt = InteractivePrompt(commands={})
@@ -189,3 +208,24 @@ class TestIntegration:
 
             # Tip should have been requested
             prompt.tip_manager.get_tip.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_capture_queued_input_exposes_streaming_output_controller(self, monkeypatch):
+        """Queued-input capture should give the scheduler a single TUI update target."""
+        prompt = InteractivePrompt(commands={})
+        queue_manager = QueuedInputManager()
+        calls = []
+
+        async def fake_run_input_app(**kwargs):
+            calls.append(kwargs)
+            await kwargs["stop_event"].wait()
+
+        monkeypatch.setattr(prompt, "_run_input_app", fake_run_input_app)
+
+        async with prompt.capture_queued_input(queue_manager) as stream_output:
+            assert stream_output is not None
+            assert hasattr(stream_output, "update_output")
+            assert calls[0]["queue_manager"] is queue_manager
+            assert calls[0]["stream_output"] is stream_output
+
+        assert calls[0]["stop_event"].is_set()

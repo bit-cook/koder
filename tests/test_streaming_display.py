@@ -382,6 +382,43 @@ def test_full_display_flow_write_file(display_manager):
     assert content is not None
 
 
+def test_tool_output_display_hides_queued_user_input_block(display_manager):
+    """Queued prompts are model-visible, but should not alter user-facing tool summaries."""
+
+    class MockToolCallItem:
+        class RawItem:
+            name = "read_file"
+            arguments = '{"path": "sample.txt"}'
+            call_id = "read-queued-123"
+
+        raw_item = RawItem()
+
+    display_manager.handle_tool_called(MockToolCallItem())
+
+    class MockToolOutputItem:
+        output = (
+            "1|initial\n"
+            "2|changed\n\n"
+            "[Queued user input]\n"
+            "The user submitted the following input while this tool was running.\n"
+            "1. queued from tmux while streaming"
+        )
+        tool_call_id = "read-queued-123"
+
+        class RawItem:
+            pass
+
+        raw_item = RawItem()
+
+    display_manager.handle_tool_output(MockToolOutputItem())
+
+    final_display = display_manager.get_final_display()
+
+    assert "Read 2 lines" in final_display
+    assert "Queued user input" not in final_display
+    assert "queued from tmux while streaming" not in final_display
+
+
 def test_reasoning_summary_renders_but_is_excluded_from_final_text(display_manager):
     """Reasoning sections should be visible without becoming assistant text."""
 

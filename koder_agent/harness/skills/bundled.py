@@ -62,9 +62,11 @@ def _definitions() -> list[BundledSkillDefinition]:
             name="loop",
             description="Run a prompt or slash command on a recurring interval.",
             argument_hint="[interval] <prompt>",
+            disable_model_invocation=True,
             content=(
-                "Schedule a recurring action for $ARGUMENTS.\n\n"
-                "Parse the interval, confirm the cadence, and then execute the prompt once immediately."
+                "Use the /loop runtime command for $ARGUMENTS.\n\n"
+                "Create, list, or delete durable scheduled prompts via /loop rather than invoking "
+                "this bundled skill through the model."
             ),
         ),
         BundledSkillDefinition(

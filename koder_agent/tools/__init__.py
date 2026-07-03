@@ -19,7 +19,6 @@ from .cron import (
     cron_list,
     cron_list_tool,
 )
-from .engine import ToolEngine
 from .file import (
     FileEditModel,
     FileReadModel,
@@ -32,6 +31,7 @@ from .file import (
     read_file,
     write_file,
 )
+from .goal import create_goal, get_goal, update_goal
 from .mcp_resource import list_mcp_resources, read_mcp_resource
 from .notebook_edit import notebook_edit
 from .plan_mode import (
@@ -91,39 +91,6 @@ from .worktree import (
     exit_worktree,
     exit_worktree_tool,
 )
-
-# Create the global tool engine
-tool_engine = ToolEngine()
-
-# Register all tools
-tool_engine.register(FileReadModel)(read_file)
-tool_engine.register(FileWriteModel)(write_file)
-tool_engine.register(FileWriteModel)(append_file)
-tool_engine.register(FileEditModel)(edit_file)
-tool_engine.register(ShellModel)(run_shell)
-tool_engine.register(PowerShellModel)(run_powershell)
-tool_engine.register(ShellOutputModel)(shell_output)
-tool_engine.register(ShellKillModel)(shell_kill)
-tool_engine.register(SearchModel)(web_search)
-tool_engine.register(GlobModel)(glob_search)
-tool_engine.register(GrepModel)(grep_search)
-tool_engine.register(CodeIntelligenceModel)(code_intelligence)
-tool_engine.register(LSModel)(list_directory)
-# TODO tools are already registered via @function_tool decorator
-# Removing duplicate registration to avoid naming conflicts
-tool_engine.register(SkillModel)(get_skill)
-tool_engine.register(WebFetchModel)(web_fetch)
-tool_engine.register(TaskDelegateModel)(task_delegate)
-tool_engine.register(GitModel)(git_command)
-tool_engine.register(AgentToolModel)(agent_tool)
-tool_engine.register(SendMessageModel)(send_message)
-tool_engine.register(TeamCreateModel)(team_create)
-tool_engine.register(TeamDeleteModel)(team_delete)
-# New orchestration tools (registered via @function_tool, models listed for completeness)
-tool_engine.register(TaskCreateModel)(task_create)
-tool_engine.register(TaskUpdateModel)(task_update)
-tool_engine.register(TaskGetModel)(task_get)
-tool_engine.register(TaskListModel)(task_list)
 
 
 def get_all_tools() -> List[Tool]:
@@ -186,6 +153,10 @@ def get_all_tools() -> List[Tool]:
         notebook_edit,
         # Sleep (self-throttling)
         sleep_tool,
+        # Goals (long-running objectives)
+        get_goal,
+        create_goal,
+        update_goal,
         # MCP resource tools
         list_mcp_resources,
         read_mcp_resource,
@@ -213,7 +184,6 @@ def get_all_tools() -> List[Tool]:
 
 
 __all__ = [
-    "tool_engine",
     "get_all_tools",
     # Manager for cleanup
     "BackgroundShellManager",
@@ -275,6 +245,9 @@ __all__ = [
     "todo_write",
     "task_delegate",
     "get_skill",
+    "get_goal",
+    "create_goal",
+    "update_goal",
     "agent_tool",
     "send_message",
     "team_create",
