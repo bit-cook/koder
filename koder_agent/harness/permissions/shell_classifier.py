@@ -209,6 +209,40 @@ DANGEROUS_PATTERNS = [
 WRITE_REDIRECTION_PATTERN = re.compile(r"(?:^|[^\d])>>?(?!\s*/dev/null\b)")
 COMMAND_SPLIT_PATTERN = re.compile(r"\s*(?:\|\||&&|[|;])\s*")
 
+# Shell operators that separate command segments during quote-aware tokenization.
+_SEGMENT_SEPARATORS = {"|", "||", "&&", ";", ";;", "&"}
+# Redirection-style operator tokens emitted by shlex punctuation_chars mode; these
+# are not command words and must not be classified as such.
+_REDIRECTION_TOKENS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", "&>>", "|&"}
+
+
+def _tokenize_segments(raw: str) -> list[list[str]]:
+    """Split a command into per-segment token lists, honoring shell quoting.
+
+    Uses ``shlex`` with ``punctuation_chars`` so operators like ``|`` and ``&&``
+    inside quotes (e.g. ``grep "a\\|b"``) stay part of their word instead of
+    being treated as segment separators. Raises ``ValueError`` on genuinely
+    malformed input (e.g. unbalanced quotes).
+    """
+    lexer = shlex.shlex(raw, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SEGMENT_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        if token in _REDIRECTION_TOKENS or (token and all(ch in ";&|<>" for ch in token)):
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
 
 @dataclass(frozen=True)
 class ShellCommandDecision:
@@ -295,17 +329,18 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             )
 
     try:
-        segments = [segment for segment in COMMAND_SPLIT_PATTERN.split(raw) if segment.strip()]
-        tokenized_segments = [shlex.split(segment, posix=True) for segment in segments]
+        tokenized_segments = _tokenize_segments(raw)
     except ValueError:
+        # Unparseable syntax (e.g. unbalanced quotes) is not proof of danger;
+        # fall back to manual approval instead of hard-denying the call.
         return ShellCommandDecision(
             command=command,
-            allowed=False,
+            allowed=True,
             read_only=False,
-            requires_approval=False,
+            requires_approval=True,
             destructive=False,
             malformed=True,
-            reason="command could not be parsed",
+            reason="command could not be parsed; requires manual approval",
         )
 
     if not tokenized_segments or not any(tokens for tokens in tokenized_segments):

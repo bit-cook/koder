@@ -25,6 +25,7 @@ from rich.text import Text
 
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
 from ..agentic.api_errors import ApiErrorCategory, classify_api_error
+from ..core.constants import get_max_turns
 from ..core.goal_prompts import GOAL_CONTEXT_MARKER
 from ..core.goal_runtime import GoalRuntime
 from ..core.goals import GoalStore
@@ -516,7 +517,7 @@ class AgentScheduler:
                         session=self.session,  # Automatic history management
                         run_config=RunConfig(),
                         hooks=self.hooks,
-                        max_turns=50,
+                        max_turns=get_max_turns(),
                     )
                     # Capture token usage from result
                     await self._capture_usage(result)
@@ -623,7 +624,7 @@ class AgentScheduler:
                 session=self.session,
                 run_config=RunConfig(),
                 hooks=self.hooks,
-                max_turns=50,
+                max_turns=get_max_turns(),
             )
 
             partial_text_chunks: list[str] = []
@@ -806,7 +807,7 @@ class AgentScheduler:
             session=self.session,  # Automatic history management
             run_config=RunConfig(),
             hooks=self.hooks,
-            max_turns=50,
+            max_turns=get_max_turns(),
         )
         reasoning_display_mode = self._reasoning_display_mode()
 

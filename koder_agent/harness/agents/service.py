@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 from agents import RunConfig, Runner
 
 from koder_agent.agentic import create_dev_agent, get_display_hooks
+from koder_agent.core.constants import get_max_turns
 from koder_agent.core.session import EnhancedSQLiteSession
 from koder_agent.harness.agents.hooks import SubagentLifecycleHooks
 from koder_agent.harness.paths import worktrees_dir
@@ -143,7 +144,7 @@ async def _execute_agent_run(
                     cwd=cwd or Path.cwd(),
                     wrapped_hooks=get_display_hooks(),
                 ),
-                max_turns=agent_definition.max_turns or 50,
+                max_turns=agent_definition.max_turns or get_max_turns(),
             )
     finally:
         await _cleanup_agent_mcp_servers(agent)

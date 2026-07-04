@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import platform
+
 from ..permissions.powershell_classifier import classify_powershell_command
 from ..permissions.shell_classifier import classify_shell_command
 from .registry import ToolRegistry, ToolSpec, build_tool_result
@@ -79,8 +81,10 @@ async def invoke_shell_kill(arguments: dict) -> dict:
 
 def register_tools(registry: ToolRegistry) -> None:
     registry.register(ToolSpec(name="run_shell", invoke=invoke_run_shell, category="tool"))
-    registry.register(
-        ToolSpec(name="run_powershell", invoke=invoke_run_powershell, category="tool")
-    )
+    # PowerShell is Windows-only; never register it on other platforms.
+    if platform.system() == "Windows":
+        registry.register(
+            ToolSpec(name="run_powershell", invoke=invoke_run_powershell, category="tool")
+        )
     registry.register(ToolSpec(name="shell_output", invoke=invoke_shell_output, category="tool"))
     registry.register(ToolSpec(name="shell_kill", invoke=invoke_shell_kill, category="tool"))

@@ -91,6 +91,7 @@ async def test_fallback_on_llm_error():
         result = await classifier.classify("some command")
         assert result.risk_level == RiskLevel.MODERATE
         assert not result.allowed  # Default to deny on error
+        assert result.error  # Marked as classifier failure, not a verdict
 
 
 @pytest.mark.asyncio

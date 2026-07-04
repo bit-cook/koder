@@ -1,5 +1,6 @@
 """Tool implementations for Koder Agent."""
 
+import platform
 from typing import List
 
 from agents import FunctionTool, Tool
@@ -106,7 +107,6 @@ def get_all_tools() -> List[Tool]:
         append_file,
         edit_file,
         run_shell,
-        run_powershell,
         shell_output,
         shell_kill,
         git_command,
@@ -161,6 +161,10 @@ def get_all_tools() -> List[Tool]:
         list_mcp_resources,
         read_mcp_resource,
     ]
+
+    # PowerShell is Windows-only; never expose it to the model on other platforms.
+    if platform.system() == "Windows":
+        tools.insert(tools.index(shell_output), run_powershell)
 
     # Filter to only include properly decorated tools and attach guardrails
     result = []

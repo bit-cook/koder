@@ -160,7 +160,9 @@ class PermissionService:
     async def _consult_ai_classifier(self, command: str) -> PermissionEvaluationResult | None:
         """Consult AI classifier for shell command evaluation.
 
-        Returns None if classifier unavailable or falls back to static.
+        Returns None when the classifier is unavailable or errors, so callers
+        fall back to the static classification result (typically an approval
+        request) instead of treating classifier downtime as a denial.
         """
         if self._ai_classifier is None:
             return None
@@ -169,6 +171,9 @@ class PermissionService:
             from .ai_classifier import RiskLevel
 
             classification = await self._ai_classifier.classify(command)
+
+            if classification.error:
+                return None
 
             if not classification.allowed:
                 self.denial_log.record("run_shell", f"AI classifier: {classification.reason}")
@@ -193,12 +198,8 @@ class PermissionService:
             )
 
         except Exception:
-            # Fallback: require approval on AI failure
-            return PermissionEvaluationResult.approval_required(
-                tool_name="run_shell",
-                reason="AI classifier unavailable, defaulting to manual approval",
-                mode=self.mode,
-            )
+            # Classifier crashed: fall back to the static result.
+            return None
 
     def _evaluate_file_tool(self, tool_name: str, arguments: dict) -> PermissionEvaluationResult:
         operation = {

@@ -46,3 +46,39 @@ def test_shell_classifier_flags_interpreter_prefix_as_dangerous():
     result = classify_shell_command('python -c "print(1)"')
     assert result.allowed is False
     assert result.destructive is True
+
+
+def test_shell_classifier_handles_pipe_inside_quotes():
+    """Quoted pipes (grep alternation) must not break segment splitting."""
+    result = classify_shell_command(r'grep -rln "foo\|bar\|baz" src')
+    assert result.allowed is True
+    assert result.read_only is True
+    assert result.malformed is False
+
+
+def test_shell_classifier_handles_single_quoted_pipe():
+    result = classify_shell_command("awk -F'|' '{print $1}' data.txt")
+    assert result.malformed is False
+    assert result.allowed is True
+
+
+def test_shell_classifier_still_splits_real_pipes():
+    """A dangerous segment after a real pipe is still detected."""
+    result = classify_shell_command('echo "harmless" | sudo tee /etc/hosts')
+    assert result.allowed is False
+    assert result.destructive is True
+
+
+def test_shell_classifier_unparseable_falls_back_to_approval():
+    """Unbalanced quotes should require approval, not hard-deny."""
+    result = classify_shell_command('echo "unterminated')
+    assert result.malformed is True
+    assert result.allowed is True
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_quoted_pipe_with_redirect_is_write():
+    result = classify_shell_command('echo "a|b" > out.txt')
+    assert result.malformed is False
+    assert result.read_only is False
+    assert result.requires_approval is True

@@ -7,6 +7,7 @@ from typing import List, Union
 from agents import RunConfig, Runner
 from pydantic import BaseModel
 
+from ..core.constants import get_max_turns
 from .compat import function_tool
 
 
@@ -92,7 +93,7 @@ Return your findings or results directly without unnecessary explanation."""
                 result = await Runner.run(
                     delegated_agent,
                     task.prompt,
-                    max_turns=50,
+                    max_turns=get_max_turns(),
                     run_config=RunConfig(),
                     hooks=get_display_hooks(),
                 )

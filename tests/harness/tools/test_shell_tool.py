@@ -112,9 +112,30 @@ def test_shell_tool_reports_argument_error_for_blank_command():
     assert "permission" not in result
 
 
-def test_powershell_tool_respects_own_permission_gate():
+def _windows_only_registry(monkeypatch):
+    """Register shell tools as if running on Windows so run_powershell exists."""
+    from koder_agent.harness.tools import shell as shell_module
+
+    monkeypatch.setattr(shell_module.platform, "system", lambda: "Windows")
     registry = ToolRegistry.with_permission_service(PermissionService.default())
     registry.register_module("shell")
+    return registry
+
+
+def test_powershell_tool_not_registered_on_non_windows():
+    import platform as platform_module
+
+    if platform_module.system() == "Windows":
+        pytest.skip("run_powershell is expected on Windows")
+
+    registry = ToolRegistry.with_permission_service(PermissionService.default())
+    registry.register_module("shell")
+
+    assert registry.get("run_powershell") is None
+
+
+def test_powershell_tool_respects_own_permission_gate(monkeypatch):
+    registry = _windows_only_registry(monkeypatch)
 
     result = asyncio.run(registry.get("run_powershell").invoke({"command": "New-Item fixture.txt"}))
 
@@ -122,9 +143,8 @@ def test_powershell_tool_respects_own_permission_gate():
     assert result["permission"]["tool"] == "run_powershell"
 
 
-def test_powershell_tool_reports_argument_error_for_blank_command():
-    registry = ToolRegistry.with_permission_service(PermissionService.default())
-    registry.register_module("shell")
+def test_powershell_tool_reports_argument_error_for_blank_command(monkeypatch):
+    registry = _windows_only_registry(monkeypatch)
 
     result = asyncio.run(registry.get("run_powershell").invoke({"command": "   "}))
 
@@ -137,8 +157,7 @@ def test_powershell_tool_reports_missing_executable(monkeypatch):
     from koder_agent.harness.tools import shell_executor
 
     monkeypatch.setattr(shell_executor, "resolve_powershell_executable", lambda: None)
-    registry = ToolRegistry.with_permission_service(PermissionService.default())
-    registry.register_module("shell")
+    registry = _windows_only_registry(monkeypatch)
 
     result = asyncio.run(registry.get("run_powershell").invoke({"command": "Get-Location"}))
 

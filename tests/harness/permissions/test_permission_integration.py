@@ -164,6 +164,32 @@ class TestAiClassifierIntegration:
         # Conservative fallback: deny or require approval
         assert result.requires_approval or not result.allowed
 
+    @pytest.mark.asyncio
+    async def test_ai_classifier_unavailable_falls_back_to_static_approval(self):
+        """Classifier downtime must surface as approval-required, not a denial."""
+        service = PermissionService(
+            mode=PermissionMode.DEFAULT,
+        )
+
+        mock_classifier = AsyncMock(spec=AiShellClassifier)
+        mock_classifier.classify.return_value = ClassificationResult(
+            command="uv run pytest tests/",
+            risk_level=RiskLevel.MODERATE,
+            allowed=False,
+            reason="AI classifier unavailable, defaulting to manual approval",
+            error=True,
+        )
+
+        service._ai_classifier = mock_classifier
+
+        result = await service.evaluate_tool_call_async(
+            "run_shell", {"command": "uv run pytest tests/"}
+        )
+
+        # Falls back to the static verdict: approval required, never a hard deny.
+        assert result.requires_approval
+        assert "AI classifier denied" not in result.reason
+
     def test_no_ai_classifier_uses_static_only(self):
         """Without AI classifier, service uses static classification only."""
         service = PermissionService(

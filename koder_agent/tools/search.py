@@ -89,16 +89,16 @@ def grep_search(
     path: Optional[str] = None,
     glob: Optional[str] = None,
     include: Optional[str] = None,
-    output_mode: str = "files_with_matches",
+    output_mode: Optional[str] = None,
     context: Optional[int] = None,
     type: Optional[str] = None,
-    head_limit: int = 250,
-    offset: int = 0,
-    multiline: bool = False,
-    case_insensitive: bool = False,
+    head_limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    multiline: Optional[bool] = None,
+    case_insensitive: Optional[bool] = None,
     context_after: Optional[int] = None,
     context_before: Optional[int] = None,
-    line_numbers: bool = True,
+    line_numbers: Optional[bool] = None,
 ) -> str:
     """Search for pattern in file contents using ripgrep.
 
@@ -121,6 +121,14 @@ def grep_search(
     Returns:
         Formatted search results
     """
+    # Strict JSON schema marks every parameter as required, so providers send
+    # explicit nulls for omitted arguments; normalize them to real defaults here.
+    output_mode = output_mode or "files_with_matches"
+    head_limit = 250 if head_limit is None else head_limit
+    offset = 0 if offset is None else offset
+    multiline = bool(multiline)
+    case_insensitive = bool(case_insensitive)
+    line_numbers = True if line_numbers is None else line_numbers
     try:
         # Find ripgrep
         rg_path = shutil.which("rg")

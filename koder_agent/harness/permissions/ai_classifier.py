@@ -23,6 +23,10 @@ class ClassificationResult:
     risk_level: RiskLevel
     allowed: bool
     reason: str
+    # True when the classifier itself failed (LLM unavailable, bad response, ...).
+    # Callers must treat this as "no verdict" and fall back to static policy,
+    # never as an authoritative denial of the command.
+    error: bool = False
 
 
 CLASSIFIER_SYSTEM_PROMPT = """You are a shell command security classifier. Classify commands into risk levels:
@@ -87,12 +91,14 @@ class AiShellClassifier:
             )
 
         except Exception:
-            # Conservative fallback: treat as moderate, deny
+            # Classifier failure is not a verdict on the command: surface the
+            # error so callers fall back to the static approval flow.
             return ClassificationResult(
                 command=command,
                 risk_level=RiskLevel.MODERATE,
                 allowed=False,
                 reason="AI classifier unavailable, defaulting to manual approval",
+                error=True,
             )
 
     def classify_sync(
@@ -121,6 +127,7 @@ class AiShellClassifier:
                 risk_level=RiskLevel.MODERATE,
                 allowed=False,
                 reason="AI classifier unavailable in sync context (already in event loop)",
+                error=True,
             )
         except Exception:
             # Conservative fallback
@@ -129,4 +136,5 @@ class AiShellClassifier:
                 risk_level=RiskLevel.MODERATE,
                 allowed=False,
                 reason="AI classifier unavailable, defaulting to manual approval",
+                error=True,
             )

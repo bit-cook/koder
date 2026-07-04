@@ -1,5 +1,9 @@
 """Tests that all 13 new orchestration tools are registered correctly."""
 
+import platform
+
+import pytest
+
 
 def test_new_tools_registered():
     """All new tools appear in get_all_tools by default."""
@@ -33,7 +37,11 @@ def test_new_tools_registered():
     assert "cron_delete" in names
     assert "cron_list" in names
 
-    assert "run_powershell" in names
+    # PowerShell is Windows-only
+    if platform.system() == "Windows":
+        assert "run_powershell" in names
+    else:
+        assert "run_powershell" not in names
     assert "code_intelligence" in names
 
 
@@ -68,6 +76,7 @@ def test_all_new_tools_are_function_tools():
             assert len(tool.tool_input_guardrails) >= 2, f"{name} should have at least 2 guardrails"
 
 
+@pytest.mark.skipif(platform.system() != "Windows", reason="run_powershell is Windows-only")
 def test_powershell_tool_is_registered_with_guardrails():
     from agents import FunctionTool
 
@@ -79,6 +88,16 @@ def test_powershell_tool_is_registered_with_guardrails():
     assert isinstance(tool, FunctionTool)
     assert tool.tool_input_guardrails is not None
     assert len(tool.tool_input_guardrails) >= 2
+
+
+def test_powershell_tool_not_registered_on_non_windows():
+    if platform.system() == "Windows":
+        pytest.skip("run_powershell is expected on Windows")
+
+    from koder_agent.tools import get_all_tools
+
+    names = {getattr(t, "name", None) for t in get_all_tools()}
+    assert "run_powershell" not in names
 
 
 def test_code_intelligence_tool_is_registered_with_guardrails():

@@ -305,3 +305,36 @@ def test_line_numbers_in_content_mode(sample_files):
     assert isinstance(result, str)
     # Should contain colon-separated line numbers (filename:linenum:content)
     assert ":" in result
+
+
+def test_null_optional_arguments_normalized(sample_files):
+    """Strict-schema providers send explicit nulls for omitted args; they must not error."""
+    result = invoke_tool(
+        grep_search,
+        {
+            "pattern": "Hello",
+            "path": str(sample_files),
+            "glob": None,
+            "include": None,
+            "output_mode": None,
+            "context": None,
+            "type": None,
+            "head_limit": None,
+            "offset": None,
+            "multiline": None,
+            "case_insensitive": None,
+            "context_after": None,
+            "context_before": None,
+            "line_numbers": None,
+        },
+    )
+    assert isinstance(result, str)
+    assert "error" not in result.lower() or "No matches" in result
+    assert "validation" not in result.lower()
+
+
+def test_pattern_only_invocation(sample_files):
+    """Calling with just pattern and path (all other args omitted) works."""
+    result = invoke_tool(grep_search, {"pattern": "Hello", "path": str(sample_files)})
+    assert isinstance(result, str)
+    assert "validation" not in result.lower()

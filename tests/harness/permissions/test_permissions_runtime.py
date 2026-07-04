@@ -161,6 +161,7 @@ async def test_permission_service_ai_classifier_integration():
     mock_result.risk_level = RiskLevel.SAFE
     mock_result.allowed = True
     mock_result.reason = "Safe read-only command"
+    mock_result.error = False
 
     with patch.object(ai_classifier, "classify", new=AsyncMock(return_value=mock_result)):
         service = PermissionService.default(
@@ -189,6 +190,7 @@ async def test_permission_service_ai_classifier_moderate():
     mock_result.risk_level = RiskLevel.MODERATE
     mock_result.allowed = True
     mock_result.reason = "Moderate risk command"
+    mock_result.error = False
 
     with patch.object(ai_classifier, "classify", new=AsyncMock(return_value=mock_result)):
         service = PermissionService.default(ai_classifier=ai_classifier)
@@ -212,6 +214,7 @@ async def test_permission_service_ai_classifier_dangerous():
     mock_result.risk_level = RiskLevel.DANGEROUS
     mock_result.allowed = False
     mock_result.reason = "Dangerous command detected"
+    mock_result.error = False
 
     with patch.object(ai_classifier, "classify", new=AsyncMock(return_value=mock_result)):
         service = PermissionService.default(ai_classifier=ai_classifier)
@@ -229,7 +232,7 @@ async def test_permission_service_ai_classifier_dangerous():
 
 @pytest.mark.asyncio
 async def test_permission_service_ai_classifier_fallback():
-    """Test AI classifier falls back on error."""
+    """Test AI classifier failure falls back to the static verdict."""
     ai_classifier = AiShellClassifier()
 
     with patch.object(ai_classifier, "classify", new=AsyncMock(side_effect=Exception("API error"))):
@@ -240,9 +243,9 @@ async def test_permission_service_ai_classifier_fallback():
             {"command": "some-command"},
         )
 
-        # Should require approval on AI failure
+        # Should fall back to static approval flow, never a hard deny
         assert result.requires_approval
-        assert "AI classifier unavailable" in result.reason
+        assert "AI classifier denied" not in result.reason
 
 
 @pytest.mark.asyncio
