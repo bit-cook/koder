@@ -4,11 +4,13 @@ Supports both bash (Unix/Linux/macOS) and PowerShell (Windows).
 """
 
 import asyncio
+import os
 import platform
 import re
 import shlex
 import time
 import uuid
+from collections import deque
 from typing import List, Optional
 
 from pydantic import BaseModel
@@ -19,6 +21,25 @@ from .compat import function_tool
 # Detect OS once at module load
 IS_WINDOWS = platform.system() == "Windows"
 SHELL_NAME = "PowerShell" if IS_WINDOWS else "bash"
+
+# Cap the per-shell output buffer so a verbose long-running background process
+# does not leak memory for the whole session. Overridable via
+# KODER_BG_SHELL_MAX_LINES; unset/empty/non-numeric/<=0 falls back to default.
+DEFAULT_BG_SHELL_MAX_LINES = 10000
+
+
+def _bg_shell_max_lines() -> int:
+    """Resolve the max retained output lines per background shell."""
+    raw = os.environ.get("KODER_BG_SHELL_MAX_LINES")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_BG_SHELL_MAX_LINES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BG_SHELL_MAX_LINES
+    if value <= 0:
+        return DEFAULT_BG_SHELL_MAX_LINES
+    return value
 
 
 class ShellModel(BaseModel):
@@ -59,7 +80,13 @@ class BackgroundShell:
         self.command = command
         self.process = process
         self.start_time = start_time
-        self.output_lines: List[str] = []
+        # Bounded ring buffer: old lines are evicted from the left once the cap
+        # is hit, keeping session memory bounded for verbose processes.
+        self.output_lines: "deque[str]" = deque(maxlen=_bg_shell_max_lines())
+        # Monotonic count of all lines ever appended (including evicted ones).
+        # last_read_index is an index into this logical stream, not into the
+        # deque, so it stays correct even after left-eviction shifts positions.
+        self._total_appended = 0
         self.last_read_index = 0
         self.status = "running"  # running, completed, failed, terminated, error
         self.exit_code: Optional[int] = None
@@ -67,11 +94,24 @@ class BackgroundShell:
     def add_output(self, line: str):
         """Add new output line."""
         self.output_lines.append(line)
+        self._total_appended += 1
 
     def get_new_output(self, filter_pattern: Optional[str] = None) -> List[str]:
-        """Get new output since last check, optionally filtered by regex."""
-        new_lines = self.output_lines[self.last_read_index :]
-        self.last_read_index = len(self.output_lines)
+        """Get new output since last check, optionally filtered by regex.
+
+        ``last_read_index`` counts against the monotonic total-appended stream.
+        The deque only retains the most recent ``maxlen`` lines, so the oldest
+        retained line has logical index ``_total_appended - len(output_lines)``.
+        If lines were evicted since the last read we clamp forward to that start
+        (silently skipping the dropped lines) and never re-emit read lines.
+        """
+        retained_start = self._total_appended - len(self.output_lines)
+        # Clamp: never slice before the oldest retained line (evicted lines are
+        # gone) and never re-read lines already consumed.
+        effective_index = max(self.last_read_index, retained_start)
+        offset = effective_index - retained_start
+        new_lines = list(self.output_lines)[offset:]
+        self.last_read_index = self._total_appended
 
         if filter_pattern:
             try:

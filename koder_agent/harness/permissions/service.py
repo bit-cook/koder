@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from ..sandbox.workspace import protected_write_violation, read_only_violation
 from ..sandbox_settings import is_excluded_command, resolve_sandbox_settings
 from .denial_log import DenialLog
-from .modes import PermissionMode
+from .modes import FILE_WRITE_TOOLS, PermissionMode
 from .path_policy import evaluate_path_access
 from .persistence import PermissionStore
 from .powershell_classifier import classify_powershell_command
@@ -122,6 +122,14 @@ class PermissionService:
         if tool_name in {"run_shell", "run_powershell"}:
             command = arguments.get("command")
             return command if isinstance(command, str) else None
+        if tool_name == "git_command":
+            command = arguments.get("command")
+            if not isinstance(command, str):
+                return None
+            # git_command accepts the command with or without a leading 'git'
+            # token; normalize so allow/deny rules can match a stable "git ..."
+            # target regardless of how the model phrased it.
+            return command if command.strip().startswith("git") else f"git {command}"
         if tool_name in {"Skill", "skill"}:
             skill = arguments.get("skill")
             if not isinstance(skill, str):
@@ -206,6 +214,7 @@ class PermissionService:
             "read_file": "read",
             "write_file": "write",
             "edit_file": "write",
+            "append_file": "write",
         }.get(tool_name)
         target = self._extract_rule_target(tool_name, arguments)
         if not operation or not target:
@@ -222,8 +231,6 @@ class PermissionService:
             additional_roots=self.additional_roots,
         )
         if decision.requires_approval and self.mode == PermissionMode.ACCEPT_EDITS:
-            from .modes import FILE_WRITE_TOOLS
-
             if tool_name in FILE_WRITE_TOOLS and decision.allowed:
                 return PermissionEvaluationResult.allow(
                     tool_name=tool_name,
@@ -293,7 +300,7 @@ class PermissionService:
                 reason="bypass mode",
             )
 
-        if tool_name in {"run_shell", "run_powershell"}:
+        if tool_name in {"run_shell", "run_powershell", "git_command"}:
             command = arguments.get("command")
             if not isinstance(command, str) or not command.strip():
                 return PermissionEvaluationResult.allow(
@@ -301,13 +308,24 @@ class PermissionService:
                     mode=self.mode,
                     reason="shell command validation deferred until invocation",
                 )
+            # git_command is analyzed with the bash classifier (never the
+            # PowerShell one, even on Windows): its git subcommand / write-flag
+            # analysis lives in classify_shell_command. Normalize the target to a
+            # leading "git " token so read-only git stays allowed while
+            # push --force / reset --hard become requires_approval.
+            classify_command = command
+            if tool_name == "git_command":
+                rest = command.strip()
+                if rest.startswith("git"):
+                    rest = rest[len("git") :].strip()
+                classify_command = f"git {rest}"
             current_cwd = Path.cwd()
             state = resolve_sandbox_settings(current_cwd)
-            excluded_from_sandbox = is_excluded_command(command, cwd=current_cwd)
+            excluded_from_sandbox = is_excluded_command(classify_command, cwd=current_cwd)
             decision = (
                 classify_powershell_command(command)
                 if tool_name == "run_powershell"
-                else classify_shell_command(command)
+                else classify_shell_command(classify_command)
             )
             if state.enabled and not excluded_from_sandbox:
                 if tool_name == "run_powershell":
@@ -345,11 +363,11 @@ class PermissionService:
                         reason=reason,
                         mode=self.mode,
                     )
-                elif tool_name == "run_shell" and state.policy is not None:
-                    violation = read_only_violation(command, policy=state.policy)
+                elif tool_name in {"run_shell", "git_command"} and state.policy is not None:
+                    violation = read_only_violation(classify_command, policy=state.policy)
                     if violation is None:
                         violation = protected_write_violation(
-                            command,
+                            classify_command,
                             policy=state.policy,
                             repo_root=current_cwd,
                         )
@@ -395,7 +413,7 @@ class PermissionService:
                 )
             )
 
-        if tool_name in {"read_file", "write_file", "edit_file"}:
+        if tool_name in ({"read_file"} | FILE_WRITE_TOOLS):
             return self._apply_mode_override(self._evaluate_file_tool(tool_name, arguments))
 
         return self._apply_mode_override(

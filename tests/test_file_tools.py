@@ -255,6 +255,9 @@ async def test_append_file_to_existing(sample_file):
     original = sample_file.read_text()
     new_content = "\nappended line"
 
+    # Must read before appending to an existing file (read-before-write guard).
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+
     result = await append_file.on_invoke_tool(
         None, json.dumps({"path": str(sample_file), "content": new_content})
     )
@@ -847,6 +850,9 @@ async def test_append_file_diff_shows_appended_content(temp_dir):
     file_path = temp_dir / "append.txt"
     file_path.write_text("existing\n", encoding="utf-8")
 
+    # Must read before appending to an existing file (read-before-write guard).
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
+
     result = await append_file.on_invoke_tool(
         None, json.dumps({"path": str(file_path), "content": "appended\n"})
     )
@@ -873,6 +879,9 @@ async def test_append_file_multiline_append(temp_dir):
     """append_file shows correct diff for multiline append."""
     file_path = temp_dir / "multi_append.txt"
     file_path.write_text("line1\n", encoding="utf-8")
+
+    # Must read before appending to an existing file (read-before-write guard).
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
 
     result = await append_file.on_invoke_tool(
         None, json.dumps({"path": str(file_path), "content": "line2\nline3\n"})
@@ -1097,3 +1106,51 @@ async def test_edit_file_special_characters(temp_dir):
     assert "Successfully applied diff" in result
     content = file_path.read_text()
     assert "[new_array]" in content
+
+
+# =============================================================================
+# Tests for symlink write protection (O_NOFOLLOW, TOCTOU hardening)
+# =============================================================================
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "O_NOFOLLOW"),
+    reason="O_NOFOLLOW unavailable on this platform",
+)
+@pytest.mark.asyncio
+async def test_write_file_refuses_symlink_leaf(temp_dir):
+    """write_file must not follow a leaf symlink to write outside the target."""
+    outside = temp_dir / "outside.txt"
+    outside.write_text("SAFE", encoding="utf-8")
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    # Pass the read-before-write guard first so O_NOFOLLOW is the gate under test.
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(link)}))
+
+    result = await write_file.on_invoke_tool(
+        None, json.dumps({"path": str(link), "content": "HACKED"})
+    )
+
+    assert "symlink" in result.lower()
+    assert outside.read_text() == "SAFE"  # target untouched
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "O_NOFOLLOW"),
+    reason="O_NOFOLLOW unavailable on this platform",
+)
+@pytest.mark.asyncio
+async def test_append_file_refuses_symlink_leaf(temp_dir):
+    """append_file must not follow a leaf symlink to append outside the target."""
+    outside = temp_dir / "outside.txt"
+    outside.write_text("SAFE", encoding="utf-8")
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(link)}))
+
+    result = await append_file.on_invoke_tool(None, json.dumps({"path": str(link), "content": "X"}))
+
+    assert "symlink" in result.lower()
+    assert outside.read_text() == "SAFE"

@@ -109,15 +109,47 @@ class TestEnforceToolPermission:
             reset_tool_permission_context(token)
 
     @pytest.mark.asyncio
-    async def test_requires_approval_no_approver_default_allows(self):
-        """When approval required but no approver, default behavior allows."""
+    async def test_requires_approval_no_approver_env_opt_out_allows(self):
+        """With KODER_ENFORCE_TOOL_APPROVAL=0, unapproved calls are allowed.
+
+        The unattended-approval default is now TTY-aware (fail closed when
+        stdin is non-interactive, since nobody can approve). An explicit
+        ``0/false/no/off`` opts back into the legacy allow+log behavior.
+        """
         svc = _fake_service(requires_approval=True, reason="needs user ok")
         token = set_tool_permission_context(svc)
         try:
-            result = await enforce_tool_permission(
-                "run_shell", json.dumps({"command": "npm install"})
-            )
-            assert result is None  # allowed by default (no approver wired)
+            with patch.dict(os.environ, {"KODER_ENFORCE_TOOL_APPROVAL": "0"}):
+                result = await enforce_tool_permission(
+                    "run_shell", json.dumps({"command": "npm install"})
+                )
+                assert result is None  # explicit opt-out allows
+        finally:
+            reset_tool_permission_context(token)
+
+    @pytest.mark.asyncio
+    async def test_requires_approval_no_approver_non_interactive_fails_closed(self):
+        """No approver + non-interactive stdin + no env override -> fail closed.
+
+        This is the security fix: silently allowing when nobody can approve was
+        the real hole. With no explicit ``KODER_ENFORCE_TOOL_APPROVAL`` and a
+        non-interactive stdin, the call is denied.
+        """
+        svc = _fake_service(requires_approval=True, reason="needs user ok")
+        token = set_tool_permission_context(svc)
+        try:
+            # Clear any inherited override, then force non-interactive detection.
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("KODER_ENFORCE_TOOL_APPROVAL", None)
+                with patch(
+                    "koder_agent.tools.permission_context.sys.stdin.isatty",
+                    return_value=False,
+                ):
+                    result = await enforce_tool_permission(
+                        "run_shell", json.dumps({"command": "npm install"})
+                    )
+            assert result is not None
+            assert "Permission denied" in result
         finally:
             reset_tool_permission_context(token)
 

@@ -3,6 +3,8 @@
 import os
 from typing import Any, List
 
+from rich.console import Console
+
 try:  # pragma: no cover - depends on optional SDK extras at import time
     from agents.mcp import MCPServer
 except ImportError:  # pragma: no cover
@@ -23,6 +25,10 @@ try:  # pragma: no cover - optional transport dependencies may be absent
     from .server_factory import MCPServerFactory
 except ImportError:  # pragma: no cover
     MCPServerFactory = None  # type: ignore[assignment]
+
+# Dedicated stderr console so MCP-connection warnings reach the user even when
+# the root logger is pinned high elsewhere.
+_console = Console(stderr=True)
 
 
 def _load_plugin_mcp_configs() -> List[MCPServerConfig]:
@@ -167,7 +173,8 @@ async def load_mcp_servers() -> List[MCPServer]:
         )
         # Configure reconnection with retry
         reconnection_config = ReconnectionConfig(max_attempts=3, initial_delay=1.0, max_delay=10.0)
-        servers = []
+        servers: List[MCPServer] = []
+        connected: list[tuple[MCPServerConfig, MCPServer]] = []
         for config in configs:
             try:
                 cb = channel_callback if config.name in channel_server_names else None
@@ -186,6 +193,7 @@ async def load_mcp_servers() -> List[MCPServer]:
                     type(server).__name__,
                 )
                 servers.append(server)
+                connected.append((config, server))
                 if config.name in channel_server_names:
                     # Verify capability after connection
                     caps = getattr(server, "server_initialize_result", None)
@@ -204,12 +212,18 @@ async def load_mcp_servers() -> List[MCPServer]:
                 _logger.info(f"Created MCP server '{config.name}' ({config.transport_type})")
             except Exception as e:
                 _logger.error(f"Failed to create MCP server '{config.name}': {e}")
+                # Surface the failure to the user — the root logger is pinned
+                # high elsewhere, so a bare _logger.error() would be invisible.
+                _console.print(f"[yellow]⚠ MCP server '{config.name}' unavailable: {e}[/yellow]")
                 continue
 
         # Try to discover prompts from connected servers
+        # Iterate the (config, server) pairs we actually connected, rather than
+        # zip(configs, servers): a skipped server would misalign the zip and
+        # attribute prompts to the wrong config after the first failure.
         registry = get_prompt_registry()
         registry.clear()
-        for config, server in zip(configs, servers):
+        for config, server in connected:
             try:
                 await _discover_prompts(config.name, server, registry)
             except Exception:

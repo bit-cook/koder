@@ -40,6 +40,22 @@ LITELLM_RETRYABLE_ERRORS = (
 litellm.num_retries = 3  # Default, will be updated with config values
 litellm.num_retries_per_request = 3
 
+# GitHub Copilot spoof headers (single source of truth; also imported by
+# ``koder_agent.agentic.agent``). These emulate the official VSCode Copilot
+# client. Excludes x-request-id, which is generated per-use and merged in at
+# the call site so it can rotate. NOTE: routing a GitHub Copilot subscription
+# through an unofficial client may violate GitHub's terms of service — users
+# opt in to this behavior knowingly.
+GITHUB_COPILOT_HEADERS: dict[str, str] = {
+    "copilot-integration-id": "vscode-chat",
+    "editor-version": "vscode/1.98.1",
+    "editor-plugin-version": "copilot-chat/0.26.7",
+    "user-agent": "GitHubCopilotChat/0.26.7",
+    "openai-intent": "conversation-panel",
+    "x-github-api-version": "2025-04-01",
+    "x-vscode-user-agent-library-version": "electron-fetch",
+}
+
 # Well-known environment variable mappings for common providers
 # For providers not listed here, the api_key from config will be set
 # to the provider's expected env var (e.g., {PROVIDER}_API_KEY)
@@ -674,15 +690,10 @@ async def llm_completion(
     is_copilot = "github_copilot/" in model_lower
     extra_headers = None
     if is_copilot:
+        # Reuse the shared static header set and add a fresh per-request id.
         extra_headers = {
-            "copilot-integration-id": "vscode-chat",
-            "editor-version": "vscode/1.98.1",
-            "editor-plugin-version": "copilot-chat/0.26.7",
-            "user-agent": "GitHubCopilotChat/0.26.7",
-            "openai-intent": "conversation-panel",
-            "x-github-api-version": "2025-04-01",
+            **GITHUB_COPILOT_HEADERS,
             "x-request-id": str(uuid.uuid4()),
-            "x-vscode-user-agent-library-version": "electron-fetch",
         }
 
     if is_copilot and "codex" in model_lower:

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 
+from ...tools.permission_context import GUARDED_TOOLS
 from ..hooks.runtime import dispatch_command_hooks
 from .definitions import AgentDefinition
 
@@ -137,8 +138,12 @@ class SubagentLifecycleHooks(RunHooks):
         _run_command_hooks(stop_rules, payload, self.cwd)
 
     async def on_tool_start(self, context: RunContextWrapper, agent: Agent, tool: Tool) -> None:
-        # Permission check before forwarding
-        if self._permission_service is not None:
+        # Permission check before forwarding. Guarded tools are re-evaluated with
+        # their full arguments in Phase 2 (enforce_tool_permission in the compat
+        # wrapper); a name-level arguments={} check here would deny the whole turn
+        # and can never match a target-scoped allow rule, so skip them. Non-guarded
+        # tools have no Phase-2 path, so keep the name-level evaluate/raise.
+        if self._permission_service is not None and tool.name not in GUARDED_TOOLS:
             result = self._permission_service.evaluate_tool_call(
                 tool_name=tool.name,
                 arguments={},

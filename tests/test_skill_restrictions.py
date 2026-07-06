@@ -471,15 +471,15 @@ class TestToolGuardrailIntegration:
         # Verify each FunctionTool has the guardrail attached
         for tool in tools:
             if isinstance(tool, FunctionTool):
-                assert tool.tool_input_guardrails is not None, (
-                    f"Tool '{tool.name}' should have tool_input_guardrails"
-                )
-                assert len(tool.tool_input_guardrails) > 0, (
-                    f"Tool '{tool.name}' should have at least one guardrail"
-                )
-                assert skill_restriction_guardrail in tool.tool_input_guardrails, (
-                    f"Tool '{tool.name}' should have skill_restriction_guardrail"
-                )
+                assert (
+                    tool.tool_input_guardrails is not None
+                ), f"Tool '{tool.name}' should have tool_input_guardrails"
+                assert (
+                    len(tool.tool_input_guardrails) > 0
+                ), f"Tool '{tool.name}' should have at least one guardrail"
+                assert (
+                    skill_restriction_guardrail in tool.tool_input_guardrails
+                ), f"Tool '{tool.name}' should have skill_restriction_guardrail"
 
     def test_skill_restriction_guardrail_is_correct_type(self):
         """Test that skill_restriction_guardrail is a ToolInputGuardrail, not InputGuardrail."""
@@ -489,15 +489,15 @@ class TestToolGuardrailIntegration:
 
         # The guardrail must be ToolInputGuardrail (for per-tool validation)
         # NOT InputGuardrail (which has run_in_parallel and is for agent-level)
-        assert isinstance(skill_restriction_guardrail, ToolInputGuardrail), (
-            "skill_restriction_guardrail must be a ToolInputGuardrail instance"
-        )
+        assert isinstance(
+            skill_restriction_guardrail, ToolInputGuardrail
+        ), "skill_restriction_guardrail must be a ToolInputGuardrail instance"
 
         # ToolInputGuardrail should NOT have run_in_parallel attribute
         # (that's only on InputGuardrail for agent-level guardrails)
-        assert not hasattr(skill_restriction_guardrail, "run_in_parallel"), (
-            "ToolInputGuardrail should not have run_in_parallel attribute"
-        )
+        assert not hasattr(
+            skill_restriction_guardrail, "run_in_parallel"
+        ), "ToolInputGuardrail should not have run_in_parallel attribute"
 
     def test_agent_creation_with_tools_no_attribute_error(self):
         """Test that Agent can be created with tools without run_in_parallel AttributeError.
@@ -537,9 +537,9 @@ class TestToolGuardrailIntegration:
         for tool in tools:
             if hasattr(tool, "tool_input_guardrails") and tool.tool_input_guardrails:
                 guardrail_count = tool.tool_input_guardrails.count(skill_restriction_guardrail)
-                assert guardrail_count == 1, (
-                    f"Tool '{tool.name}' has {guardrail_count} copies of skill_restriction_guardrail, expected 1"
-                )
+                assert (
+                    guardrail_count == 1
+                ), f"Tool '{tool.name}' has {guardrail_count} copies of skill_restriction_guardrail, expected 1"
 
 
 class TestPatternBasedRestrictions:

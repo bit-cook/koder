@@ -26,7 +26,6 @@ READ_ONLY_COMMANDS = {
     "paste",
     "pwd",
     "rg",
-    "sed",
     "sha1sum",
     "sha256sum",
     "sort",
@@ -168,7 +167,6 @@ WRITE_COMMANDS = {
     "mv",
     "rm",
     "rmdir",
-    "sed",
     "tee",
     "touch",
 }
@@ -270,6 +268,19 @@ class ShellCommandDecision:
 _FIND_MUTATING_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf"}
 
 
+def _sed_is_in_place(tokens: list[str]) -> bool:
+    """Return True if any ``sed`` token requests in-place editing (a write).
+
+    Covers short forms ``-i`` and ``-i.bak`` (via ``startswith("-i")``) plus GNU
+    long forms ``--in-place`` and ``--in-place=SUFFIX`` (which do not match
+    ``startswith("-i")``, so the bare long form must be matched explicitly).
+    """
+    return any(
+        token.startswith("-i") or token == "--in-place" or token.startswith("--in-place=")
+        for token in tokens
+    )
+
+
 def _is_read_only_segment(tokens: list[str]) -> bool:
     if not tokens:
         return True
@@ -277,7 +288,9 @@ def _is_read_only_segment(tokens: list[str]) -> bool:
     if command == "git":
         return is_readonly_git_subcommand(tokens)
     if command == "sed":
-        return "-i" not in tokens and not any(token.startswith("-i") for token in tokens)
+        # sed is read-only unless it writes in place; handled specially because
+        # its classification is flag-dependent (see _sed_is_in_place).
+        return not _sed_is_in_place(tokens)
     if command == "find":
         return not any(token in _FIND_MUTATING_FLAGS for token in tokens)
     return command in READ_ONLY_COMMANDS
@@ -290,7 +303,8 @@ def _is_write_segment(tokens: list[str]) -> bool:
     if command == "git":
         return not _is_read_only_segment(tokens)
     if command == "sed":
-        return "-i" in tokens or any(token.startswith("-i") for token in tokens)
+        # In-place sed mutates files; flag-dependent, so handled specially.
+        return _sed_is_in_place(tokens)
     return command in WRITE_COMMANDS
 
 

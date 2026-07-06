@@ -1,6 +1,5 @@
 """Security guards for the Koder Agent."""
 
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -9,9 +8,6 @@ from koder_agent.core.bash_security import analyze_command
 
 class SecurityGuard:
     """Security guard to validate paths and inputs."""
-
-    UI_PATTERN = re.compile(r"^[\s\S]{1,2000}$")
-    FORBIDDEN_WORDS = {"rm -rf", "shutdown", "reboot"}
 
     @staticmethod
     def validate_command(command: str) -> Optional[str]:

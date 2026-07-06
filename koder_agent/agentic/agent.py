@@ -28,6 +28,7 @@ from ..harness.reasoning_display import normalize_reasoning_display_mode
 from ..mcp import MCPServerFactory, load_mcp_servers
 from ..tools.skill import build_skills_metadata_prompt, discover_merged_skills
 from ..utils.client import (
+    GITHUB_COPILOT_HEADERS,
     LITELLM_RETRYABLE_ERRORS,
     get_model_client_snapshot,
 )
@@ -37,17 +38,9 @@ from ..utils.prompts import KODER_SYSTEM_PROMPT
 console = Console()
 logger = logging.getLogger(__name__)
 
-# GitHub Copilot spoof headers (shared constant, excludes x-request-id which
-# ideally should rotate per-request).
-GITHUB_COPILOT_HEADERS: dict[str, str] = {
-    "copilot-integration-id": "vscode-chat",
-    "editor-version": "vscode/1.98.1",
-    "editor-plugin-version": "copilot-chat/0.26.7",
-    "user-agent": "GitHubCopilotChat/0.26.7",
-    "openai-intent": "conversation-panel",
-    "x-github-api-version": "2025-04-01",
-    "x-vscode-user-agent-library-version": "electron-fetch",
-}
+# GITHUB_COPILOT_HEADERS is defined in ..utils.client (single source of truth)
+# and re-imported above; the is_copilot branch below spreads it and appends a
+# per-request x-request-id.
 
 _BRIEF_MODE_INSTRUCTION = (
     "# Brief Mode\n"

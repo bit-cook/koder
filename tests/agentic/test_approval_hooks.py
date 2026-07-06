@@ -59,39 +59,32 @@ async def test_on_tool_start_allows_read(permission_service):
 
 
 @pytest.mark.asyncio
-async def test_on_tool_start_blocks_write_in_plan_mode(tmp_path):
-    """Plan mode should block write operations."""
+@pytest.mark.parametrize("guarded_tool", ["write_file", "run_shell", "edit_file"])
+async def test_on_tool_start_defers_guarded_tools_in_plan_mode(tmp_path, guarded_tool):
+    """Guarded tools are NOT blocked at the name level, even in plan mode.
+
+    ``on_tool_start`` only sees the tool *name*, not its arguments. Guarded
+    tools (write_file/edit_file/run_shell/run_powershell/git_command/
+    append_file) are re-evaluated with their FULL arguments in Phase 2
+    (``enforce_tool_permission`` in the compat wrapper), which returns a
+    graceful, model-visible denial. An empty-args name-level evaluation would
+    deny the whole turn (e.g. in plan mode) and could never match a
+    target-scoped allow rule, so the name-level evaluate/raise is intentionally
+    skipped for guarded tools and enforcement is deferred to Phase 2. The call
+    must therefore pass through to the wrapped hooks here rather than raise.
+    """
     svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
-    hooks = ApprovalHooks(wrapped_hooks=_make_wrapped_hooks(), permission_service=svc)
+    wrapped = _make_wrapped_hooks()
+    hooks = ApprovalHooks(wrapped_hooks=wrapped, permission_service=svc)
     tool = MagicMock(spec=Tool)
-    tool.name = "write_file"
+    tool.name = guarded_tool
+    ctx = MagicMock()
+    agent = MagicMock()
 
-    with pytest.raises(PermissionError):
-        await hooks.on_tool_start(MagicMock(), MagicMock(), tool)
+    # Should not raise: enforcement is deferred to Phase-2 argument-level checks.
+    await hooks.on_tool_start(ctx, agent, tool)
 
-
-@pytest.mark.asyncio
-async def test_on_tool_start_blocks_shell_in_plan_mode(tmp_path):
-    """Plan mode should block shell commands."""
-    svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
-    hooks = ApprovalHooks(wrapped_hooks=_make_wrapped_hooks(), permission_service=svc)
-    tool = MagicMock(spec=Tool)
-    tool.name = "run_shell"
-
-    with pytest.raises(PermissionError):
-        await hooks.on_tool_start(MagicMock(), MagicMock(), tool)
-
-
-@pytest.mark.asyncio
-async def test_on_tool_start_blocks_edit_in_plan_mode(tmp_path):
-    """Plan mode should block edit operations."""
-    svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
-    hooks = ApprovalHooks(wrapped_hooks=_make_wrapped_hooks(), permission_service=svc)
-    tool = MagicMock(spec=Tool)
-    tool.name = "edit_file"
-
-    with pytest.raises(PermissionError):
-        await hooks.on_tool_start(MagicMock(), MagicMock(), tool)
+    wrapped.on_tool_start.assert_called_once_with(ctx, agent, tool)
 
 
 @pytest.mark.asyncio
@@ -135,12 +128,17 @@ async def test_on_tool_start_forwards_to_wrapped_hooks(permission_service):
 
 @pytest.mark.asyncio
 async def test_on_tool_start_does_not_forward_on_deny(tmp_path):
-    """Should NOT forward to wrapped hooks when permission is denied."""
+    """Should NOT forward to wrapped hooks when permission is denied.
+
+    Uses a non-guarded mutating tool (``todo_write``) so the name-level deny
+    path is actually exercised: guarded tools defer to Phase-2 enforcement and
+    are not denied here, whereas a non-guarded mutation is denied in plan mode.
+    """
     svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
     wrapped = _make_wrapped_hooks()
     hooks = ApprovalHooks(wrapped_hooks=wrapped, permission_service=svc)
     tool = MagicMock(spec=Tool)
-    tool.name = "write_file"
+    tool.name = "todo_write"
 
     with pytest.raises(PermissionError):
         await hooks.on_tool_start(MagicMock(), MagicMock(), tool)
@@ -164,13 +162,15 @@ async def test_permission_denied_raises_classified_exception(tmp_path):
     svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
     hooks = ApprovalHooks(wrapped_hooks=_make_wrapped_hooks(), permission_service=svc)
     tool = MagicMock(spec=Tool)
-    tool.name = "write_file"
+    # A non-guarded mutating tool is denied at the name level in plan mode;
+    # guarded tools instead defer to Phase-2 argument-level enforcement.
+    tool.name = "todo_write"
 
     with pytest.raises(ToolPermissionError) as exc_info:
         await hooks.on_tool_start(MagicMock(), MagicMock(), tool)
 
     assert isinstance(exc_info.value, PermissionError)
-    assert exc_info.value.tool_name == "write_file"
+    assert exc_info.value.tool_name == "todo_write"
 
 
 @pytest.mark.asyncio

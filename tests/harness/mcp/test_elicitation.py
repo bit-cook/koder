@@ -87,9 +87,7 @@ class TestFormMode:
             },
         )
 
-        with (
-            patch("koder_agent.mcp.elicitation.Confirm") as mock_confirm,
-        ):
+        with (patch("koder_agent.mcp.elicitation.Confirm") as mock_confirm,):
             # First call for the boolean field, second call for submission confirm
             mock_confirm.ask.side_effect = [True, True]
             result = handler._handle_form(params)

@@ -1,6 +1,8 @@
 """File operation tools."""
 
+import errno
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -22,6 +24,36 @@ _LEFT_SINGLE_CURLY = "\u2018"  # '
 _RIGHT_SINGLE_CURLY = "\u2019"  # '
 _LEFT_DOUBLE_CURLY = "\u201c"  # "
 _RIGHT_DOUBLE_CURLY = "\u201d"  # "
+
+
+# O_NOFOLLOW makes open() refuse to traverse a symlink at the final path
+# component, closing the check-then-write (TOCTOU) window where the resolved
+# target could be swapped for a symlink pointing outside the workspace after the
+# permission check passed. It is a no-op on platforms lacking the flag (Windows),
+# which also lack the POSIX symlink semantics this guards against.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _write_bytes_no_follow(path: str, data: bytes, *, append: bool) -> None:
+    """Write ``data`` to ``path``'s leaf without following a leaf symlink.
+
+    The parent is resolved but the final component is kept literal, so ``open``
+    sees the leaf as the caller named it. With ``O_NOFOLLOW`` a symlinked leaf
+    raises ``OSError`` (``ELOOP``) instead of silently redirecting the write to
+    the symlink's target — the case a full ``Path.resolve()`` would mask.
+    """
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    # Resolve only the parent; keep the leaf literal so O_NOFOLLOW can guard it.
+    target = raw.parent.resolve() / raw.name
+    flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW
+    flags |= os.O_APPEND if append else os.O_TRUNC
+    fd = os.open(str(target), flags, 0o644)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 def _normalize_quotes(s: str) -> str:
@@ -334,8 +366,8 @@ def write_file(path: str, content: str) -> str:
             except Exception:
                 old_content = ""
 
-        # Write the new content
-        p.write_text(content, "utf-8")
+        # Write the new content (refusing to follow a leaf symlink)
+        _write_bytes_no_follow(path, content.encode("utf-8"), append=False)
         _file_state.record_read(str(p), content=content)
 
         # Generate diff for display
@@ -347,7 +379,9 @@ def write_file(path: str, content: str) -> str:
         else:
             return f"Updated {path} ({len(content)} bytes)\n---DIFF---\n{diff_output}"
 
-    except PermissionError as e:
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"Refusing to write through a symlink: {path}"
         return str(e)
     except Exception as e:
         return f"Error writing file: {str(e)}"
@@ -367,6 +401,17 @@ def append_file(path: str, content: str) -> str:
 
         # Get old content for diff (if file exists)
         is_new_file = not p.exists()
+
+        # Enforce read-before-write for existing files, matching write_file
+        if not is_new_file:
+            if not _file_state.has_been_read(str(p)):
+                return "File has not been read yet. Read it first before appending to it."
+            if _file_state.is_stale(str(p)):
+                return (
+                    "File has been modified since it was last read. "
+                    "Read it again before attempting to append to it."
+                )
+
         old_content = ""
         if not is_new_file:
             try:
@@ -374,18 +419,22 @@ def append_file(path: str, content: str) -> str:
             except Exception:
                 old_content = ""
 
-        # Append the content
-        with p.open("a", encoding="utf-8") as f:
-            f.write(content)
+        # Append the content (refusing to follow a leaf symlink)
+        _write_bytes_no_follow(path, content.encode("utf-8"), append=True)
 
         # Generate diff for display (showing appended content)
         new_content = old_content + content
+        # Record the new full content so a subsequent append/edit doesn't
+        # spuriously fail the staleness check (mirrors write_file).
+        _file_state.record_read(str(p), content=new_content)
         filename = p.name
         diff_output = _generate_diff_output(old_content, new_content, filename, is_new_file)
 
         return f"Appended {len(content)} bytes to {path}\n---DIFF---\n{diff_output}"
 
-    except PermissionError as e:
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"Refusing to append through a symlink: {path}"
         return str(e)
     except Exception as e:
         return f"Error appending to file: {str(e)}"

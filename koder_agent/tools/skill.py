@@ -128,15 +128,20 @@ class Skill:
             return "[inline command execution disabled]"
 
         if self.shell == "powershell":
-            # The bash security analyzer is bash-oriented and cannot reason about
-            # PowerShell syntax, so we only honor the disable gate here.
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
-                capture_output=True,
-                text=True,
-                cwd=str(Path.cwd()),
-                check=False,
+            # Security gate 2 (PowerShell): route the candidate through the
+            # PowerShell classifier BEFORE executing. Inline expansion happens at
+            # render time with no human in the loop, so only clearly read-only
+            # commands (allowed and not requiring approval) may run; everything
+            # else is blocked, mirroring the bash branch's [blocked] behavior.
+            from koder_agent.harness.permissions.powershell_classifier import (
+                classify_powershell_command,
             )
+
+            decision = classify_powershell_command(command)
+            if not decision.allowed or decision.requires_approval:
+                return f"[blocked: {decision.reason}]"
+
+            argv = ["powershell", "-NoProfile", "-Command", command]
         else:
             # Security gate 2: route the candidate command through the existing
             # bash security analyzer BEFORE executing. This prevents a malicious
@@ -149,13 +154,20 @@ class Skill:
             if analysis.blocked:
                 return f"[blocked: {analysis.reason}]"
 
+            argv = ["/bin/bash", "-lc", command]
+
+        # A hanging command would block prompt rendering forever, so bound it.
+        try:
             result = subprocess.run(
-                ["/bin/bash", "-lc", command],
+                argv,
                 capture_output=True,
                 text=True,
                 cwd=str(Path.cwd()),
                 check=False,
+                timeout=30,
             )
+        except subprocess.TimeoutExpired:
+            return "[timed out after 30s]"
         output = result.stdout.strip()
         if output:
             return output
@@ -354,9 +366,7 @@ class SkillLoader:
             argument_hint=(
                 "[" + " ".join(str(item) for item in meta["argument-hint"]) + "]"
                 if isinstance(meta.get("argument-hint"), list)
-                else str(meta["argument-hint"])
-                if meta.get("argument-hint") is not None
-                else None
+                else str(meta["argument-hint"]) if meta.get("argument-hint") is not None else None
             ),
             argument_names=_parse_list(meta.get("arguments")),
             model=(

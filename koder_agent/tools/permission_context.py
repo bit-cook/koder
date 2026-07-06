@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ GUARDED_TOOLS: frozenset[str] = frozenset(
     {
         "run_shell",
         "run_powershell",
+        "git_command",
         "write_file",
         "edit_file",
         "append_file",
@@ -51,9 +53,13 @@ GUARDED_TOOLS: frozenset[str] = frozenset(
 )
 
 # Env flag controlling what happens when a call *requires approval* but no
-# interactive approver is wired into the context. Default preserves historical
-# behavior (allow + log), matching the legacy ``ApprovalHooks`` non-interactive
-# path. Set truthy to fail closed (deny approval-required calls).
+# interactive approver is wired into the context. When set, an explicit value
+# always wins ("1/true/yes/on" -> fail closed; "0/false/no/off" -> allow + log).
+# When unset/empty the default is TTY-aware: fail closed on a non-interactive
+# (headless/piped) stdin — where nobody can approve, so silent-allow would be the
+# real security hole — and preserve the legacy allow + log when a TTY is attached,
+# since no interactive approver is currently wired and hard-denying every
+# workspace write would brick the tool in a live session.
 _ENFORCE_APPROVAL_ENV = "KODER_ENFORCE_TOOL_APPROVAL"
 
 # Approver signature: (tool_name, arguments, decision) -> awaitable[bool].
@@ -108,9 +114,19 @@ def get_tool_permission_context() -> Optional[ToolPermissionContext]:
 
 def _enforce_approval_when_unattended() -> bool:
     raw = os.environ.get(_ENFORCE_APPROVAL_ENV)
-    if not raw:
-        return False
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if raw:
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    # No explicit override: decide by interactivity. A non-interactive stdin
+    # means there is genuinely nobody to approve, so we fail closed. Inability
+    # to detect a TTY is treated as non-interactive (fail closed) as well.
+    try:
+        return not sys.stdin.isatty()
+    except Exception:
+        return True
 
 
 def _denial_message(tool_name: str, reason: str) -> str:
@@ -228,8 +244,14 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
             return None if approved else _deny(decision.reason)
         # No interactive approver available.
         if _enforce_approval_when_unattended():
-            return _deny(decision.reason)
-        logger.debug(
+            return _deny(
+                f"{decision.reason}. No approver is available (non-interactive run); "
+                "set KODER_ENFORCE_TOOL_APPROVAL=0 to opt out, or use acceptEdits/"
+                "bypass mode or an allow rule to permit this call"
+            )
+        # Interactive fail-open: log at warning so a silent allow is at least
+        # visible in a live session.
+        logger.warning(
             "Tool %s requires approval but no approver is wired; allowing (%s)",
             tool_name,
             decision.reason,

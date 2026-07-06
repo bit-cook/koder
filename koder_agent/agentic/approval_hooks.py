@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 
 from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+from koder_agent.tools.permission_context import GUARDED_TOOLS
 
 if TYPE_CHECKING:
     from koder_agent.harness.permissions.service import PermissionService
@@ -111,11 +112,19 @@ class ApprovalHooks(RunHooks):
         Raises:
             ToolPermissionError: When the permission service denies the tool.
         """
-        if self._permission_service is not None:
-            # on_tool_start receives the Tool but NOT its arguments,
-            # so we can only perform tool-level checks (e.g. "is write_file
-            # allowed in plan mode?").  Argument-level checks (specific file
-            # paths, shell commands) happen inside each tool function.
+        # on_tool_start receives the Tool but NOT its arguments, so a check here
+        # can only be name-level. We split on GUARDED_TOOLS:
+        #
+        # - Guarded tools (run_shell/run_powershell/git_command/write_file/
+        #   edit_file/append_file) are re-evaluated with their FULL arguments in
+        #   Phase 2 (enforce_tool_permission in the compat wrapper), which returns
+        #   a graceful model-visible denial. We SKIP the name-level evaluate/raise
+        #   for them here: an arguments={} evaluation would deny the whole turn
+        #   (e.g. in plan mode) and can never match a target-scoped allow rule.
+        # - Non-guarded tools (e.g. todo_write/task_delegate) have no Phase-2
+        #   path, so this name-level check is their only plan-mode enforcement;
+        #   keep the evaluate/raise for them.
+        if self._permission_service is not None and tool.name not in GUARDED_TOOLS:
             result = self._permission_service.evaluate_tool_call(
                 tool_name=tool.name,
                 arguments={},
