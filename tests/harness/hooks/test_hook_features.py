@@ -18,7 +18,6 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from koder_agent.harness.hooks.runtime import (  # noqa: E402
-    _MAX_HOOK_OUTPUT_CHARS,
     _once_fired,
     dispatch_command_hooks,
 )
@@ -189,44 +188,6 @@ def test_command_hook_timeout_prevents_hang(tmp_path, monkeypatch):
     # Should not block forever; timeout causes non-blocking error (exit 1)
     assert result.matched_hooks == 1
     assert not result.blocked
-
-
-# ---- output cap ----
-
-
-def test_hook_output_is_capped_at_10000_chars(tmp_path, monkeypatch):
-    """Hook additionalContext exceeding 10000 chars should be truncated."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    project = tmp_path / "project"
-    big_context = "x" * 15_000
-    _write_settings(
-        project,
-        {
-            "hooks": {
-                "PostToolUse": [
-                    {
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": f'python -c "print(\'{{\\"hookSpecificOutput\\":{{\\"additionalContext\\":\\"{big_context}\\"}}}}\')"',
-                            }
-                        ]
-                    }
-                ]
-            }
-        },
-    )
-    monkeypatch.chdir(project)
-
-    result = dispatch_command_hooks(
-        cwd=project,
-        event_name="PostToolUse",
-        match_value="Edit",
-        payload={"event": "PostToolUse", "tool_name": "Edit", "tool_input": {}, "result": "ok"},
-    )
-    assert result.additional_context is not None
-    assert len(result.additional_context) <= _MAX_HOOK_OUTPUT_CHARS + 100  # some slack for suffix
-    assert "truncated" in result.additional_context
 
 
 # ---- KODER_ENV_FILE for CwdChanged and FileChanged ----

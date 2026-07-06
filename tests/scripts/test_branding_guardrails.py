@@ -24,7 +24,23 @@ SCAN_ROOTS = [
 ]
 
 
+def _git_visible_files() -> set[Path] | None:
+    """Files git would ship: tracked plus untracked-but-not-ignored."""
+    result = subprocess.run(
+        ["git", "ls-files", "-co", "--exclude-standard"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return {ROOT / line for line in result.stdout.splitlines() if line}
+
+
 def _iter_scan_files() -> list[Path]:
+    visible = _git_visible_files()
     files: list[Path] = []
     for root in SCAN_ROOTS:
         if root.is_file():
@@ -33,6 +49,8 @@ def _iter_scan_files() -> list[Path]:
             candidates = [candidate for candidate in root.rglob("*") if candidate.is_file()]
         for candidate in candidates:
             if "__pycache__" in candidate.parts or candidate.suffix in {".pyc", ".png"}:
+                continue
+            if visible is not None and candidate not in visible:
                 continue
             files.append(candidate)
     return sorted(files)

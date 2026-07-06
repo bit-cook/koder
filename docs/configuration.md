@@ -10,6 +10,7 @@ Koder supports flexible configuration through three mechanisms (in order of prio
 
 - [Config File](#config-file)
 - [Environment Variables](#environment-variables)
+- [Settings Files](#settings-files)
 - [Settings Bundles](#settings-bundles)
 - [Managed Settings](#managed-settings)
 - [Provider Setup](#provider-setup)
@@ -107,6 +108,18 @@ Use these if you need different keys for different providers:
 | Cohere | `COHERE_API_KEY` | - |
 | Bedrock | `AWS_ACCESS_KEY_ID` | `AWS_SECRET_ACCESS_KEY` |
 
+## Settings Files
+
+Besides `config.yaml`, Koder reads JSON settings files for hooks, permission rules, sandbox policy, and the status line:
+
+| File | Scope |
+|---|---|
+| `~/.koder/settings.json` | User, all projects |
+| `.koder/settings.json` | Project, committed to git |
+| `.koder/settings.local.json` | Project, this machine only (gitignored) |
+
+Permission rules live under `permissions.allow` / `permissions.deny` as `"tool_name(content)"` strings (deny rules win over allow rules). Hook configuration lives under `hooks` — see the [Hooks](hooks.md) guide for events, matchers, and examples.
+
 ## Settings Bundles
 
 Koder can export and import a local settings bundle for machine-to-machine setup or backup. Bundles include known Koder config, settings, keybindings, user memories, project memories, and project session notes. Token stores, model caches, transcripts, task records, plugin caches, and arbitrary files are not included.
@@ -125,7 +138,6 @@ Export and import scopes are `all`, `user`, and `project`. Import writes into th
 Koder reads an optional local managed policy file at `~/.koder/managed-settings.json`. It can define high-priority hook settings and sandbox policy keys such as `enabled`, `mode`, `backend`, and `autoAllowBashIfSandboxed`.
 
 ```bash
-koder /sandbox status
 koder /hooks
 koder /sandbox status
 ```
@@ -444,7 +456,7 @@ mcp_servers:
     transport_type: "http"
     url: "https://internal-mcp.company.com"
     headers:
-      X-API-Key: "${COMPANY_API_KEY}"
+      X-API-Key: "your-company-api-key"
 ```
 
 ```bash
@@ -452,6 +464,8 @@ export AZURE_API_KEY="..."
 export AZURE_API_BASE="https://your-resource.openai.azure.com"
 koder
 ```
+
+Note: `config.yaml` values are used literally; `${VAR}` placeholders are not expanded there. Environment-variable interpolation in MCP server definitions works only in a project `.mcp.json` file — put `"X-API-Key": "${COMPANY_API_KEY}"` there and the real value stays in your environment. For YAML-configured servers, use `koder mcp add --header` or write the literal value.
 
 ### Multi-Provider Development
 

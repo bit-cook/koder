@@ -102,10 +102,41 @@ def test_agent_tool_async_spawn_returns_agent_id(tmp_path, monkeypatch):
 
 def test_agent_tool_with_isolation_worktree(tmp_path, monkeypatch):
     """Agent tool passes isolation=worktree to the agent definition."""
+    import subprocess
+
+    # The tool creates a real worktree in Path.cwd(); run inside a throwaway
+    # git repo so the developer's repository is never touched.
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.chdir(repo_root)
+
     seen_definitions = []
+    seen_cwds = []
 
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
         seen_definitions.append(agent_definition)
+        seen_cwds.append(cwd)
         return "worktree result"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -125,6 +156,18 @@ def test_agent_tool_with_isolation_worktree(tmp_path, monkeypatch):
     # The definition passed to execute should have isolation set
     assert len(seen_definitions) == 1
     assert seen_definitions[0].isolation == "worktree"
+    # The run happened in a worktree, and the clean worktree was removed
+    # afterwards along with its sync-agent/* branch.
+    assert seen_cwds[0] != str(repo_root)
+    assert not Path(seen_cwds[0]).exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "sync-agent/*", "--format=%(refname:short)"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branches == ""
 
 
 def test_agent_tool_background_frontmatter_forces_async(monkeypatch):

@@ -48,6 +48,8 @@ Sandbox policy supports these high-level modes:
 
 Koder currently treats file tools, MCP servers, teammate processes, and background shell commands as permission-backed unless their execution path is explicitly routed through a sandbox backend. Hosted backends are listed with missing dependency or credential hints; credentials are not printed. See the [Sandbox Guide](sandbox.md) for setup, status fields, backend options, and troubleshooting.
 
+Hooks extend this policy layer with your own commands: a `PermissionRequest` hook can approve or deny a call programmatically, and `PermissionDenied` hooks can log every denial. See [Hooks](hooks.md).
+
 ## Workspace Directories
 
 Koder starts from the current working directory. Add another workspace root only when a task needs it:
@@ -127,5 +129,6 @@ Before giving Koder a sensitive repository, check:
 - Run `/memory` to inspect project and user memories that may influence prompts.
 - Run `/permissions` and `/sandbox status` to see command policy and backend availability.
 - Run `/mcp`, `/plugin`, and `/channels` to inspect external tool surfaces.
+- Run `/hooks` to see which hook commands run automatically on session and tool events.
 - Keep API keys in environment variables or user config; do not store them in repository files.
 - Treat model-provider requests as remote requests to that provider, even though Koder's own product state is local.

@@ -25,9 +25,6 @@ from koder_agent.harness.session_env import (
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters of hook output injected into model context.
-_MAX_HOOK_OUTPUT_CHARS = 10_000
-
 # Events that receive KODER_ENV_FILE.
 _ENV_FILE_EVENTS = frozenset({"SessionStart", "CwdChanged", "FileChanged"})
 
@@ -243,8 +240,6 @@ class HookDispatchResult:
     matched_hooks: int
     blocked: bool = False
     block_reason: str | None = None
-    additional_context: str | None = None
-    updated_input: dict[str, Any] | None = None
     permission_request_result: dict[str, Any] | None = None
     watch_paths: list[str] | None = None
     worktree_path: str | None = None
@@ -258,9 +253,6 @@ _active_skill_hook_scopes: ContextVar[list[HookScope]] = ContextVar(
     default=[],
 )
 _watched_paths: dict[str, float | None] = {}
-
-# Pending async-rewake signals from hooks that exited with code 2.
-_async_rewake_pending: list[dict[str, Any]] = []
 
 # Tracks hooks marked ``once: true`` that have already fired.
 # Key is ``(source, event_name, hook_identity)`` where hook_identity
@@ -280,9 +272,7 @@ class HookConfig:
     shell: str = ""  # "" means default, or "bash"/"zsh"/"sh"
     headers: dict[str, str] | None = None
     allowed_env_vars: list[str] | None = None
-    status_message: str = ""
     async_hook: bool = False
-    async_rewake: bool = False
     once: bool = False
     matcher: str = ""
     if_condition: str = ""
@@ -488,15 +478,6 @@ def _hook_identity(hook: dict[str, Any]) -> str:
     return f"unknown:{id(hook)}"
 
 
-def _cap_output(text: str | None) -> str | None:
-    """Cap hook output to _MAX_HOOK_OUTPUT_CHARS."""
-    if text is None:
-        return None
-    if len(text) <= _MAX_HOOK_OUTPUT_CHARS:
-        return text
-    return text[:_MAX_HOOK_OUTPUT_CHARS] + f"\n... (truncated, {len(text)} chars total)"
-
-
 def _run_command_hook(
     *,
     command: str,
@@ -680,17 +661,10 @@ def _merge_dispatch_result(
     permission_request_result = (
         hook_specific.get("decision") if isinstance(hook_specific.get("decision"), dict) else None
     )
-    raw_context = hook_specific.get("additionalContext") or parsed.get("systemMessage")
     return HookDispatchResult(
         matched_hooks=current.matched_hooks,
         blocked=current.blocked,
         block_reason=current.block_reason,
-        additional_context=_cap_output(raw_context),
-        updated_input=(
-            hook_specific.get("updatedInput")
-            if isinstance(hook_specific.get("updatedInput"), dict)
-            else None
-        ),
         permission_request_result=permission_request_result,
         watch_paths=(
             hook_specific.get("watchPaths")
@@ -756,7 +730,6 @@ def _run_async_command(
     cwd: Path,
     env: dict[str, str],
     shell: str = "",
-    async_rewake: bool = False,
 ) -> None:
     if shell:
         cmd: str | list[str] = [shell, "-c", command]
@@ -766,7 +739,7 @@ def _run_async_command(
         use_shell = True
 
     def _target():
-        proc = subprocess.run(
+        subprocess.run(
             cmd,
             input=payload_text,
             text=True,
@@ -776,16 +749,6 @@ def _run_async_command(
             env=env,
             check=False,
         )
-        if async_rewake and proc.returncode == 2:
-            # Exit code 2 with asyncRewake causes the model to re-wake.
-            # Store the signal for the scheduler to detect.
-            _async_rewake_pending.append(
-                {
-                    "command": command,
-                    "returncode": proc.returncode,
-                    "stderr": proc.stderr.strip() if proc.stderr else "",
-                }
-            )
 
     thread = threading.Thread(target=_target, daemon=True)
     thread.start()
@@ -874,9 +837,6 @@ def dispatch_command_hooks(
                     if isinstance(hook.get("allowedEnvVars"), list)
                     else None
                 )
-                # statusMessage: text shown in spinner while hook runs.
-                # Stored for callers to read via HookConfig; not used here directly.
-                _status_message = hook.get("statusMessage") or ""  # noqa: F841
                 stdout = ""
                 stderr = ""
                 code = 0
@@ -891,7 +851,6 @@ def dispatch_command_hooks(
                             cwd=scope.skill_root or Path(cwd).resolve(),
                             env=env,
                             shell=hook_shell,
-                            async_rewake=hook.get("asyncRewake") is True,
                         )
                         continue
                     result = HookDispatchResult(matched_hooks=result.matched_hooks + 1)
@@ -946,8 +905,6 @@ def dispatch_command_hooks(
                         matched_hooks=result.matched_hooks,
                         blocked=True,
                         block_reason=stderr or block_reason or "Blocked by hook",
-                        additional_context=result.additional_context,
-                        updated_input=result.updated_input,
                         permission_request_result=result.permission_request_result,
                         watch_paths=result.watch_paths,
                         worktree_path=result.worktree_path,
@@ -959,8 +916,6 @@ def dispatch_command_hooks(
                         matched_hooks=result.matched_hooks,
                         blocked=True,
                         block_reason=block_reason,
-                        additional_context=result.additional_context,
-                        updated_input=result.updated_input,
                         permission_request_result=result.permission_request_result,
                         watch_paths=result.watch_paths,
                         worktree_path=result.worktree_path,

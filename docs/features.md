@@ -14,6 +14,7 @@ This guide is the topic map for the `koder` CLI. Start here when you want to kno
 | Engineering workflows | [Workflows](workflows.md) | Reviews, security review, planning, Git readiness, PR comments, GitHub Actions setup, and release notes. |
 | Extension system | [Skills, Plugins, and MCP](extensions.md) | Skills, verifier skills, plugins, MCP servers, channels, and Magic Docs. |
 | Permissions and data | [Permissions and Privacy](permissions-and-privacy.md) | Tool approvals, sandbox policy, managed settings, workspace directories, local paths, and privacy boundaries. |
+| Event hooks | [Hooks](hooks.md) | Run your own commands on session, tool, permission, compaction, and agent lifecycle events. |
 | Shell sandboxing | [Sandbox Guide](sandbox.md) | Backend selection, real backend status, shell isolation boundaries, backend setup, and troubleshooting. |
 | Voice input | [Voice Mode](voice-mode.md) | Dictation controls and provider-specific speech-to-text configuration. |
 | Full command list | [Command Reference](commands.md) | Complete slash-command catalog with examples. |
@@ -55,6 +56,7 @@ Koder is organized around a few everyday jobs:
 | Add local domain knowledge | [Skills, Plugins, and MCP](extensions.md), then `/skills`, `/init-verifiers`, `/plugin`, and `/mcp`. |
 | Run parallel investigations | [Agents and Teams](agents-and-teams.md), then `/fork`, `/agents`, `/peers`, and `/tasks`. |
 | Audit data access and command risk | [Permissions and Privacy](permissions-and-privacy.md) and [Sandbox Guide](sandbox.md). |
+| Automate actions on session or tool events | [Hooks](hooks.md), then `/hooks` to inspect the loaded configuration. |
 
 ## Common Starting Points
 

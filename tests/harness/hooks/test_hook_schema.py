@@ -15,20 +15,6 @@ class TestHookShellSelection:
         assert cfg.shell == "bash"
 
 
-class TestAsyncRewake:
-    def test_async_rewake_default_false(self):
-        from koder_agent.harness.hooks.runtime import HookConfig
-
-        cfg = HookConfig(type="command", command="echo test", async_hook=True)
-        assert cfg.async_rewake is False
-
-    def test_async_rewake_can_be_enabled(self):
-        from koder_agent.harness.hooks.runtime import HookConfig
-
-        cfg = HookConfig(type="command", command="echo test", async_hook=True, async_rewake=True)
-        assert cfg.async_rewake is True
-
-
 class TestHttpHeaders:
     def test_headers_default_none(self):
         from koder_agent.harness.hooks.runtime import HookConfig
@@ -69,15 +55,29 @@ class TestEnvVarExpansion:
         assert result == "Bearer "
 
 
-class TestStatusMessage:
-    def test_status_message_default_empty(self):
+class TestHookConfigHasNoReservedFields:
+    def test_every_config_field_is_consumed_by_dispatch(self):
+        """HookConfig must not accumulate parsed-but-unused fields again.
+
+        asyncRewake and statusMessage were removed because nothing consumed
+        them; this pins the surviving field list.
+        """
+        from dataclasses import fields
+
         from koder_agent.harness.hooks.runtime import HookConfig
 
-        cfg = HookConfig(type="command", command="echo test")
-        assert cfg.status_message == ""
-
-    def test_status_message_can_be_set(self):
-        from koder_agent.harness.hooks.runtime import HookConfig
-
-        cfg = HookConfig(type="command", command="lint", status_message="Running linter...")
-        assert cfg.status_message == "Running linter..."
+        assert [field.name for field in fields(HookConfig)] == [
+            "type",
+            "command",
+            "url",
+            "prompt",
+            "timeout",
+            "shell",
+            "headers",
+            "allowed_env_vars",
+            "async_hook",
+            "once",
+            "matcher",
+            "if_condition",
+            "model",
+        ]

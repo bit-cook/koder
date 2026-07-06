@@ -367,6 +367,128 @@ def test_agent_service_keeps_dirty_worktree_after_completion(tmp_path, monkeypat
     asyncio.run(run_case())
 
 
+def _list_sync_agent_branches(repo_root: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "branch", "--list", "sync-agent/*", "--format=%(refname:short)"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def test_agent_service_run_sync_removes_clean_worktree_and_branch(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    seen_cwds: list[str] = []
+
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+        seen_cwds.append(cwd)
+        return "sync isolated result"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+        isolation="worktree",
+    )
+
+    async def run_case():
+        result = await service.run_sync(
+            agent_definition=definition,
+            prompt="Investigate in worktree",
+            cwd=repo_root,
+        )
+        assert result == "sync isolated result"
+        assert seen_cwds and seen_cwds[0] != str(repo_root)
+        # The clean worktree and its sync-agent/* branch are removed after the run.
+        assert not Path(seen_cwds[0]).exists()
+        assert _list_sync_agent_branches(repo_root) == []
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_run_sync_keeps_dirty_worktree(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    seen_cwds: list[str] = []
+
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+        seen_cwds.append(cwd)
+        (Path(cwd) / "result.txt").write_text("agent output\n", encoding="utf-8")
+        return "sync isolated result"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+        isolation="worktree",
+    )
+
+    async def run_case():
+        await service.run_sync(
+            agent_definition=definition,
+            prompt="Produce a file in the worktree",
+            cwd=repo_root,
+        )
+        # Dirty worktrees are kept so the user can inspect or merge the work.
+        assert Path(seen_cwds[0]).exists()
+        assert (Path(seen_cwds[0]) / "result.txt").exists()
+        assert len(_list_sync_agent_branches(repo_root)) == 1
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_run_sync_removes_clean_worktree_on_failure(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    seen_cwds: list[str] = []
+
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+        seen_cwds.append(cwd)
+        raise RuntimeError("agent exploded")
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+        isolation="worktree",
+    )
+
+    async def run_case():
+        with pytest.raises(RuntimeError, match="agent exploded"):
+            await service.run_sync(
+                agent_definition=definition,
+                prompt="Fail inside worktree",
+                cwd=repo_root,
+            )
+        # A failed run that left no changes has nothing to inspect; the
+        # worktree and branch must not leak.
+        assert not Path(seen_cwds[0]).exists()
+        assert _list_sync_agent_branches(repo_root) == []
+
+    asyncio.run(run_case())
+
+
 def test_agent_service_can_reload_agent_record_from_disk(tmp_path, monkeypatch):
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
         return "persisted result"

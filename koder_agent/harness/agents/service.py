@@ -286,23 +286,39 @@ class AgentService:
         permission_mode: str | None = None,
     ) -> str:
         effective_cwd = str(cwd) if cwd is not None else None
+        worktree_service: WorktreeService | None = None
+        worktree_created = None
         if agent_definition.isolation == "worktree" and cwd is not None:
             cwd_path = Path(cwd).resolve()
-            service = WorktreeService(worktrees_dir(cwd_path), repo_root=cwd_path)
-            created = service.create(f"sync-agent/{uuid.uuid4().hex[:8]}")
-            effective_cwd = str(created.path)
-        scoped_service = PlanModeService()
-        effective_permission_mode = permission_mode or agent_definition.permission_mode or "default"
-        if effective_permission_mode == "plan":
-            scoped_service.enter_plan_mode(permission_mode="plan")
-        with plan_service_scope(scoped_service):
-            return await _execute_agent_run(
-                agent_definition=agent_definition,
-                prompt=prompt,
-                session_id=f"subagent-sync-{uuid.uuid4().hex[:8]}",
-                seed_items=seed_items,
-                cwd=effective_cwd,
+            worktree_service = WorktreeService(worktrees_dir(cwd_path), repo_root=cwd_path)
+            worktree_created = worktree_service.create(f"sync-agent/{uuid.uuid4().hex[:8]}")
+            effective_cwd = str(worktree_created.path)
+        try:
+            scoped_service = PlanModeService()
+            effective_permission_mode = (
+                permission_mode or agent_definition.permission_mode or "default"
             )
+            if effective_permission_mode == "plan":
+                scoped_service.enter_plan_mode(permission_mode="plan")
+            with plan_service_scope(scoped_service):
+                return await _execute_agent_run(
+                    agent_definition=agent_definition,
+                    prompt=prompt,
+                    session_id=f"subagent-sync-{uuid.uuid4().hex[:8]}",
+                    seed_items=seed_items,
+                    cwd=effective_cwd,
+                )
+        finally:
+            # Dirty worktrees are kept so the user can inspect or merge them.
+            if worktree_service is not None and worktree_created is not None:
+                try:
+                    worktree_service.remove_if_clean(
+                        worktree_created.path, branch=worktree_created.branch
+                    )
+                except Exception:
+                    logger.debug(
+                        "Worktree cleanup failed for %s", worktree_created.path, exc_info=True
+                    )
 
     async def resume_background(
         self,

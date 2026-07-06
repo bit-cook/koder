@@ -384,6 +384,7 @@ See [Sandbox Guide](docs/sandbox.md) and [Permissions and Privacy](docs/permissi
 - [Workflows](docs/workflows.md) - review, planning, Git, GitHub, release, and verification workflows
 - [Skills, Plugins, and MCP](docs/extensions.md) - extending Koder with skills, plugins, MCP servers, channels, and Magic Docs
 - [Permissions and Privacy](docs/permissions-and-privacy.md) - approvals, sandbox policy, managed settings, workspace roots, and data boundaries
+- [Hooks](docs/hooks.md) - run your own commands on session, tool, permission, and agent lifecycle events
 - [Sandbox Guide](docs/sandbox.md) - shell sandbox backends, status fields, configuration, and troubleshooting
 - [Voice Mode](docs/voice-mode.md) - voice dictation setup and provider-specific notes
 - [Command Reference](docs/commands.md) - complete slash-command catalog

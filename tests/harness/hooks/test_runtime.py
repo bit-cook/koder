@@ -213,7 +213,7 @@ def test_dispatch_command_hooks_supports_http_prompt_agent_and_async_handlers(
             body = data.split("\r\n\r\n", 1)[1]
             payload = json.loads(body)
             response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json.dumps(
-                {"hookSpecificOutput": {"additionalContext": payload["event"]}}
+                {"hookSpecificOutput": {"echo": payload["event"]}}
             )
             self.request.sendall(response.encode("utf-8"))
 
@@ -257,11 +257,11 @@ def test_dispatch_command_hooks_supports_http_prompt_agent_and_async_handlers(
 
     monkeypatch.setattr(
         "koder_agent.harness.hooks.runtime._run_prompt_hook",
-        lambda **_kwargs: json.dumps({"hookSpecificOutput": {"additionalContext": "prompt"}}),
+        lambda **_kwargs: json.dumps({"hookSpecificOutput": {"echo": "prompt"}}),
     )
     monkeypatch.setattr(
         "koder_agent.harness.hooks.runtime._run_agent_hook",
-        lambda **_kwargs: json.dumps({"hookSpecificOutput": {"additionalContext": "agent"}}),
+        lambda **_kwargs: json.dumps({"hookSpecificOutput": {"echo": "agent"}}),
     )
 
     result = dispatch_command_hooks(

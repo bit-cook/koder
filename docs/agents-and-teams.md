@@ -37,6 +37,8 @@ Default subagent context is isolated from the main agent. The main session recei
 
 Subagents inherit the active model configuration, including model name, base URL, reasoning effort, and OAuth-style provider routing where supported. That keeps background work on the same provider family as the main session unless you intentionally override it.
 
+An agent definition with `isolation: worktree` in its frontmatter runs in its own git worktree under `.koder/worktrees/`, so its edits cannot collide with your working tree. When the run finishes and the worktree contains no changes, Koder removes it automatically (firing the `WorktreeRemove` hook); a worktree with uncommitted work is kept for you to inspect or merge. See [Hooks](hooks.md) for the `SubagentStart`, `SubagentStop`, `WorktreeCreate`, and `WorktreeRemove` events.
+
 ## Task Delegate Tool
 
 During normal model execution, Koder may expose `task_delegate` for bounded background work. Treat it like `/fork`: delegate concrete tasks with clear outputs, keep the main session responsible for integration, and avoid asking a subagent to guess unstated context.

@@ -16,6 +16,7 @@ TOPIC_GUIDES = [
     "docs/workflows.md",
     "docs/extensions.md",
     "docs/permissions-and-privacy.md",
+    "docs/hooks.md",
     "docs/voice-mode.md",
     "docs/commands.md",
 ]

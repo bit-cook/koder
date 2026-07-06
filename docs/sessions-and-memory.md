@@ -40,6 +40,8 @@ Inside the TUI:
 
 `/clear` switches to a fresh workflow state. The previous named session remains resumable unless you explicitly remove local state outside Koder.
 
+When `/resume` switches sessions inside the TUI, Koder also restores the working directory recorded for that session (and fires the `CwdChanged` hook, see [Hooks](hooks.md)) so the resumed session continues where it actually ran.
+
 ## Inspecting Session State
 
 Use these commands to understand what the active session contains:
