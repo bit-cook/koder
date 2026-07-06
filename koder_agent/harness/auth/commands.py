@@ -7,6 +7,7 @@ import json
 import logging
 import numbers
 import os
+import sys
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -14,10 +15,17 @@ from typing import Dict, Optional
 from rich.console import Console
 from rich.panel import Panel
 
+from koder_agent.auth.base import OAuthTokens
 from koder_agent.auth.callback_server import CallbackResult, run_oauth_flow
 from koder_agent.auth.constants import SUPPORTED_PROVIDERS, TOKEN_EXPIRY_BUFFER_MS
 from koder_agent.auth.providers import get_provider
 from koder_agent.auth.token_storage import get_token_storage
+
+# Env var used as a fallback source for headless token ingestion.
+AUTH_TOKEN_ENV = "KODER_AUTH_TOKEN"
+# Access tokens ingested via stdin/env have no refresh flow; give them a long
+# nominal lifetime so status does not immediately report them as expired.
+STDIN_TOKEN_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -114,6 +122,53 @@ async def handle_login(provider_id: str, timeout: float = 300) -> bool:
     except Exception as exc:
         console.print(f"[red]Error during authentication:[/red] {exc}")
         return False
+
+
+def _resolve_ingested_token(token_arg: Optional[str]) -> Optional[str]:
+    """Resolve a token from the --token argument, stdin, or KODER_AUTH_TOKEN.
+
+    ``--token -`` reads a single token from stdin. Any other ``--token`` value
+    is used literally. When ``--token`` is absent, the ``KODER_AUTH_TOKEN``
+    environment variable is used as a fallback.
+    """
+    if token_arg == "-":
+        stdin_value = sys.stdin.read()
+        stripped = stdin_value.strip()
+        return stripped or None
+    if token_arg:
+        return token_arg.strip() or None
+    env_value = os.environ.get(AUTH_TOKEN_ENV)
+    if env_value and env_value.strip():
+        return env_value.strip()
+    return None
+
+
+def handle_token_login(provider_id: str, token: str) -> bool:
+    """Persist a directly-provided access token without a browser flow."""
+    provider_id = _normalize_provider_id(provider_id)
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID:
+        console.print(
+            "[yellow]GitHub Copilot tokens are managed by LiteLLM and cannot be "
+            "ingested directly. Run `koder auth login github_copilot`.[/yellow]"
+        )
+        return False
+
+    tokens = OAuthTokens(
+        provider=provider_id,
+        access_token=token,
+        refresh_token="",
+        expires_at=int(time.time() * 1000) + STDIN_TOKEN_LIFETIME_MS,
+    )
+    storage = get_token_storage()
+    storage.save(tokens)
+    console.print(
+        Panel(
+            f"[green]Token saved for {provider_id}[/green]\nSource: stdin/env (no browser flow)",
+            title="Authentication Complete",
+            border_style="green",
+        )
+    )
+    return True
 
 
 async def handle_github_copilot_login(timeout: float = 300) -> bool:
@@ -295,6 +350,57 @@ async def handle_status(provider_id: Optional[str] = None) -> None:
         console.print()
 
 
+def _token_status_label(tokens) -> str:
+    if tokens.is_expired(0):
+        return "expired"
+    if tokens.is_expired(TOKEN_EXPIRY_BUFFER_MS):
+        return "expiring_soon"
+    return "valid"
+
+
+def _build_token_status_dict(provider_id: str, tokens) -> dict:
+    """Build a JSON-serializable, redacted status dict for one provider."""
+    now_ms = int(datetime.now().timestamp() * 1000)
+    time_left_ms = tokens.expires_at - now_ms
+    return {
+        "provider": provider_id,
+        "status": _token_status_label(tokens),
+        "account": tokens.email,
+        "expires_at": tokens.expires_at,
+        "time_left_minutes": max(0, time_left_ms // 60000),
+        "has_access_token": bool(tokens.access_token),
+        "has_refresh_token": bool(tokens.refresh_token),
+        "models": sorted(tokens.models) if tokens.models else [],
+    }
+
+
+async def handle_status_json(provider_id: Optional[str] = None) -> None:
+    """Emit auth status as a serializable JSON dict (no Rich panels)."""
+    if provider_id:
+        provider_id = _normalize_provider_id(provider_id)
+
+    storage = get_token_storage()
+    payload: dict[str, object]
+
+    if provider_id == GITHUB_COPILOT_PROVIDER_ID:
+        payload = {"providers": [_github_copilot_status_dict()]}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if provider_id:
+        tokens = storage.load(provider_id)
+        if not tokens:
+            payload = {"providers": [{"provider": provider_id, "status": "not_configured"}]}
+        else:
+            payload = {"providers": [_build_token_status_dict(provider_id, tokens)]}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    all_tokens = storage.get_all_tokens()
+    providers = [_build_token_status_dict(pid, tok) for pid, tok in all_tokens.items()]
+    print(json.dumps({"providers": providers}, ensure_ascii=False, indent=2))
+
+
 async def _print_token_details(provider_id: str, tokens, storage) -> None:
     access_token = tokens.access_token
     if tokens.is_expired():
@@ -352,6 +458,43 @@ async def _print_token_details(provider_id: str, tokens, storage) -> None:
     console.print(Panel(info.strip(), title=f"[bold]{provider_id}[/bold]", border_style="blue"))
 
 
+def _github_copilot_status_dict() -> dict:
+    """Build a JSON-serializable status dict for GitHub Copilot."""
+    try:
+        from litellm.llms.github_copilot.authenticator import Authenticator
+
+        authenticator = Authenticator()
+        access_token_exists = bool(
+            authenticator.access_token_file and os.path.exists(authenticator.access_token_file)
+        )
+        api_key_info = None
+        try:
+            with open(authenticator.api_key_file, encoding="utf-8") as file:
+                api_key_info = json.load(file)
+        except Exception:
+            logger.debug("Failed to read GitHub Copilot API key file", exc_info=True)
+
+        raw_expires_at = api_key_info.get("expires_at") if isinstance(api_key_info, dict) else None
+        expires_at = raw_expires_at if isinstance(raw_expires_at, numbers.Real) else None
+        if expires_at:
+            status = "valid" if expires_at > time.time() else "expired"
+        else:
+            status = "needs_login"
+        return {
+            "provider": GITHUB_COPILOT_PROVIDER_ID,
+            "status": status,
+            "has_access_token": access_token_exists,
+            "expires_at": float(expires_at) if expires_at else None,
+            "token_cache": str(authenticator.token_dir),
+        }
+    except Exception as exc:
+        return {
+            "provider": GITHUB_COPILOT_PROVIDER_ID,
+            "status": "unavailable",
+            "error": str(exc),
+        }
+
+
 async def _print_github_copilot_status() -> None:
     try:
         from litellm.llms.github_copilot.authenticator import Authenticator
@@ -405,6 +548,16 @@ Providers:
 
 async def handle_auth_subcommand(args) -> int:
     if args.auth_command == "login":
+        token_arg = getattr(args, "token", None)
+        if token_arg is not None or os.environ.get(AUTH_TOKEN_ENV):
+            token = _resolve_ingested_token(token_arg)
+            if not token:
+                console.print(
+                    "[red]No token provided via --token, stdin, or KODER_AUTH_TOKEN.[/red]"
+                )
+                return 1
+            success = handle_token_login(args.provider, token)
+            return 0 if success else 1
         success = await handle_login(args.provider, timeout=args.timeout)
         return 0 if success else 1
     if args.auth_command == "list":
@@ -414,6 +567,9 @@ async def handle_auth_subcommand(args) -> int:
         success = await handle_revoke(args.provider)
         return 0 if success else 1
     if args.auth_command == "status":
+        if getattr(args, "json_output", False):
+            await handle_status_json(getattr(args, "provider", None))
+            return 0
         await handle_status(getattr(args, "provider", None))
         return 0
     show_auth_help()

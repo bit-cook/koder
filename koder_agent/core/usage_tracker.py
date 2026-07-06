@@ -33,6 +33,38 @@ class SessionUsage:
     last_input_tokens: int = 0  # Last API call's input tokens
     last_output_tokens: int = 0  # Last API call's output tokens
     current_context_tokens: int = 0  # Estimated current context size (tokens)
+    cache_read_tokens: int = 0  # Cumulative cache-read (prompt cache hit) tokens
+    cache_write_tokens: int = 0  # Cumulative cache-write (prompt cache creation) tokens
+
+
+@dataclass
+class UsageSummary:
+    """A snapshot of session usage suitable for /cost-style reporting.
+
+    ``cost_unavailable`` is set when per-token pricing is unknown (e.g. a
+    subscription/OAuth model that litellm has no price for). In that case
+    ``total_cost`` is ``0.0`` and callers should surface the token counts while
+    marking the dollar figure as unavailable rather than printing ``$0.00``.
+    """
+
+    request_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    context_tokens: int = 0
+    total_cost: float = 0.0
+    cost_unavailable: bool = False
+
+    @property
+    def fresh_input_tokens(self) -> int:
+        """Input tokens NOT served from the prompt cache.
+
+        API-reported ``input_tokens`` already excludes cache reads, so this is
+        simply ``input_tokens`` clamped at zero. Exposed as a named accessor so
+        callers can express the "fresh vs cached" split clearly.
+        """
+        return max(0, self.input_tokens)
 
 
 @dataclass
@@ -129,6 +161,8 @@ class UsageTracker:
         cost = self.calculate_cost(input_tokens, output_tokens)
         self.session_usage.input_tokens += input_tokens
         self.session_usage.output_tokens += output_tokens
+        self.session_usage.cache_read_tokens += cache_read_tokens
+        self.session_usage.cache_write_tokens += cache_write_tokens
         self.session_usage.total_cost += cost
         self.session_usage.request_count += 1
         self.session_usage.last_input_tokens = input_tokens
@@ -161,6 +195,53 @@ class UsageTracker:
             Dictionary mapping model names to ModelUsage instances
         """
         return self._per_model
+
+    def pricing_known(self) -> bool:
+        """Return True when per-token pricing is known for the current model.
+
+        On subscription/OAuth backends (or unrecognized models) litellm has no
+        price, so both per-token costs are zero. Callers use this to decide
+        whether to render a dollar figure or mark cost as unavailable.
+        """
+        input_cost, output_cost = self.get_model_costs()
+        return input_cost > 0 or output_cost > 0
+
+    def summary(self) -> "UsageSummary":
+        """Return a structured usage snapshot for /cost-style reporting.
+
+        Aggregates cache-read/cache-write tokens across all recorded requests
+        (falling back to per-model totals for snapshots recorded before those
+        counters existed) and flags ``cost_unavailable`` when the current model
+        has no known per-token pricing.
+
+        Returns:
+            A :class:`UsageSummary` with token counts, context size, cost, and
+            a ``cost_unavailable`` flag.
+        """
+        usage = self.session_usage
+
+        cache_read = getattr(usage, "cache_read_tokens", 0)
+        cache_write = getattr(usage, "cache_write_tokens", 0)
+
+        # Backfill from per-model totals for snapshots that predate session-level
+        # cache counters (older saved usage files, or callers that only recorded
+        # per-model cache tokens).
+        if cache_read == 0 and cache_write == 0 and self._per_model:
+            cache_read = sum(m.cache_read_tokens for m in self._per_model.values())
+            cache_write = sum(m.cache_write_tokens for m in self._per_model.values())
+
+        cost_unavailable = usage.total_cost <= 0.0 and not self.pricing_known()
+
+        return UsageSummary(
+            request_count=usage.request_count,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            context_tokens=usage.current_context_tokens,
+            total_cost=usage.total_cost,
+            cost_unavailable=cost_unavailable,
+        )
 
     def save(self, path: Path) -> None:
         """
@@ -208,15 +289,26 @@ class UsageTracker:
         Format a human-readable usage summary.
 
         Returns:
-            Formatted summary string with session totals and per-model breakdown
+            Formatted summary string with session totals and per-model breakdown.
+            Includes a cache-read split when any cache tokens were recorded, and
+            marks cost as unavailable (rather than ``$0.0000``) when per-token
+            pricing is unknown.
         """
+        summary = self.summary()
         lines = [
             "Usage Summary:",
-            f"  Total Requests: {self.session_usage.request_count}",
-            f"  Total Input Tokens: {self.session_usage.input_tokens:,}",
-            f"  Total Output Tokens: {self.session_usage.output_tokens:,}",
-            f"  Total Cost: ${self.session_usage.total_cost:.4f}",
+            f"  Total Requests: {summary.request_count}",
+            f"  Total Input Tokens: {summary.input_tokens:,}",
+            f"  Total Output Tokens: {summary.output_tokens:,}",
         ]
+        if summary.cache_read_tokens > 0:
+            lines.append(f"  Cache Read Tokens: {summary.cache_read_tokens:,}")
+        if summary.cache_write_tokens > 0:
+            lines.append(f"  Cache Write Tokens: {summary.cache_write_tokens:,}")
+        if summary.cost_unavailable:
+            lines.append("  Total Cost: unavailable (pricing unknown for this model)")
+        else:
+            lines.append(f"  Total Cost: ${summary.total_cost:.4f}")
 
         if self._per_model:
             lines.append("\nPer-Model Breakdown:")
@@ -229,7 +321,10 @@ class UsageTracker:
                     lines.append(f"    Cache Read: {usage.cache_read_tokens:,} tokens")
                 if usage.cache_write_tokens > 0:
                     lines.append(f"    Cache Write: {usage.cache_write_tokens:,} tokens")
-                lines.append(f"    Cost: ${usage.cost:.4f}")
+                if summary.cost_unavailable:
+                    lines.append("    Cost: unavailable")
+                else:
+                    lines.append(f"    Cost: ${usage.cost:.4f}")
 
         return "\n".join(lines)
 

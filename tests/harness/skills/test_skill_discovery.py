@@ -194,3 +194,62 @@ class TestActivateConditionalSkills:
         activated = activate_conditional_skills(skills, "/absolute/path/to/file.py")
 
         assert activated == ["python-dev"]
+
+
+class TestActivateConditionalSkillsPathsField:
+    """Test activation reads the dedicated Skill.paths field, not just metadata."""
+
+    def test_real_skill_paths_field_activates(self):
+        """A real Skill object stores patterns in .paths (stripped from metadata)."""
+        from koder_agent.tools.skill import Skill
+
+        skill = Skill(
+            name="python-dev",
+            description="Python helper",
+            content="body",
+            metadata=None,  # paths is NOT in metadata on real skills
+            paths=["**/*.py"],
+        )
+
+        activated = activate_conditional_skills({"python-dev": skill}, "src/module.py")
+        assert activated == ["python-dev"]
+
+    def test_real_skill_paths_field_no_match(self):
+        """Real Skill with paths that do not match returns no activation."""
+        from koder_agent.tools.skill import Skill
+
+        skill = Skill(
+            name="python-dev",
+            description="Python helper",
+            content="body",
+            metadata=None,
+            paths=["**/*.py"],
+        )
+
+        activated = activate_conditional_skills({"python-dev": skill}, "README.md")
+        assert activated == []
+
+    def test_real_skill_without_paths_not_activated(self):
+        """Non-regression: a real Skill with paths=None never activates."""
+        from koder_agent.tools.skill import Skill
+
+        skill = Skill(
+            name="always-on",
+            description="No conditional paths",
+            content="body",
+            metadata={"other": "value"},
+            paths=None,
+        )
+
+        activated = activate_conditional_skills({"always-on": skill}, "src/module.py")
+        assert activated == []
+
+    def test_metadata_paths_still_supported_for_mock_inputs(self):
+        """Non-regression: Mock inputs using metadata['paths'] still activate.
+
+        Mock auto-creates a truthy ``.paths`` attribute, so activation must fall
+        back to ``metadata['paths']`` unless ``.paths`` is a real list/tuple.
+        """
+        skill_obj = Mock(name="cfg", metadata={"paths": ["**/*.yaml"]})
+        activated = activate_conditional_skills({"cfg": skill_obj}, "conf/app.yaml")
+        assert activated == ["cfg"]

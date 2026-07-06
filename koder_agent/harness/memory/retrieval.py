@@ -2,11 +2,65 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .budget import estimate_text_tokens
 from .memory_files import ParsedMemoryFile, parse_memory_file
+
+# Small stopword set to drop low-signal query terms from the deterministic scorer.
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "are",
+        "but",
+        "not",
+        "you",
+        "all",
+        "any",
+        "can",
+        "had",
+        "has",
+        "her",
+        "his",
+        "our",
+        "out",
+        "was",
+        "who",
+        "why",
+        "how",
+        "its",
+        "with",
+        "this",
+        "that",
+        "from",
+        "have",
+        "your",
+        "what",
+        "when",
+        "were",
+        "will",
+        "into",
+        "them",
+        "then",
+        "they",
+        "some",
+        "such",
+        "than",
+        "over",
+        "onto",
+    }
+)
+
+_WORD_RE = re.compile(r"\w+")
+
+
+def _tokenize(text: str) -> set[str]:
+    """Split text into a set of lowercase word tokens."""
+    return set(_WORD_RE.findall(text.lower()))
 
 
 @dataclass(frozen=True)
@@ -39,8 +93,11 @@ def _scan_memory_files(memory_dirs: list[Path]) -> list[Path]:
 def _score_memory(query_terms: list[str], parsed: ParsedMemoryFile) -> int:
     haystack = " ".join(
         part for part in [parsed.description or "", parsed.body, parsed.memory_type or ""] if part
-    ).lower()
-    return sum(1 for term in query_terms if term in haystack)
+    )
+    # Word-boundary matching: tokenize the haystack so "cat" does not match
+    # "category". query_terms are already normalized/filtered by the caller.
+    haystack_words = _tokenize(haystack)
+    return sum(1 for term in query_terms if term in haystack_words)
 
 
 def retrieve_relevant_memories(
@@ -50,7 +107,8 @@ def retrieve_relevant_memories(
     max_tokens: int,
 ) -> RetrievalResult:
     """Retrieve relevant memory files within a token budget."""
-    query_terms = [term for term in query.lower().split() if term]
+    # Tokenize the query on word boundaries, drop stopwords and <3-char tokens.
+    query_terms = [term for term in _tokenize(query) if len(term) >= 3 and term not in _STOPWORDS]
     scored: list[RetrievedMemory] = []
 
     for path in _scan_memory_files(memory_dirs):

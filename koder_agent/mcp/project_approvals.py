@@ -42,6 +42,18 @@ def set_project_approval(project_root: str | Path, approved: bool) -> None:
     _save_approvals(approvals)
 
 
+def is_project_connect_allowed(project_root: str | Path) -> bool:
+    """Whether PROJECT-scoped MCP servers for *project_root* may be connected.
+
+    Project ``.mcp.json`` servers run arbitrary commands / auth helpers straight
+    from the repository, so they are only connected when the user has explicitly
+    approved them (stored decision is ``True``). An undecided (``None``) or
+    rejected (``False``) state is treated as "do not run" — a safe,
+    non-interactive default for headless sessions.
+    """
+    return is_project_approved(project_root) is True
+
+
 def reset_project_choices(project_root: str | Path | None = None) -> int:
     """Reset stored approval decisions.
 

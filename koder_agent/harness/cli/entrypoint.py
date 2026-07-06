@@ -15,7 +15,18 @@ class RuntimeRequest:
     first_arg: str | None = None
 
 
-SUBCOMMANDS = {"auth", "mcp", "config", "agents", "plugin", "plugins"}
+SUBCOMMANDS = {
+    "auth",
+    "mcp",
+    "config",
+    "agents",
+    "plugin",
+    "plugins",
+    "doctor",
+    "review",
+    "completion",
+    "upgrade",
+}
 FLAGS_WITH_VALUE = {
     "--session",
     "-s",

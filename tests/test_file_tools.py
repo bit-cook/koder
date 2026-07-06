@@ -1154,3 +1154,272 @@ async def test_append_file_refuses_symlink_leaf(temp_dir):
 
     assert "symlink" in result.lower()
     assert outside.read_text() == "SAFE"
+
+
+# =============================================================================
+# Security hardening tests (atomic writes, symlink-guarded edit paths,
+# read/state partial-view desync)
+# =============================================================================
+# Finding 4: edit paths must refuse to write through a symlink leaf.
+# Finding 5: a truncated full read must be recorded as a partial view.
+# Finding 6: edits are atomic (temp + os.replace); a whitespace-only file counts
+#            as existing content and must be read before an empty-old_string edit.
+
+
+import errno  # noqa: E402
+import os as _os  # noqa: E402
+
+from koder_agent.tools.file import _atomic_write_no_follow  # noqa: E402
+
+_HAS_NOFOLLOW = hasattr(_os, "O_NOFOLLOW")
+
+
+@pytest.mark.skipif(not _HAS_NOFOLLOW, reason="O_NOFOLLOW unavailable on this platform")
+@pytest.mark.asyncio
+async def test_edit_file_string_mode_refuses_symlink_leaf(temp_dir):
+    """edit_file string mode must not follow a leaf symlink pointing outside the tree."""
+    outside = temp_dir / "outside.txt"
+    outside.write_text("hello world\n", encoding="utf-8")
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    # Read through the link first so the read-before-edit guard is satisfied and
+    # the symlink refusal is the gate under test.
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(link)}))
+
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(link), "old_string": "hello world", "new_string": "HACKED"}),
+    )
+
+    assert "symlink" in result.lower()
+    assert outside.read_text() == "hello world\n"  # target untouched
+
+
+@pytest.mark.skipif(not _HAS_NOFOLLOW, reason="O_NOFOLLOW unavailable on this platform")
+@pytest.mark.asyncio
+async def test_edit_file_diff_mode_refuses_symlink_leaf(temp_dir):
+    """edit_file diff mode must not follow a leaf symlink pointing outside the tree."""
+    outside = temp_dir / "outside.txt"
+    outside.write_text("a\nb\nc\n", encoding="utf-8")
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(link)}))
+
+    diff = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
+    result = await edit_file.on_invoke_tool(None, json.dumps({"path": str(link), "diff": diff}))
+
+    assert "symlink" in result.lower()
+    assert outside.read_text() == "a\nb\nc\n"  # target untouched
+
+
+@pytest.mark.skipif(not _HAS_NOFOLLOW, reason="O_NOFOLLOW unavailable on this platform")
+@pytest.mark.asyncio
+async def test_edit_file_empty_oldstring_refuses_symlink_leaf(temp_dir):
+    """The empty-old_string creation branch must refuse a symlinked leaf."""
+    outside = temp_dir / "outside.txt"
+    outside.write_text("", encoding="utf-8")  # empty target so branch reaches the write
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(link), "old_string": "", "new_string": "INJECTED"}),
+    )
+
+    assert "symlink" in result.lower()
+    assert outside.read_text() == ""  # target untouched
+
+
+@pytest.mark.asyncio
+async def test_edit_file_string_mode_common_case_still_works(temp_dir):
+    """A normal (non-symlink) string edit still succeeds after hardening."""
+    file_path = temp_dir / "plain.txt"
+    file_path.write_text("hello world\n", encoding="utf-8")
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
+
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "hello world", "new_string": "goodbye"}),
+    )
+
+    assert "Successfully edited" in result
+    assert file_path.read_text() == "goodbye\n"
+
+
+@pytest.mark.asyncio
+async def test_read_truncation_marks_partial_and_blocks_edit(temp_dir):
+    """A full read that gets truncated on display must mark the state partial.
+
+    file_state must record is_partial=True so a diff/string edit is refused until
+    the whole file is actually read (offset+limit) -- the read/state desync fix.
+    """
+    file_path = temp_dir / "big.txt"
+    # Build content large enough to exceed the 32k-token truncation limit.
+    big = "".join(f"line {i} " + "x" * 60 + "\n" for i in range(20000))
+    file_path.write_text(big, encoding="utf-8")
+
+    result = await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
+    # Sanity: the returned display is truncated (either the read_file token-limit
+    # note, or the outer function_tool char-limit marker for very large outputs).
+    assert "truncated" in result.lower()
+
+    # State must now report the read as partial even though no offset/limit was
+    # given -- the model never saw the whole file.
+    assert _file_state.is_partial_view(str(file_path)) is True
+
+    # A diff edit must be refused because only a partial view was seen.
+    diff = "@@ -1,1 +1,1 @@\n-line 0 " + "x" * 60 + "\n+CHANGED\n"
+    diff_result = await edit_file.on_invoke_tool(
+        None, json.dumps({"path": str(file_path), "diff": diff})
+    )
+    assert "partially read" in diff_result.lower()
+
+    # A string edit must likewise be refused (string mode now consults is_partial_view).
+    str_result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "line 0", "new_string": "LINE ZERO"}),
+    )
+    assert "partially read" in str_result.lower()
+
+
+@pytest.mark.asyncio
+async def test_read_small_file_full_is_not_partial(temp_dir):
+    """A small full read is NOT marked partial (common case preserved)."""
+    file_path = temp_dir / "small.txt"
+    file_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
+    assert _file_state.is_partial_view(str(file_path)) is False
+
+    # And a normal edit is allowed.
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "two", "new_string": "TWO"}),
+    )
+    assert "Successfully edited" in result
+
+
+@pytest.mark.asyncio
+async def test_edit_empty_oldstring_does_not_clobber_whitespace_file(temp_dir):
+    """A whitespace-only file counts as existing content; empty-old_string must not clobber it."""
+    file_path = temp_dir / "ws.txt"
+    file_path.write_text("   \n\t\n", encoding="utf-8")
+
+    # Without reading first, the empty-old_string branch must refuse (read-before-write).
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "", "new_string": "NEW"}),
+    )
+    assert "read" in result.lower()
+    assert file_path.read_text() == "   \n\t\n"  # untouched
+
+    # After reading, it is still treated as an existing file with content.
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(file_path)}))
+    result2 = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "", "new_string": "NEW"}),
+    )
+    assert "already exists with content" in result2
+    assert file_path.read_text() == "   \n\t\n"  # still untouched
+
+
+@pytest.mark.asyncio
+async def test_edit_empty_oldstring_creates_when_absent(temp_dir):
+    """Empty-old_string still creates a brand-new file (common case preserved)."""
+    file_path = temp_dir / "new.txt"
+    result = await edit_file.on_invoke_tool(
+        None,
+        json.dumps({"path": str(file_path), "old_string": "", "new_string": "fresh\n"}),
+    )
+    assert "Created" in result
+    assert file_path.read_text() == "fresh\n"
+
+
+def test_atomic_write_no_follow_replaces_content(temp_dir):
+    """_atomic_write_no_follow replaces file content in place."""
+    file_path = temp_dir / "atomic.txt"
+    file_path.write_text("old", encoding="utf-8")
+    _atomic_write_no_follow(str(file_path), b"new content")
+    assert file_path.read_text() == "new content"
+    # No leftover temp files in the directory.
+    leftovers = [p.name for p in temp_dir.iterdir() if p.name.startswith(".atomic.txt.")]
+    assert leftovers == []
+
+
+@pytest.mark.skipif(not _HAS_NOFOLLOW, reason="O_NOFOLLOW unavailable on this platform")
+def test_atomic_write_no_follow_refuses_symlink(temp_dir):
+    """_atomic_write_no_follow raises ELOOP (not clobber) for a symlinked leaf."""
+    outside = temp_dir / "target.txt"
+    outside.write_text("SAFE", encoding="utf-8")
+    link = temp_dir / "link.txt"
+    link.symlink_to(outside)
+
+    with pytest.raises(OSError) as excinfo:
+        _atomic_write_no_follow(str(link), b"HACKED")
+    assert excinfo.value.errno == errno.ELOOP
+    assert outside.read_text() == "SAFE"
+    assert link.is_symlink()  # link itself not replaced
+
+
+# =============================================================================
+# Tests for whole-file re-read caching / dedup (Wave 3)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_reread_unchanged_whole_file_returns_compact_notice(sample_file):
+    """Re-reading an unchanged whole file returns a compact notice, not the body."""
+    first = await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+    assert "line1" in first  # First read emits real content.
+
+    second = await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+    assert "File unchanged since last read" in second
+    assert "5 lines" in second
+    assert "line1" not in second  # Body is NOT re-emitted.
+
+
+@pytest.mark.asyncio
+async def test_reread_changed_whole_file_reemits_content(sample_file):
+    """A whole file that changed on disk is re-emitted, not deduped."""
+    import os
+    import time
+
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+
+    time.sleep(0.05)
+    sample_file.write_text("brand\nnew\ncontent\n", encoding="utf-8")
+    os.utime(str(sample_file), None)
+
+    result = await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+    assert "File unchanged since last read" not in result
+    assert "brand" in result and "content" in result
+
+
+@pytest.mark.asyncio
+async def test_partial_read_never_deduped(sample_file):
+    """Partial (offset/limit) reads are never short-circuited by the dedup path."""
+    # Prime with a full read so a record with full content exists.
+    await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+
+    # A subsequent partial read must still emit real content.
+    partial = await read_file.on_invoke_tool(
+        None, json.dumps({"path": str(sample_file), "offset": 2, "limit": 2})
+    )
+    assert "File unchanged since last read" not in partial
+    assert "line2" in partial
+
+
+@pytest.mark.asyncio
+async def test_whole_file_reread_after_prior_partial_reemits(sample_file):
+    """If the prior record was partial, a whole-file read must re-emit content."""
+    # Prime with a PARTIAL read (no full content stored).
+    await read_file.on_invoke_tool(
+        None, json.dumps({"path": str(sample_file), "offset": 1, "limit": 2})
+    )
+
+    # Whole-file read has no cached full content -> emit real body.
+    result = await read_file.on_invoke_tool(None, json.dumps({"path": str(sample_file)}))
+    assert "File unchanged since last read" not in result
+    assert "line1" in result and "line5" in result

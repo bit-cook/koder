@@ -46,7 +46,7 @@ class _FakeScheduler:
         )
         self._title_generation_task = None
 
-    async def handle(self, prompt: str, render_output: bool = True) -> str:
+    async def handle(self, prompt: str, render_output: bool = True, multimodal_input=None) -> str:
         self.prompts.append((prompt, render_output))
         return prompt
 
@@ -291,7 +291,9 @@ def test_stop_failure_hook_runs_when_scheduler_raises(tmp_path, monkeypatch):
     monkeypatch.chdir(project_root)
 
     class _BrokenScheduler(_FakeScheduler):
-        async def handle(self, prompt: str, render_output: bool = True) -> str:
+        async def handle(
+            self, prompt: str, render_output: bool = True, multimodal_input=None
+        ) -> str:
             raise RuntimeError("scheduler exploded")
 
     monkeypatch.setattr("koder_agent.core.scheduler.AgentScheduler", _BrokenScheduler)

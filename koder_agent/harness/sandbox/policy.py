@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import fnmatch
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
+
+# Backends able to actually enforce a network deny/allow policy at runtime. The
+# unix-local backend cannot, so network_access must never be presented as
+# enforced when it is the resolved backend (honesty-first, finding #4).
+NETWORK_ENFORCING_BACKENDS = frozenset({"docker", "cloudflare", "e2b", "modal", "vercel"})
 
 DEFAULT_PROTECTED_PATHS = (".git", ".koder", ".agents", ".codex")
 DEFAULT_SENSITIVE_DENY_WRITE = (
@@ -72,6 +79,17 @@ def _normalize_mode(value: Any, *, enabled: bool) -> SandboxMode:
         normalized = value.strip().lower()
         if normalized in VALID_MODES:
             return normalized  # type: ignore[return-value]
+        # An invalid/misspelled mode while the sandbox is enabled must never
+        # silently fall through to danger-full-access (finding #6): fail closed
+        # to the safer workspace-write and surface a warning so the misconfig is
+        # not hidden.
+        if enabled and normalized:
+            warnings.warn(
+                f"invalid sandbox mode {value!r}; falling back to workspace-write",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return "workspace-write"
     return "workspace-write" if enabled else "danger-full-access"
 
 
@@ -106,6 +124,29 @@ class SandboxPolicy:
     def enabled(self) -> bool:
         return self.mode != "danger-full-access"
 
+    @property
+    def network_enforced(self) -> bool:
+        """Whether the resolved backend can actually enforce the network policy.
+
+        The unix-local backend applies no network confinement, so a policy that
+        denies network access is *not* enforced there. Callers/status output must
+        rely on this flag rather than assuming ``network_access`` is honored
+        (honesty-first, finding #4).
+        """
+        return self.backend in NETWORK_ENFORCING_BACKENDS
+
+    @property
+    def network_restricted_but_unenforced(self) -> bool:
+        """True when the policy asks to restrict network but the backend can't.
+
+        Signals the dishonest-confinement case: network_access is disabled (or
+        domain lists are set) yet the selected backend cannot enforce it.
+        """
+        wants_restriction = (
+            not self.network_access or bool(self.allowed_domains) or bool(self.denied_domains)
+        )
+        return wants_restriction and not self.network_enforced
+
     @classmethod
     def from_config(cls, sandbox: dict[str, Any] | None) -> "SandboxPolicy":
         data = sandbox if isinstance(sandbox, dict) else {}
@@ -138,9 +179,33 @@ class SandboxPolicy:
         roots: list[Path] = []
         for value in (*self.protected_paths, *self.deny_write):
             if "*" in value:
+                # Glob patterns are handled by deny_write_globs / fnmatch; they
+                # cannot be resolved to concrete literal roots here (finding #3).
                 continue
             path = Path(value).expanduser()
             if not path.is_absolute():
                 path = repo_root / path
             roots.append(path.resolve(strict=False))
         return tuple(roots)
+
+    def deny_write_globs(self) -> tuple[str, ...]:
+        """Return the glob-style deny_write patterns (e.g. ``.env.*``).
+
+        These are intentionally excluded from ``protected_path_roots`` (which only
+        yields literal roots) so they were previously dropped entirely (finding
+        #3). Callers match write targets against them with :meth:`matches_deny_write_glob`.
+        """
+        return tuple(value for value in (*self.protected_paths, *self.deny_write) if "*" in value)
+
+    def matches_deny_write_glob(self, target: str) -> str | None:
+        """Return the matched glob pattern if ``target`` hits a deny_write glob.
+
+        ``target`` may be a full/relative path; both its basename and the path as
+        given are tested so patterns like ``.env.*`` match ``.env.local`` and
+        ``config/.env.production`` alike.
+        """
+        basename = Path(target).name
+        for pattern in self.deny_write_globs():
+            if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(target, pattern):
+                return pattern
+        return None

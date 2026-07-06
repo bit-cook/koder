@@ -27,3 +27,42 @@ def test_retrieve_relevant_memories_respects_token_budget():
     fixtures_dir = Path("tests/fixtures/memory/retrieval")
     result = retrieve_relevant_memories("user", [fixtures_dir], max_tokens=20)
     assert result.token_count <= 20
+
+
+def test_word_boundary_scoring_does_not_match_substrings(tmp_path):
+    """'cat' must not match 'category' (word-boundary tokenization)."""
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\ntype: note\ndescription: product taxonomy\n---\n"
+        "This document lists every product category and its subcategory.\n",
+        encoding="utf-8",
+    )
+
+    result = retrieve_relevant_memories("cat", [tmp_path], max_tokens=200)
+    assert result.memories == []
+
+
+def test_word_boundary_scoring_matches_whole_word(tmp_path):
+    """'cat' matches a standalone 'cat' token even next to 'category' text."""
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\ntype: note\ndescription: pets\n---\n" "The cat sat in the category aisle.\n",
+        encoding="utf-8",
+    )
+
+    result = retrieve_relevant_memories("cat", [tmp_path], max_tokens=200)
+    assert len(result.memories) == 1
+    assert result.memories[0].parsed.description == "pets"
+
+
+def test_stopwords_and_short_tokens_are_ignored(tmp_path):
+    """Stopwords and <3-char tokens do not create spurious matches."""
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\ntype: note\ndescription: misc\n---\nThe project is done.\n",
+        encoding="utf-8",
+    )
+
+    # "the", "is", "a" are stopwords/short -> no term should match -> no memories.
+    result = retrieve_relevant_memories("the a is", [tmp_path], max_tokens=200)
+    assert result.memories == []

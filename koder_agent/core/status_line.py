@@ -34,6 +34,24 @@ _PR_STATE_LABELS: dict[str, str] = {
     "merged": "merged",
 }
 
+# Absolute token warning threshold. This is independent of the context-window
+# percentage: even on models with very large context windows, a session this
+# large is worth flagging (cost/latency). Env-overridable for power users/tests.
+_DEFAULT_ABSOLUTE_TOKEN_LIMIT = 200_000
+
+
+def _absolute_token_limit() -> int:
+    """Resolve the absolute token warning threshold (env-overridable)."""
+    raw = os.environ.get("KODER_TOKEN_WARN_LIMIT")
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_ABSOLUTE_TOKEN_LIMIT
+
 
 class StatusLine:
     """
@@ -136,6 +154,77 @@ class StatusLine:
             return "class:status-context-warn"
         return "class:status-context-ok"
 
+    def absolute_token_warning(
+        self, current_tokens: int, limit: Optional[int] = None
+    ) -> Optional[str]:
+        """Return a warning string when ``current_tokens`` exceeds an ABSOLUTE limit.
+
+        This complements the context-percentage warning: a session can cross a
+        large absolute token count (e.g. 200k) even when the percentage of a
+        huge context window still looks small. Returns ``None`` when at or
+        below the threshold.
+
+        Args:
+            current_tokens: The current context/token count to check.
+            limit: Optional explicit threshold; defaults to the configured
+                absolute limit (``KODER_TOKEN_WARN_LIMIT`` env or 200k).
+        """
+        threshold = limit if (limit is not None and limit > 0) else _absolute_token_limit()
+        if current_tokens > threshold:
+            return f"{self._format_tokens(current_tokens)} tokens (over {self._format_tokens(threshold)})"
+        return None
+
+    def _usage_summary(self):
+        """Return a UsageSummary from the tracker, tolerating minimal test doubles.
+
+        Falls back to reading ``session_usage`` attributes directly when the
+        tracker does not implement :meth:`UsageTracker.summary` (e.g. a stubbed
+        tracker), so the status line never crashes on partial objects.
+        """
+        summary_fn = getattr(self.usage_tracker, "summary", None)
+        if callable(summary_fn):
+            try:
+                return summary_fn()
+            except Exception:
+                pass
+
+        # Fallback: synthesize a minimal summary from session_usage attributes.
+        from .usage_tracker import UsageSummary
+
+        usage = self.usage_tracker.session_usage
+        total_cost = float(getattr(usage, "total_cost", 0.0) or 0.0)
+        return UsageSummary(
+            request_count=int(getattr(usage, "request_count", 0) or 0),
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
+            cache_write_tokens=int(getattr(usage, "cache_write_tokens", 0) or 0),
+            context_tokens=int(getattr(usage, "current_context_tokens", 0) or 0),
+            total_cost=total_cost,
+            # Without a real tracker we can't consult litellm pricing; treat a
+            # positive cost as "known" and a zero cost as "unavailable".
+            cost_unavailable=total_cost <= 0.0,
+        )
+
+    def _format_token_cost_segment(self) -> str:
+        """Build the compact live token/cost segment.
+
+        Example: ``▽ 45.2k tok (12k cached) · ~$0.14``. When per-token pricing
+        is unknown (subscription/OAuth backends), the cost portion is shown as
+        ``· $?`` instead of a misleading ``$0.00``. The ``(N cached)`` clause is
+        omitted when no cache-read tokens have been recorded.
+        """
+        summary = self._usage_summary()
+        billed = summary.input_tokens + summary.output_tokens
+        parts = [f"▽ {self._format_tokens(billed)} tok"]
+        if summary.cache_read_tokens > 0:
+            parts.append(f"({self._format_tokens(summary.cache_read_tokens)} cached)")
+        if summary.cost_unavailable:
+            cost_part = "· $?"
+        else:
+            cost_part = f"· ~${summary.total_cost:.2f}"
+        return f"{' '.join(parts)} {cost_part}"
+
     def _build_statusline_payload(self) -> dict[str, object]:
         usage = self.usage_tracker.session_usage
         model = self.usage_tracker.model
@@ -177,6 +266,8 @@ class StatusLine:
             "context_window": {
                 "total_input_tokens": usage.input_tokens,
                 "total_output_tokens": usage.output_tokens,
+                "total_cache_read_tokens": getattr(usage, "cache_read_tokens", 0),
+                "total_cache_write_tokens": getattr(usage, "cache_write_tokens", 0),
                 "context_window_size": max_context,
                 "current_usage": {
                     "input_tokens": getattr(usage, "last_input_tokens", 0),
@@ -266,7 +357,9 @@ class StatusLine:
 
         # Usage data
         usage = self.usage_tracker.session_usage
-        cost_str = f"${usage.total_cost:.4f}"
+        # Compact live token/cost segment (fresh vs cached split + running $).
+        # Resilient to unknown pricing (shows "$?" rather than a blank/zero).
+        token_cost_segment = self._format_token_cost_segment()
 
         # Context window usage: current_context_tokens
         # This represents the total context that will be sent in the next turn
@@ -312,7 +405,8 @@ class StatusLine:
             )
             self._append_field(fragments, "Tokens: ", tokens_str + " ")
             fragments.append((context_style, f"({context_pct:.1f}%)"))
-            self._append_field(fragments, "Cost: ", cost_str)
+            # Compact live token/cost segment (fresh vs cached + running $).
+            self._append_field(fragments, "", token_cost_segment)
         elif columns >= 100:
             self._append_field(
                 fragments,
@@ -322,7 +416,7 @@ class StatusLine:
             self._append_field(fragments, "Dir: ", self._compact_cwd(cwd, 28))
             self._append_field(fragments, "Tok: ", tokens_str + " ")
             fragments.append((context_style, f"({context_pct:.1f}%)"))
-            self._append_field(fragments, "$: ", cost_str)
+            self._append_field(fragments, "", token_cost_segment)
         elif columns >= 72:
             self._append_field(
                 fragments,
@@ -345,6 +439,20 @@ class StatusLine:
             pr_len = sum(len(text) for _, text in pr_fragments)
             if rendered_len + pr_len <= columns:
                 fragments.extend(pr_fragments)
+
+        # Absolute-threshold token warning (independent of context %). Only shown
+        # on wider terminals and when no transient notice is already occupying
+        # the line, and only if it fits within the remaining width.
+        token_warning = self.absolute_token_warning(current_tokens)
+        if token_warning and not self._notice and columns >= 100:
+            warn_fragments = [
+                ("class:status-separator", " | "),
+                ("class:status-context-critical", f"⚠ {token_warning}"),
+            ]
+            rendered_len = sum(len(text) for _, text in fragments)
+            warn_len = sum(len(text) for _, text in warn_fragments)
+            if rendered_len + warn_len <= columns:
+                fragments.extend(warn_fragments)
 
         if self._notice:
             if self._notice.startswith("Voice error:"):

@@ -48,7 +48,7 @@ class _FakeScheduler:
         self._mcp_servers = []
         _FakeScheduler.last_agent = agent_definition
 
-    async def handle(self, prompt: str, render_output: bool = True) -> str:
+    async def handle(self, prompt: str, render_output: bool = True, multimodal_input=None) -> str:
         return prompt
 
     async def cleanup(self) -> None:
@@ -158,7 +158,9 @@ def test_main_session_agent_initial_prompt_is_prepended(monkeypatch, tmp_path):
     captured_prompts: list[str] = []
 
     class _PromptScheduler(_FakeScheduler):
-        async def handle(self, prompt: str, render_output: bool = True) -> str:
+        async def handle(
+            self, prompt: str, render_output: bool = True, multimodal_input=None
+        ) -> str:
             captured_prompts.append(prompt)
             return "ok"
 

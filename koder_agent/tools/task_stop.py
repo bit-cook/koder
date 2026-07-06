@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any, Optional
 
@@ -24,7 +23,7 @@ def _get_manager():
     return BackgroundShellManager
 
 
-def task_stop(
+async def task_stop(
     task_id: Optional[str] = None,
     shell_id: Optional[str] = None,
 ) -> str:
@@ -51,19 +50,11 @@ def task_stop(
             }
         )
 
-    # Terminate — handle async manager.terminate()
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            pool.submit(asyncio.run, mgr.terminate(effective_id)).result()
-    else:
-        asyncio.run(mgr.terminate(effective_id))
+    # Await terminate() directly on the running loop. The subprocess and its
+    # transport are bound to the loop that spawned them, so terminating here
+    # (rather than via asyncio.run in a separate thread/loop) avoids cross-loop
+    # hangs that could leave the process alive.
+    await mgr.terminate(effective_id)
 
     return json.dumps(
         {

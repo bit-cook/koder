@@ -127,3 +127,119 @@ def test_shell_classifier_quoted_pipe_with_redirect_is_write():
     assert result.malformed is False
     assert result.read_only is False
     assert result.requires_approval is True
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: newlines and |& must act as command separators, not whitespace.
+# ---------------------------------------------------------------------------
+
+
+def test_shell_classifier_newline_splits_commands():
+    """`ls\\nrm -rf foo` is TWO commands; the rm line must block auto-allow."""
+    result = classify_shell_command("ls\nrm -rf foo")
+    assert not (result.allowed and not result.requires_approval)
+    assert result.read_only is False
+
+
+def test_shell_classifier_newline_with_home_rm():
+    result = classify_shell_command("echo hi\nrm -rf ~/x")
+    assert not (result.allowed and not result.requires_approval)
+    assert result.read_only is False
+
+
+def test_shell_classifier_pipe_ampersand_is_separator():
+    """`cat a |& rm b` must not merge into a single read-only `cat` segment."""
+    result = classify_shell_command("cat a |& rm b")
+    assert not (result.allowed and not result.requires_approval)
+    assert result.read_only is False
+
+
+def test_shell_classifier_plain_ls_still_read_only():
+    result = classify_shell_command("ls")
+    assert result.allowed is True
+    assert result.read_only is True
+    assert result.requires_approval is False
+
+
+def test_shell_classifier_grep_pipe_wc_still_read_only():
+    result = classify_shell_command("grep x file | wc -l")
+    assert result.allowed is True
+    assert result.read_only is True
+    assert result.requires_approval is False
+
+
+def test_shell_classifier_multiline_read_only_stays_read_only():
+    """Two independent read-only lines remain auto-allowable."""
+    result = classify_shell_command("ls\ngrep x file")
+    assert result.allowed is True
+    assert result.read_only is True
+    assert result.requires_approval is False
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: command-runner prefixes (env/timeout/...) must not auto-allow.
+# ---------------------------------------------------------------------------
+
+
+def test_shell_classifier_env_prefix_does_not_autoallow_rm():
+    """`env rm -rf ~/data` must classify by the inner rm, not `env`."""
+    result = classify_shell_command("env rm -rf ~/data")
+    assert not (result.allowed and not result.requires_approval)
+    assert result.read_only is False
+
+
+def test_shell_classifier_timeout_prefix_does_not_autoallow_rm():
+    result = classify_shell_command("timeout 5 rm x")
+    assert not (result.allowed and not result.requires_approval)
+    assert result.read_only is False
+
+
+def test_shell_classifier_bare_env_requires_approval():
+    """A runner wrapping nothing is unresolvable and must require approval."""
+    result = classify_shell_command("env")
+    assert result.requires_approval is True
+    assert result.read_only is False
+
+
+def test_shell_classifier_env_with_assignment_then_interpreter_needs_approval():
+    """`env PYTHONPATH=. pytest` resolves to pytest and is handled sanely."""
+    result = classify_shell_command("env PYTHONPATH=. pytest")
+    assert result.requires_approval is True
+    assert result.read_only is False
+
+
+def test_shell_classifier_env_wrapping_read_only_still_read_only():
+    """`env ls` resolves to a read-only inner command and stays auto-allowed."""
+    result = classify_shell_command("env ls")
+    assert result.allowed is True
+    assert result.read_only is True
+    assert result.requires_approval is False
+
+
+def test_shell_classifier_env_wrapping_sudo_is_hard_denied():
+    result = classify_shell_command("env sudo reboot")
+    assert result.allowed is False
+    assert result.destructive is True
+
+
+def test_shell_classifier_timeout_wrapping_rm_root_is_hard_denied():
+    result = classify_shell_command("timeout 5 rm -rf /")
+    assert result.allowed is False
+    assert result.destructive is True
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: absolute / relative paths to privileged binaries are caught.
+# ---------------------------------------------------------------------------
+
+
+def test_shell_classifier_absolute_path_sudo_hard_denied():
+    result = classify_shell_command("/usr/bin/sudo reboot")
+    assert result.allowed is False
+    assert result.destructive is True
+
+
+def test_shell_classifier_relative_path_sudo_hard_denied():
+    result = classify_shell_command("./sudo rm -rf /")
+    assert result.allowed is False
+    assert result.destructive is True

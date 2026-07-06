@@ -46,9 +46,20 @@ class BackendSpec:
 def _check_unix_local() -> tuple[bool, str | None]:
     if sys.platform == "win32":
         return False, "Unix local sandbox is not supported on native Windows"
-    if sys.platform == "darwin" and shutil.which("sandbox-exec") is None:
-        return False, "missing /usr/bin/sandbox-exec"
-    return True, None
+    if sys.platform == "darwin":
+        if shutil.which("sandbox-exec") is None:
+            return False, "missing /usr/bin/sandbox-exec"
+        return True, None
+    # On non-darwin POSIX hosts (Linux, *BSD) the SDK unix_local backend returns
+    # the command unchanged — it applies NO kernel confinement. Reporting the
+    # backend as available here would let Koder claim sandboxed:true with zero
+    # confinement (finding #1). Fail closed: mark it unavailable so callers must
+    # pick a real sandbox backend or disable the sandbox explicitly.
+    return (
+        False,
+        "unix-local backend provides no kernel confinement on this platform; "
+        "use a real sandbox backend (docker/e2b/modal/…) or disable the sandbox",
+    )
 
 
 def _check_docker_daemon() -> tuple[bool, str | None]:

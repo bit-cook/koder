@@ -175,6 +175,57 @@ def test_collect_ignores_non_read_tools():
     assert "/tmp/read.py" in files
 
 
+def test_collect_from_function_call_items():
+    """Should extract read_file paths from koder's top-level function_call items.
+
+    koder persists tool calls as ``{"type": "function_call", "name": ...,
+    "arguments": ...}`` items, NOT the Chat Completions ``tool_calls`` shape, so
+    the collector must understand this shape or it finds nothing.
+    """
+    messages = [
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": json.dumps({"path": "/tmp/first.py"}),
+            "call_id": "call_1",
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "first"},
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": json.dumps({"path": "/tmp/second.py"}),
+            "call_id": "call_2",
+        },
+        {"type": "function_call_output", "call_id": "call_2", "output": "second"},
+    ]
+    repair = PostCompactRepair()
+    files = repair.collect_recently_accessed_files(messages)
+    assert files[0] == "/tmp/second.py"  # most recent first
+    assert files[1] == "/tmp/first.py"
+
+
+def test_collect_from_function_call_ignores_writes():
+    """function_call items for non-read tools must be ignored."""
+    messages = [
+        {
+            "type": "function_call",
+            "name": "write_file",
+            "arguments": json.dumps({"path": "/tmp/written.py", "content": "x"}),
+            "call_id": "call_1",
+        },
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": json.dumps({"path": "/tmp/read.py"}),
+            "call_id": "call_2",
+        },
+    ]
+    repair = PostCompactRepair()
+    files = repair.collect_recently_accessed_files(messages)
+    assert "/tmp/written.py" not in files
+    assert files == ["/tmp/read.py"]
+
+
 @pytest.mark.anyio
 async def test_build_attachments_reads_existing(tmp_path):
     """Should re-read files that still exist."""

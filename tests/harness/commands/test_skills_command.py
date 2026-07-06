@@ -87,7 +87,9 @@ def test_direct_skill_invocation_executes_inline_skill(tmp_path, monkeypatch):
     class _Scheduler:
         session = _Session()
 
-        async def handle(self, prompt: str, render_output: bool = True) -> str:
+        async def handle(
+            self, prompt: str, render_output: bool = True, multimodal_input=None
+        ) -> str:
             return prompt
 
     handler = HarnessInteractiveCommandHandler()
@@ -114,7 +116,9 @@ def test_direct_manual_skill_invocation_renders_without_model(tmp_path, monkeypa
     class _Scheduler:
         session = type("Session", (), {"session_id": "skill-session"})()
 
-        async def handle(self, prompt: str, render_output: bool = True) -> str:
+        async def handle(
+            self, prompt: str, render_output: bool = True, multimodal_input=None
+        ) -> str:
             raise AssertionError("manual skill should not call the model scheduler")
 
     handler = HarnessInteractiveCommandHandler()
@@ -187,7 +191,9 @@ def test_direct_skill_invocation_activates_skill_scoped_hooks(tmp_path, monkeypa
     )
 
     class _Scheduler:
-        async def handle(self, prompt: str, render_output: bool = True) -> str:
+        async def handle(
+            self, prompt: str, render_output: bool = True, multimodal_input=None
+        ) -> str:
             from koder_agent.harness.hooks.runtime import dispatch_command_hooks
 
             dispatch_command_hooks(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -12,7 +13,6 @@ READ_ONLY_COMMANDS = {
     "cut",
     "diff",
     "echo",
-    "env",
     "file",
     "find",
     "git",
@@ -87,6 +87,35 @@ GIT_READONLY_SUB_SUBCOMMANDS: dict[str, set[str]] = {
     "config": {"--get", "--get-all", "--get-regexp", "--list", "-l"},
 }
 
+# config flags that only read values; any other form of ``git config`` (a bare
+# ``key value`` assignment, ``--global user.email x``, ``core.hooksPath ...``)
+# is a write and must require approval.
+_GIT_CONFIG_READ_FLAGS = {
+    "--get",
+    "--get-all",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--list",
+    "-l",
+}
+# config options that take no value and are safe to ignore when deciding whether
+# an assignment is present (scope/type selectors, not the operation itself).
+_GIT_CONFIG_SCOPE_FLAGS = {
+    "--global",
+    "--system",
+    "--local",
+    "--worktree",
+    "-z",
+    "--null",
+    "--name-only",
+    "--show-origin",
+    "--show-scope",
+}
+# tag flags that force a write even without a positional tag name.
+_GIT_TAG_WRITE_FLAGS = {"-a", "-s", "-m", "-F", "--annotate", "--sign", "--message", "--file"}
+# tag flags that indicate read-only listing.
+_GIT_TAG_READ_FLAGS = {"-l", "--list", "-n", "--contains", "--points-at", "--sort", "--format"}
+
 # Extended set of always-read-only git subcommands
 EXTENDED_READ_ONLY_GIT_SUBCOMMANDS = (
     READ_ONLY_GIT_SUBCOMMANDS
@@ -114,6 +143,58 @@ EXTENDED_READ_ONLY_GIT_SUBCOMMANDS = (
 _BRANCH_READ_FLAGS = {"-a", "--all", "-r", "--remotes", "-v", "--verbose", "-vv", "--list"}
 
 
+def _git_config_is_read_only(rest: list[str]) -> bool:
+    """``git config`` is read-only only when it reads a value and sets nothing.
+
+    A get/list flag must be present, and there must be no positional assignment
+    (a bare ``key`` lookup after ``--get`` is fine, but ``key value`` or a bare
+    ``key value`` with no read flag is a write). This blocks the
+    ``git config core.hooksPath ...`` privilege-escalation vector.
+    """
+    if not rest:
+        # Bare ``git config`` opens an editor / is not a pure read; treat as write.
+        return False
+
+    has_read_flag = any(token in _GIT_CONFIG_READ_FLAGS for token in rest)
+    if not has_read_flag:
+        return False
+
+    # Any unset/replace/rename operation is a write even alongside a read flag.
+    if any(token in GIT_WRITE_FLAGS["config"] for token in rest):
+        return False
+
+    # A read flag plus at most one positional (the key to look up) is read-only;
+    # a second positional is a value assignment -> write.
+    positionals = [
+        token
+        for token in rest
+        if not token.startswith("-")
+        and token not in _GIT_CONFIG_READ_FLAGS
+        and token not in _GIT_CONFIG_SCOPE_FLAGS
+    ]
+    return len(positionals) <= 1
+
+
+def _git_tag_is_read_only(rest: list[str]) -> bool:
+    """``git tag`` is read-only only for listing.
+
+    Bare ``git tag`` lists tags. ``-l``/``--list`` (and other listing flags)
+    keep it read-only even with a pattern argument. Any create/delete flag
+    (``-a``/``-s``/``-m``/``-F``/``-d``/``--force`` ...) or a bare positional
+    tag name with no listing flag is a write.
+    """
+    if any(token in _GIT_TAG_WRITE_FLAGS for token in rest):
+        return False
+    if any(token in GIT_WRITE_FLAGS["tag"] for token in rest):
+        return False
+    has_listing_flag = any(token in _GIT_TAG_READ_FLAGS for token in rest)
+    has_positional = any(not token.startswith("-") for token in rest)
+    # A positional with no listing flag names a tag to create -> write.
+    if has_positional and not has_listing_flag:
+        return False
+    return True
+
+
 def is_readonly_git_subcommand(tokens: list[str]) -> bool:
     """Check whether a tokenized git command is read-only.
 
@@ -134,10 +215,31 @@ def is_readonly_git_subcommand(tokens: list[str]) -> bool:
         rest = tokens[2:]
         write_flags = GIT_WRITE_FLAGS[subcommand]
 
+        # ``config`` and ``tag`` need value-assignment analysis, not just a flag
+        # scan: a bare assignment such as ``git config key value`` has no write
+        # flag yet still mutates state (and can rewrite hooksPath).
+        if subcommand == "config":
+            return _git_config_is_read_only(rest)
+        if subcommand == "tag":
+            return _git_tag_is_read_only(rest)
+
         # Check for known read-only sub-subcommands first
         readonly_subs = GIT_READONLY_SUB_SUBCOMMANDS.get(subcommand, set())
         if rest and rest[0] in readonly_subs:
             return True
+
+        # ``stash``/``remote``/``notes``/``worktree`` are read-only ONLY via an
+        # explicit read-only sub-subcommand. A bare ``git stash`` (== stash push)
+        # or bare ``git remote`` add-form must not be auto-allowed. ``remote``
+        # additionally accepts ``-v``/``--verbose`` as a listing flag.
+        if subcommand in {"stash", "remote", "notes", "worktree"}:
+            if (
+                subcommand == "remote"
+                and rest
+                and all(token in {"-v", "--verbose"} for token in rest)
+            ):
+                return True
+            return False
 
         # Check if any write flag is present
         if any(token in write_flags for token in rest):
@@ -176,6 +278,22 @@ PRIVILEGED_PREFIXES = {
     "doas",
     "su",
     "sudo",
+}
+
+# Command-runner wrappers: they run whatever command follows them, so they can
+# never be treated as read-only on their own. Their own options / VAR=val
+# assignments are stripped and the inner command is classified recursively.
+# (``env`` was previously misfiled in READ_ONLY_COMMANDS, so ``env rm -rf ~/data``
+# classified as read-only.)
+COMMAND_RUNNER_PREFIXES = {
+    "command",
+    "env",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "timeout",
+    "xargs",
 }
 
 # Interpreters and script runners: they execute arbitrary code so they always
@@ -217,37 +335,48 @@ WRITE_REDIRECTION_PATTERN = re.compile(r"(?:^|[^\d])>>?(?!\s*/dev/null\b)")
 COMMAND_SPLIT_PATTERN = re.compile(r"\s*(?:\|\||&&|[|;])\s*")
 
 # Shell operators that separate command segments during quote-aware tokenization.
-_SEGMENT_SEPARATORS = {"|", "||", "&&", ";", ";;", "&"}
+# ``|&`` (pipe-both-streams) is a separator too: ``cat a |& rm b`` runs ``rm b``.
+_SEGMENT_SEPARATORS = {"|", "||", "&&", ";", ";;", "&", "|&"}
 # Redirection-style operator tokens emitted by shlex punctuation_chars mode; these
 # are not command words and must not be classified as such.
-_REDIRECTION_TOKENS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", "&>>", "|&"}
+_REDIRECTION_TOKENS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", "&>>"}
 
 
 def _tokenize_segments(raw: str) -> list[list[str]]:
     """Split a command into per-segment token lists, honoring shell quoting.
 
-    Uses ``shlex`` with ``punctuation_chars`` so operators like ``|`` and ``&&``
-    inside quotes (e.g. ``grep "a\\|b"``) stay part of their word instead of
-    being treated as segment separators. Raises ``ValueError`` on genuinely
-    malformed input (e.g. unbalanced quotes).
-    """
-    lexer = shlex.shlex(raw, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    tokens = list(lexer)
+    Newlines separate whole commands (``ls\\nrm -rf foo`` is two commands, not
+    one), so the raw input is split on line boundaries FIRST — ``shlex`` treats
+    ``\\n`` as ordinary whitespace and would otherwise merge the lines into a
+    single segment classified only by the first word.
 
+    Within each line, uses ``shlex`` with ``punctuation_chars`` so operators
+    like ``|`` and ``&&`` inside quotes (e.g. ``grep "a\\|b"``) stay part of
+    their word instead of being treated as segment separators. Raises
+    ``ValueError`` on genuinely malformed input (e.g. unbalanced quotes).
+    """
     segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token in _SEGMENT_SEPARATORS:
-            if current:
-                segments.append(current)
-                current = []
+    # splitlines() handles \n, \r\n and \r; each physical line is its own
+    # command chain and must be classified independently.
+    for line in raw.splitlines():
+        if not line.strip():
             continue
-        if token in _REDIRECTION_TOKENS or (token and all(ch in ";&|<>" for ch in token)):
-            continue
-        current.append(token)
-    if current:
-        segments.append(current)
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+
+        current: list[str] = []
+        for token in tokens:
+            if token in _SEGMENT_SEPARATORS:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            if token in _REDIRECTION_TOKENS or (token and all(ch in ";&|<>" for ch in token)):
+                continue
+            current.append(token)
+        if current:
+            segments.append(current)
     return segments
 
 
@@ -267,6 +396,133 @@ class ShellCommandDecision:
 # find actions that mutate the filesystem or execute commands
 _FIND_MUTATING_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf"}
 
+# Runner options that consume a SEPARATE following argument (so the argument is
+# not mistaken for the inner command). All other ``-`` tokens are treated as
+# boolean flags that consume only themselves; ``--opt=value`` always consumes
+# only itself. Being conservative here is safe: a mis-parsed runner falls back
+# to an approval prompt rather than auto-allowing.
+_RUNNER_VALUE_OPTIONS: dict[str, set[str]] = {
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
+    "nice": {"-n", "--adjustment"},
+    "setsid": set(),
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "command": set(),
+    "xargs": {"-I", "-i", "-n", "-P", "-d", "-E", "-L", "-s", "--replace", "--max-args"},
+    "nohup": set(),
+}
+# Runners that take a mandatory leading positional before the inner command
+# (``timeout DURATION cmd``). That positional must be skipped so the inner
+# command — not the duration — is classified.
+_RUNNER_LEADING_POSITIONALS = {"timeout": 1}
+
+
+def _normalize_command_name(token: str) -> str:
+    """Return the basename of ``argv[0]`` so absolute/relative paths match.
+
+    ``/usr/bin/sudo`` and ``./sudo`` must be recognized as ``sudo`` before the
+    privileged/runner/read-only lookups; otherwise a full path silently bypasses
+    the classifier (an absolute-path privilege escalation).
+    """
+    if not token:
+        return token
+    return os.path.basename(token)
+
+
+def _resolve_runner_segment(tokens: list[str]) -> tuple[list[str], bool]:
+    """Strip command-runner wrappers, returning the effective inner command.
+
+    ``env rm -rf x``, ``timeout 5 rm x``, ``nice -n 10 make`` all delegate to an
+    inner command that must be classified in place of the wrapper. Returns
+    ``(inner_tokens, resolvable)``. ``resolvable`` is False when a runner wraps
+    nothing (e.g. bare ``env``) so callers can require approval instead of
+    treating the bare runner as safe.
+    """
+    # Bound the recursion; nested runners (``env timeout 5 rm``) are rare but
+    # legitimate, while an unbounded chain is not worth trusting.
+    for _ in range(8):
+        if not tokens:
+            return tokens, False
+        name = _normalize_command_name(tokens[0])
+        if name not in COMMAND_RUNNER_PREFIXES:
+            # Normalize argv[0] in place so downstream checks see the basename.
+            return [name, *tokens[1:]], True
+
+        value_options = _RUNNER_VALUE_OPTIONS.get(name, set())
+        leading_positionals = _RUNNER_LEADING_POSITIONALS.get(name, 0)
+        rest = tokens[1:]
+        idx = 0
+        while idx < len(rest):
+            token = rest[idx]
+            # Leading VAR=value assignments (env-style) are not the inner command.
+            if "=" in token and not token.startswith("-"):
+                idx += 1
+                continue
+            if token.startswith("-"):
+                # Long option with attached value (``--signal=TERM``) consumes
+                # only itself; an option taking a separate argument consumes the
+                # next token too; everything else is a boolean flag.
+                if "=" not in token and token in value_options:
+                    idx += 2
+                else:
+                    idx += 1
+                continue
+            break
+        # Skip mandatory leading positionals (e.g. timeout's DURATION).
+        for _pos in range(leading_positionals):
+            if idx < len(rest) and not rest[idx].startswith("-"):
+                idx += 1
+        inner = rest[idx:]
+        if not inner:
+            # Runner with no inner command (bare ``env``, ``env VAR=val``):
+            # nothing concrete to classify -> not resolvable, require approval.
+            return [], False
+        tokens = inner
+    # Recursion bound exceeded: refuse to auto-trust a deep runner chain.
+    return tokens, False
+
+
+def normalize_segment_for_rule(tokens: list[str]) -> str | None:
+    """Return the effective-command string for a tokenized segment, or ``None``.
+
+    Strips leading ``VAR=val`` assignments and known safe command-runner
+    wrappers (``env``/``timeout``/``nice``/``nohup``/``stdbuf``/``setsid``/... and
+    their leading args) down to the inner command that actually runs, then joins
+    the resulting tokens back into a whitespace-normalized string suitable for
+    prefix rule matching. This lets a prefix rule like ``npm test:*`` generalize
+    across ``FOO=bar npm test`` and ``env npm test --watch``.
+
+    Reuses the Wave-1 :func:`_resolve_runner_segment` resolver so there is a
+    single stripper of record (no second, divergent normalizer). Returns
+    ``None`` when the segment resolves to nothing concrete (e.g. a bare ``env``
+    with no inner command), when it is empty, or when normalization would not
+    change the segment (so callers can cheaply skip the extra match).
+    """
+    if not tokens:
+        return None
+    # Strip leading bare ``VAR=val`` assignments (``FOO=bar npm test``): these are
+    # environment-prefix assignments, not the command. The runner resolver only
+    # strips assignments that follow a wrapper token (``env FOO=bar ...``), so a
+    # bare leading assignment is handled here before delegating. This is NOT a
+    # second runner stripper — it only drops the ``NAME=value`` prefix, then the
+    # Wave-1 :func:`_resolve_runner_segment` does all wrapper resolution.
+    stripped = list(tokens)
+    while stripped and "=" in stripped[0] and not stripped[0].startswith("-"):
+        stripped.pop(0)
+    if not stripped:
+        # Only assignments, no command (e.g. ``FOO=bar``): nothing concrete.
+        return None
+    inner, _resolvable = _resolve_runner_segment(stripped)
+    # A wrapper that wrapped nothing concrete (bare ``env``) has no effective
+    # command to normalize; leave it to the raw-string match / classifier.
+    if not inner:
+        return None
+    normalized = " ".join(inner)
+    if not normalized or normalized == " ".join(tokens):
+        # Nothing was stripped: the raw target already equals the normalized one.
+        return None
+    return normalized
+
 
 def _sed_is_in_place(tokens: list[str]) -> bool:
     """Return True if any ``sed`` token requests in-place editing (a write).
@@ -284,9 +540,9 @@ def _sed_is_in_place(tokens: list[str]) -> bool:
 def _is_read_only_segment(tokens: list[str]) -> bool:
     if not tokens:
         return True
-    command = tokens[0]
+    command = _normalize_command_name(tokens[0])
     if command == "git":
-        return is_readonly_git_subcommand(tokens)
+        return is_readonly_git_subcommand([command, *tokens[1:]])
     if command == "sed":
         # sed is read-only unless it writes in place; handled specially because
         # its classification is flag-dependent (see _sed_is_in_place).
@@ -299,7 +555,7 @@ def _is_read_only_segment(tokens: list[str]) -> bool:
 def _is_write_segment(tokens: list[str]) -> bool:
     if not tokens:
         return False
-    command = tokens[0]
+    command = _normalize_command_name(tokens[0])
     if command == "git":
         return not _is_read_only_segment(tokens)
     if command == "sed":
@@ -312,7 +568,9 @@ def _is_privileged_segment(tokens: list[str], lowered_command: str) -> bool:
     """Segments that are hard-denied: privilege escalation or destructive deletes."""
     if not tokens:
         return False
-    command = tokens[0]
+    # Normalize argv[0] so ``/usr/bin/sudo`` and ``./sudo`` are caught, not just
+    # a bare ``sudo`` token (absolute-path privilege bypass).
+    command = _normalize_command_name(tokens[0])
 
     if command in PRIVILEGED_PREFIXES:
         return True
@@ -329,7 +587,7 @@ def _is_code_execution_segment(tokens: list[str]) -> bool:
     """Segments that run arbitrary code: allowed, but always need approval."""
     if not tokens:
         return False
-    command = tokens[0]
+    command = _normalize_command_name(tokens[0])
 
     if command not in CODE_EXECUTION_PREFIXES:
         return False
@@ -393,7 +651,20 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             reason="empty command",
         )
 
-    if any(_is_privileged_segment(tokens, lowered) for tokens in tokenized_segments):
+    # Resolve command-runner wrappers (env/timeout/xargs/...) down to the inner
+    # command they execute, so ``env rm -rf x`` is classified as ``rm``, not as a
+    # read-only ``env``. A runner that wraps nothing (bare ``env``) is not
+    # resolvable and must fall through to an approval prompt.
+    resolved_segments: list[list[str]] = []
+    all_resolvable = True
+    for tokens in tokenized_segments:
+        inner, resolvable = _resolve_runner_segment(tokens)
+        if not resolvable:
+            all_resolvable = False
+        if inner:
+            resolved_segments.append(inner)
+
+    if any(_is_privileged_segment(tokens, lowered) for tokens in resolved_segments):
         return ShellCommandDecision(
             command=command,
             allowed=False,
@@ -404,7 +675,7 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             reason="dangerous command prefix detected",
         )
 
-    if any(_is_code_execution_segment(tokens) for tokens in tokenized_segments):
+    if any(_is_code_execution_segment(tokens) for tokens in resolved_segments):
         return ShellCommandDecision(
             command=command,
             allowed=True,
@@ -415,8 +686,10 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             reason="command executes arbitrary code; requires approval",
         )
 
-    read_only = all(_is_read_only_segment(tokens) for tokens in tokenized_segments)
-    mutates_filesystem = any(_is_write_segment(tokens) for tokens in tokenized_segments) or bool(
+    read_only = all_resolvable and all(
+        _is_read_only_segment(tokens) for tokens in resolved_segments
+    )
+    mutates_filesystem = any(_is_write_segment(tokens) for tokens in resolved_segments) or bool(
         WRITE_REDIRECTION_PATTERN.search(raw)
     )
 

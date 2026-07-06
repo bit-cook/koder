@@ -84,7 +84,29 @@ def _clear_interactive_viewport() -> None:
     console.file.flush()
 
 
-async def prompt_select_session(current_session_id: str | None = None) -> Optional[str]:
+async def _list_sessions_for_cwd_ids() -> set[str]:
+    """Return session ids that were last recorded in the current directory."""
+    from koder_agent.core.session import EnhancedSQLiteSession
+
+    ids: set[str] = set()
+    try:
+        all_sessions = await EnhancedSQLiteSession.list_sessions_with_titles()
+        cwd = os.getcwd()
+        for sid, _title in all_sessions:
+            try:
+                session_cwd = await EnhancedSQLiteSession(session_id=sid).get_cwd()
+            except Exception:
+                session_cwd = None
+            if session_cwd == cwd:
+                ids.add(sid)
+    except Exception:
+        logger.debug("Failed to scope sessions to cwd", exc_info=True)
+    return ids
+
+
+async def prompt_select_session(
+    current_session_id: str | None = None, *, all_dirs: bool = True
+) -> Optional[str]:
     from koder_agent.core.session import EnhancedSQLiteSession
     from koder_agent.utils import parse_session_dt, picker_arrows_with_titles
 
@@ -93,6 +115,12 @@ async def prompt_select_session(current_session_id: str | None = None) -> Option
         sessions_with_titles = [
             (sid, title) for sid, title in sessions_with_titles if sid != current_session_id
         ]
+    if not all_dirs:
+        cwd_ids = await _list_sessions_for_cwd_ids()
+        scoped = [(sid, title) for sid, title in sessions_with_titles if sid in cwd_ids]
+        # Fall back to all sessions when nothing is scoped to this directory.
+        if scoped:
+            sessions_with_titles = scoped
     if not sessions_with_titles:
         console.print(Panel("No sessions found.", title="Sessions", border_style="yellow"))
         return None
@@ -102,6 +130,25 @@ async def prompt_select_session(current_session_id: str | None = None) -> Option
         reverse=True,
     )
     return picker_arrows_with_titles(sessions_with_titles)
+
+
+async def _resolve_resume_value(candidate: str) -> Optional[str]:
+    """Resolve a `--resume <value>` argument to a session id.
+
+    Returns the value directly when it matches a known session id. Otherwise
+    falls back to a unique title match. Returns None when no match is found or
+    when the title is ambiguous.
+    """
+    from koder_agent.core.session import EnhancedSQLiteSession
+
+    sessions = await EnhancedSQLiteSession.list_sessions_with_titles()
+    session_ids = {sid for sid, _title in sessions}
+    if candidate in session_ids:
+        return candidate
+    title_matches = [sid for sid, title in sessions if title == candidate]
+    if len(title_matches) == 1:
+        return title_matches[0]
+    return None
 
 
 async def load_context() -> str:
@@ -365,7 +412,20 @@ async def run_harness_session_flow(
         return 0
 
     is_config_command = first_arg == "config"
-    is_subcommand = first_arg in {"config", "auth", "mcp", "agents", "plugin", "plugins"}
+    is_subcommand = first_arg in {
+        "config",
+        "auth",
+        "mcp",
+        "agents",
+        "plugin",
+        "plugins",
+        "doctor",
+        "review",
+        "completion",
+        "upgrade",
+    }
+    # Subcommands that must not require model/client setup (offline/diagnostic).
+    is_offline_subcommand = first_arg in {"config", "doctor", "completion", "upgrade"}
 
     if not is_subcommand:
         from koder_agent.utils import setup_openai_client
@@ -470,6 +530,26 @@ async def run_harness_session_flow(
 
         return await handle_plugin_subcommand(args)
 
+    if args.command == "doctor":
+        from koder_agent.harness.cli.headless import handle_doctor_command
+
+        return await handle_doctor_command(args)
+
+    if args.command == "review":
+        from koder_agent.harness.cli.headless import handle_review_command
+
+        return await handle_review_command(args)
+
+    if args.command == "completion":
+        from koder_agent.harness.cli.headless import handle_completion_command
+
+        return handle_completion_command(args)
+
+    if args.command == "upgrade":
+        from koder_agent.harness.cli.headless import handle_upgrade_command
+
+        return await handle_upgrade_command(args)
+
     if getattr(args, "continue_session", False):
         continued_session_id = await EnhancedSQLiteSession.get_most_recent_session_for_cwd(
             os.getcwd()
@@ -487,7 +567,18 @@ async def run_harness_session_flow(
 
     resume_value = getattr(args, "resume", None)
     if isinstance(resume_value, str) and resume_value.strip():
-        args.session = resume_value.strip()
+        candidate = resume_value.strip()
+        resolved = await _resolve_resume_value(candidate)
+        if resolved is None:
+            console.print(
+                Panel(
+                    f"No session found matching '{candidate}' (by id or title).",
+                    title="Error",
+                    border_style="red",
+                )
+            )
+            return 1
+        args.session = resolved
     elif resume_value:
         if not getattr(args, "session", None) and (
             not sys.stdin.isatty() or not sys.stdout.isatty()
@@ -503,7 +594,7 @@ async def run_harness_session_flow(
             return 1
         from koder_agent.utils import default_session_local_ms
 
-        selected = await prompt_select_session()
+        selected = await prompt_select_session(all_dirs=bool(getattr(args, "resume_all", False)))
         if selected:
             args.session = selected
         elif not getattr(args, "session", None):
@@ -1038,9 +1129,43 @@ async def run_harness_session_flow(
                             },
                             mcp_servers=getattr(scheduler, "_mcp_servers", []),
                         )
+                        # Attach any -i/--image files to this first (one-shot)
+                        # turn as multimodal input. The plain `prompt` string is
+                        # still passed to scheduler.handle for all bookkeeping;
+                        # only the model input carries the image blocks.
+                        multimodal_input = None
+                        images = getattr(args, "image", []) or []
+                        if images:
+                            from koder_agent.utils.image_input import (
+                                ImageInputError,
+                                build_multimodal_input,
+                                model_supports_vision,
+                            )
+
+                            if not model_supports_vision(get_model_name()):
+                                console.print(
+                                    Panel(
+                                        f"Model '{get_model_name()}' is not known to support "
+                                        "image input; sending anyway and letting the provider "
+                                        "decide.",
+                                        title="Warning",
+                                        border_style="yellow",
+                                    )
+                                )
+                            try:
+                                built = build_multimodal_input(prompt, images)
+                            except ImageInputError as exc:
+                                console.print(Panel(str(exc), title="Error", border_style="red"))
+                                return 1
+                            # build_multimodal_input returns a list only when at
+                            # least one image was attached; otherwise it echoes
+                            # the plain text (leave the plain-text path intact).
+                            if isinstance(built, list):
+                                multimodal_input = built
                         response = await scheduler.handle(
                             prompt,
                             render_output=getattr(args, "output_format", "text") == "text",
+                            multimodal_input=multimodal_input,
                         )
                     except Exception as exc:
                         dispatch_command_hooks(
@@ -1106,6 +1231,24 @@ async def run_harness_session_flow(
                         border_style="cyan",
                     ),
                 )
+
+            # Opt-in startup version check (interactive-only, never in CI/headless).
+            if not bare_mode:
+                try:
+                    from koder_agent.harness.version_info import check_for_update
+
+                    update_message = check_for_update(interactive=True)
+                    if update_message:
+                        print_reflowable(
+                            console,
+                            Panel(
+                                update_message,
+                                title="[yellow]Update Available[/yellow]",
+                                border_style="yellow",
+                            ),
+                        )
+                except Exception:
+                    logger.debug("Startup version check failed", exc_info=True)
 
             while True:
                 try:

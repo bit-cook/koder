@@ -19,26 +19,51 @@ class PostCompactRepair:
     """Restores context after compaction by re-reading recently accessed files."""
 
     def collect_recently_accessed_files(self, messages: list[dict]) -> list[str]:
-        """Extract file paths from read_file tool calls in messages (most recent first)."""
+        """Extract file paths from read_file tool calls in messages (most recent first).
+
+        Handles two item shapes:
+        * Chat Completions: an assistant message carrying a ``tool_calls`` list,
+          each entry a ``{"function": {"name", "arguments"}}`` dict.
+        * Koder/Responses items: a top-level ``{"type": "function_call",
+          "name": ..., "arguments": ...}`` item -- what koder actually persists,
+          so without this branch the collector found nothing.
+        """
         seen: set[str] = set()
         paths: list[str] = []
-        # Walk messages in reverse to get most recently accessed first
-        for msg in reversed(messages):
-            for tc in msg.get("tool_calls", []):
-                func = tc.get("function", {})
-                if func.get("name") != "read_file":
-                    continue
+
+        def _consider(name, raw_arguments) -> None:
+            if name != "read_file":
+                return
+            if isinstance(raw_arguments, dict):
+                args = raw_arguments  # some producers store parsed args
+            elif isinstance(raw_arguments, str):
                 try:
-                    args = json.loads(func.get("arguments", "{}"))
-                    fp = args.get("file_path") or args.get("path")
-                    if fp and fp not in seen:
-                        seen.add(fp)
-                        paths.append(fp)
+                    args = json.loads(raw_arguments or "{}")
                 except (json.JSONDecodeError, TypeError):
                     logger.debug(
                         "Failed to parse tool call arguments for file restore", exc_info=True
                     )
-                    continue
+                    return
+            else:
+                return
+            if not isinstance(args, dict):
+                return
+            fp = args.get("path") or args.get("file_path")
+            if fp and fp not in seen:
+                seen.add(fp)
+                paths.append(fp)
+
+        # Walk messages in reverse to get most recently accessed first
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            # Koder/Responses top-level function_call item shape.
+            if msg.get("type") == "function_call":
+                _consider(msg.get("name"), msg.get("arguments"))
+            # Chat Completions assistant-message tool_calls shape.
+            for tc in msg.get("tool_calls", []) or []:
+                func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                _consider(func.get("name"), func.get("arguments"))
         return paths[:MAX_FILE_RESTORE_COUNT]
 
     async def build_file_restoration_attachments(

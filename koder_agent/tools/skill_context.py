@@ -41,6 +41,91 @@ _active_restrictions: ContextVar[Optional["SkillRestrictions"]] = ContextVar(
     "active_skill_restrictions", default=None
 )
 
+# Substrings that indicate command/process substitution. A pattern like
+# ``git *`` cannot reason about what runs inside ``$(...)`` / backticks, so any
+# command containing these is rejected outright instead of glob-matched.
+_SUBSTITUTION_MARKERS = ("$(", "`", "<(", ">(", "${")
+
+
+def _contains_substitution(command: str) -> bool:
+    return any(marker in command for marker in _SUBSTITUTION_MARKERS)
+
+
+def _command_matches_pattern(command: str, pattern: str) -> bool:
+    """Return True only if EVERY chained segment of *command* matches *pattern*.
+
+    A naive ``fnmatch(command, "git *")`` lets ``git status; rm -rf /`` through
+    because the whole string still starts with ``git ``. We instead split the
+    command into segments on shell operators (``;`` ``&&`` ``||`` ``|`` and
+    newlines) using the quote-aware tokenizer, then require the pattern to match
+    every segment. Command/process substitution is rejected outright because a
+    first-token pattern cannot police what runs inside it.
+
+    ``pattern == "*"`` keeps its "allow anything" meaning (the caller uses it as
+    an explicit escape hatch), but still rejects substitution smuggling.
+    """
+    if _contains_substitution(command):
+        return False
+
+    segments = _split_command_segments(command)
+    if not segments:
+        # No runnable segment (e.g. empty or only operators): match only if the
+        # pattern would also match the empty/stripped command string.
+        return fnmatch.fnmatch(command.strip(), pattern)
+
+    return all(fnmatch.fnmatch(segment, pattern) for segment in segments)
+
+
+_SEGMENT_SEPARATORS = {"|", "||", "&&", ";", ";;", "&"}
+_OPERATOR_ONLY_CHARS = set(";&|<>")
+
+
+def _split_command_segments(command: str) -> list[str]:
+    """Split a command line into per-segment strings on shell operators.
+
+    Uses a quote-aware ``shlex`` tokenizer (``punctuation_chars=True``) so that
+    operators inside quotes -- e.g. the ``|`` in ``grep 'a|b'`` -- are NOT
+    treated as segment separators. Segments are reconstructed as space-joined
+    tokens for glob matching. Falls back to a conservative regex split (stricter,
+    never looser) if the command cannot be tokenized (e.g. unbalanced quotes).
+
+    Newlines separate whole commands at execution time (``shell.py`` passes the
+    raw string to ``/bin/sh -c``), but ``shlex`` treats ``\\n`` as ordinary
+    whitespace and would merge ``git log\\nrm -rf /`` into a single segment that
+    fnmatches ``git *``. So the raw command is split on line boundaries FIRST and
+    each physical line is tokenized independently.
+    """
+    import shlex
+
+    segments: list[str] = []
+    for line in command.splitlines():
+        if not line.strip():
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            import re
+
+            parts = re.split(r"(?:\|\||&&|[|;&])", line)
+            segments.extend(part.strip() for part in parts if part.strip())
+            continue
+
+        current: list[str] = []
+        for token in tokens:
+            if token in _SEGMENT_SEPARATORS or (
+                token and all(ch in _OPERATOR_ONLY_CHARS for ch in token)
+            ):
+                if current:
+                    segments.append(" ".join(current))
+                    current = []
+                continue
+            current.append(token)
+        if current:
+            segments.append(" ".join(current))
+    return segments
+
 
 @dataclass
 class SkillRestrictions:
@@ -152,7 +237,9 @@ class SkillRestrictions:
             if not isinstance(args, dict):
                 return False
             command = args.get("command", "")
-            return fnmatch.fnmatch(command, pattern)
+            if not isinstance(command, str):
+                return False
+            return _command_matches_pattern(command, pattern)
         except (json.JSONDecodeError, TypeError, AttributeError):
             return False
 
@@ -171,7 +258,14 @@ class SkillRestrictions:
             if not isinstance(args, dict):
                 return False
             git_args = args.get("args", "")
-            return fnmatch.fnmatch(git_args, pattern)
+            if not isinstance(git_args, str):
+                return False
+            # ``git_command`` runs a single ``git <args>`` invocation, but the
+            # args string can still smuggle chained commands (``status; rm -rf /``)
+            # if consumed by a shell. Reject any segment that does not match the
+            # pattern, and reject operators/substitutions the pattern didn't
+            # account for -- same defense as the shell matcher below.
+            return _command_matches_pattern(git_args, pattern)
         except (json.JSONDecodeError, TypeError, AttributeError):
             return False
 

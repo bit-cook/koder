@@ -57,10 +57,16 @@ def activate_conditional_skills(skills: dict[str, object], file_path: str) -> li
     activated = []
 
     for skill_name, skill in skills.items():
-        metadata = getattr(skill, "metadata", {})
-        path_patterns = metadata.get("paths", [])
+        # Real Skill objects store patterns in the dedicated ``paths`` field
+        # (stripped from metadata at load time). Prefer it, then fall back to
+        # ``metadata["paths"]`` for dict/Mock-based inputs. Only accept an actual
+        # list/tuple of patterns so auto-created Mock attributes are ignored.
+        path_patterns = getattr(skill, "paths", None)
+        if not isinstance(path_patterns, (list, tuple)) or not path_patterns:
+            metadata = getattr(skill, "metadata", None) or {}
+            path_patterns = metadata.get("paths", []) if isinstance(metadata, dict) else []
 
-        if not path_patterns:
+        if not isinstance(path_patterns, (list, tuple)) or not path_patterns:
             continue
 
         for pattern in path_patterns:

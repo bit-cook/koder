@@ -200,13 +200,19 @@ async def _resolve_headers_helper(helper_cmd: str) -> dict[str, str]:
         return {}
 
 
-async def _build_effective_headers(config: MCPServerConfig) -> dict[str, str]:
+async def _build_effective_headers(
+    config: MCPServerConfig, *, trusted: bool = True
+) -> dict[str, str]:
     """Merge static headers, OAuth headers, and dynamic headersHelper output.
 
     Layer order (later overrides earlier):
     1. Static ``config.headers``
     2. OAuth ``Authorization`` header (if ``config.oauth`` is set)
     3. Dynamic ``headersHelper`` output
+
+    ``headersHelper`` runs a shell command read straight from configuration. For
+    an untrusted (unapproved project-scoped) server that is a command-injection
+    vector, so the helper is skipped entirely unless *trusted* is True.
     """
     headers = dict(config.headers or {})
 
@@ -220,9 +226,48 @@ async def _build_effective_headers(config: MCPServerConfig) -> dict[str, str]:
             logger.warning("OAuth flow failed for '%s': %s", config.name, exc)
 
     if config.headers_helper:
-        dynamic = await _resolve_headers_helper(config.headers_helper)
-        headers.update(dynamic)
+        if trusted:
+            dynamic = await _resolve_headers_helper(config.headers_helper)
+            headers.update(dynamic)
+        else:
+            logger.warning(
+                "Skipping headersHelper for untrusted MCP server '%s': "
+                "project-scoped auth helpers only run after project approval.",
+                config.name,
+            )
     return headers
+
+
+def _install_output_truncation(server: MCPServer, server_name: str) -> None:
+    """Wrap ``server.call_tool`` so oversized results are truncated.
+
+    MCP tool calls go through the SDK's ``MCPServer.call_tool`` and never touch
+    koder's ``function_tool`` truncation, so the ``MAX_MCP_OUTPUT_TOKENS`` cap
+    would otherwise be dead. We wrap the bound method with a thin coroutine that
+    post-processes the ``CallToolResult`` via :func:`truncate_call_tool_result`.
+
+    Idempotent: a server already wrapped (``_koder_output_capped``) is skipped.
+    """
+    from .limits import truncate_call_tool_result
+
+    original = getattr(server, "call_tool", None)
+    if original is None or getattr(server, "_koder_output_capped", False):
+        return
+
+    async def _capped_call_tool(tool_name: str, arguments: Any = None) -> Any:
+        result = await original(tool_name, arguments)
+        try:
+            return truncate_call_tool_result(result, server_name)
+        except Exception:  # never let capping break a real tool call
+            logger.debug("MCP output truncation failed for '%s'", server_name, exc_info=True)
+            return result
+
+    try:
+        server.call_tool = _capped_call_tool  # type: ignore[assignment]
+        server._koder_output_capped = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        # Some SDK server objects may not allow attribute assignment; skip.
+        logger.debug("Could not install MCP output cap on '%s'", server_name)
 
 
 class MCPServerFactory:
@@ -232,6 +277,8 @@ class MCPServerFactory:
     async def create_server(
         config: MCPServerConfig,
         channel_callback: ChannelNotifCallbackT | None = None,
+        *,
+        trusted: bool = True,
     ) -> MCPServer:
         """Create an MCP server instance from configuration.
 
@@ -241,7 +288,9 @@ class MCPServerFactory:
         messages are intercepted before the SDK drops them.
 
         For SSE/HTTP servers with a ``headersHelper``, the helper command
-        is executed and its JSON output is merged into the connection headers.
+        is executed and its JSON output is merged into the connection headers —
+        but only when *trusted* is True (unapproved project servers do not run
+        their auth helper).
         """
         try:
             # Create tool filter if specified
@@ -253,15 +302,24 @@ class MCPServerFactory:
                 )
 
             if config.transport_type == MCPServerType.STDIO:
-                return MCPServerFactory._create_stdio_server(
+                server: MCPServer = MCPServerFactory._create_stdio_server(
                     config, tool_filter, channel_callback=channel_callback
                 )
             elif config.transport_type == MCPServerType.SSE:
-                return await MCPServerFactory._create_sse_server(config, tool_filter)
+                server = await MCPServerFactory._create_sse_server(
+                    config, tool_filter, trusted=trusted
+                )
             elif config.transport_type == MCPServerType.HTTP:
-                return await MCPServerFactory._create_http_server(config, tool_filter)
+                server = await MCPServerFactory._create_http_server(
+                    config, tool_filter, trusted=trusted
+                )
             else:
                 raise ValueError(f"Unsupported transport type: {config.transport_type}")
+
+            # Enforce the MCP output-token cap on tool results. MCP tools bypass
+            # koder's function_tool wrapper, so without this the cap is dead.
+            _install_output_truncation(server, config.name)
+            return server
 
         except Exception as e:
             logger.error(f"Failed to create MCP server '{config.name}': {e}")
@@ -301,12 +359,14 @@ class MCPServerFactory:
         )
 
     @staticmethod
-    async def _create_sse_server(config: MCPServerConfig, tool_filter) -> MCPServerSse:
+    async def _create_sse_server(
+        config: MCPServerConfig, tool_filter, *, trusted: bool = True
+    ) -> MCPServerSse:
         """Create an SSE MCP server."""
         if not config.url:
             raise ValueError("SSE server requires a URL")
 
-        effective_headers = await _build_effective_headers(config)
+        effective_headers = await _build_effective_headers(config, trusted=trusted)
 
         params = MCPServerSseParams(
             url=config.url,
@@ -321,12 +381,14 @@ class MCPServerFactory:
         )
 
     @staticmethod
-    async def _create_http_server(config: MCPServerConfig, tool_filter) -> MCPServerStreamableHttp:
+    async def _create_http_server(
+        config: MCPServerConfig, tool_filter, *, trusted: bool = True
+    ) -> MCPServerStreamableHttp:
         """Create an HTTP MCP server."""
         if not config.url:
             raise ValueError("HTTP server requires a URL")
 
-        effective_headers = await _build_effective_headers(config)
+        effective_headers = await _build_effective_headers(config, trusted=trusted)
 
         params = MCPServerStreamableHttpParams(
             url=config.url,
@@ -364,17 +426,20 @@ class MCPServerFactory:
         config: MCPServerConfig,
         channel_callback: Any = None,
         reconnection_config: Optional[ReconnectionConfig] = None,
+        *,
+        trusted: bool = True,
     ) -> tuple[MCPServer, ReconnectionManager]:
         """Create and connect an MCP server with reconnection support.
 
         Returns:
             A tuple of (server, reconnection_manager) where the manager can be
-            used for future reconnection attempts.
+            used for future reconnection attempts. The manager retains the
+            factory closure so callers can trigger a fresh connect later.
         """
         reconnection_mgr = ReconnectionManager(reconnection_config)
 
         async def connect_fn():
-            server = await MCPServerFactory.create_server(config, channel_callback)
+            server = await MCPServerFactory.create_server(config, channel_callback, trusted=trusted)
             await server.connect()
             return server
 
@@ -393,6 +458,11 @@ class MCPServerFactory:
                 f"Failed to connect to MCP server '{config.name}' after "
                 f"{reconnection_mgr.config.max_attempts} attempts"
             )
+
+        # Retain the (server, config, connect closure) on the manager so a later
+        # health check can rebuild a dropped connection without re-deriving the
+        # trust/channel wiring. Used by MCPServerRegistry.reconnect_if_needed().
+        reconnection_mgr.bind(config=config, server=server, connect_fn=connect_fn)
 
         return server, reconnection_mgr
 

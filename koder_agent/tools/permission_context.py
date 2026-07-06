@@ -62,9 +62,18 @@ GUARDED_TOOLS: frozenset[str] = frozenset(
 # workspace write would brick the tool in a live session.
 _ENFORCE_APPROVAL_ENV = "KODER_ENFORCE_TOOL_APPROVAL"
 
-# Approver signature: (tool_name, arguments, decision) -> awaitable[bool].
-# Returns True to allow the call, False to deny it.
-Approver = Callable[[str, dict, "PermissionEvaluationResult"], Awaitable[bool]]
+# Approver signature: (tool_name, arguments, decision) -> awaitable[decision].
+# The awaited result may be:
+#   * ``bool``            — True allow-once, False deny (legacy contract, still supported)
+#   * ``"deny"``          — deny the call
+#   * ``"allow"`` / ``"allow_once"`` — allow only this call
+#   * ``"always"`` / ``"allow_always"`` — allow this call AND persist a generalized
+#     allow rule via ``PermissionService.add_approval_rule`` so equivalent calls
+#     are auto-approved in this and future sessions.
+Approver = Callable[[str, dict, "PermissionEvaluationResult"], Awaitable["bool | str"]]
+
+_ALLOW_ONCE_RESULTS = frozenset({True, "allow", "allow_once", "yes"})
+_ALLOW_ALWAYS_RESULTS = frozenset({"always", "allow_always", "always_allow"})
 
 
 @dataclass
@@ -237,11 +246,24 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
                 return _deny(hook_decision.get("message") or decision.reason)
         if ctx.approver is not None:
             try:
-                approved = await ctx.approver(tool_name, arguments, decision)
+                verdict = await ctx.approver(tool_name, arguments, decision)
             except Exception:
                 logger.debug("Tool approver raised for %s", tool_name, exc_info=True)
-                approved = False
-            return None if approved else _deny(decision.reason)
+                verdict = False
+            if verdict in _ALLOW_ALWAYS_RESULTS:
+                # Persist a generalized allow rule so equivalent calls stop
+                # prompting (this session and future ones). Never let a
+                # persistence failure turn an approved call into a denial.
+                try:
+                    ctx.permission_service.add_approval_rule(tool_name, arguments)
+                except Exception:
+                    logger.debug(
+                        "Failed to persist always-allow rule for %s", tool_name, exc_info=True
+                    )
+                return None
+            if verdict in _ALLOW_ONCE_RESULTS:
+                return None
+            return _deny(decision.reason)
         # No interactive approver available.
         if _enforce_approval_when_unattended():
             return _deny(

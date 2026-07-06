@@ -15,8 +15,17 @@ from .path_policy import evaluate_path_access
 from .persistence import PermissionStore
 from .powershell_classifier import classify_powershell_command
 from .results import PermissionEvaluationResult
-from .rules import match_permission_rule, parse_permission_rule
-from .shell_classifier import classify_shell_command
+from .rules import (
+    derive_path_prefix_rule,
+    derive_shell_prefix_rule,
+    match_permission_rule,
+    parse_permission_rule,
+)
+from .shell_classifier import (
+    _tokenize_segments,
+    classify_shell_command,
+    normalize_segment_for_rule,
+)
 
 if TYPE_CHECKING:
     from .ai_classifier import AiShellClassifier
@@ -25,6 +34,16 @@ if TYPE_CHECKING:
 
 def _empty_rules() -> dict[str, dict[str, list[str]]]:
     return {}
+
+
+# Markers for command/process substitution. A prefix allow rule cannot reason
+# about what runs inside these, so a command containing any of them is never
+# auto-allowed by a rule (mirrors the same guard in the skill loaders).
+_COMMAND_SUBSTITUTION_MARKERS = ("$(", "`", "<(", ">(", "${")
+
+
+def _contains_command_substitution(command: str) -> bool:
+    return any(marker in command for marker in _COMMAND_SUBSTITUTION_MARKERS)
 
 
 @dataclass
@@ -53,9 +72,26 @@ class PermissionService:
                     for rule in rule_list:
                         if rule not in bucket:
                             bucket.append(rule)
-        # Load from store if no rules and no hierarchy
-        elif self.store is not None and not self.rules:
-            self.rules = self.store.load().get("rules", {})
+        # Also merge persisted store rules (e.g. "always allow" decisions from a
+        # prior session). Previously this was an ``elif`` that only ran when NO
+        # hierarchy existed, so with the production setup (hierarchy + store) the
+        # persisted rules were written but NEVER reloaded — always-allow silently
+        # failed to survive across sessions. Merge them in addition to the
+        # hierarchy so persisted decisions are honored.
+        if self.store is not None:
+            persisted = self.store.load().get("rules", {})
+            if isinstance(persisted, dict):
+                for tool_name, behaviors in persisted.items():
+                    if not isinstance(behaviors, dict):
+                        continue
+                    tool_rules = self.rules.setdefault(tool_name, {})
+                    for behavior, rule_list in behaviors.items():
+                        if not isinstance(rule_list, list):
+                            continue
+                        bucket = tool_rules.setdefault(behavior, [])
+                        for rule in rule_list:
+                            if rule not in bucket:
+                                bucket.append(rule)
 
     @classmethod
     def default(
@@ -100,6 +136,43 @@ class PermissionService:
             bucket.append(rule_content)
         if self.store is not None:
             self.store.save({"rules": self.rules})
+
+    def add_approval_rule(self, tool_name: str, arguments: dict) -> str | None:
+        """Persist an "always allow" decision as a generalized rule.
+
+        Rather than keying on the exact command/target string (so a path or flag
+        change re-prompts — the permission-fatigue bug), this derives a sensible
+        PREFIX rule and persists it via :meth:`add_rule` so it also survives
+        across sessions through the store:
+
+          * ``run_shell`` / ``run_powershell`` / ``git_command`` — a clearly safe
+            verb widens to ``<prefix>:*`` (``npm test`` -> ``npm test:*``), so
+            ``npm test --watch`` reuses it. Destructive/privileged/chained
+            commands are NOT widened; they persist the exact command string.
+          * file tools — a per-directory rule (``/proj/src/``) is persisted so a
+            sibling edit in the same directory is auto-allowed while a file in a
+            different directory still prompts.
+
+        Returns the rule string that was persisted, or ``None`` if no rule
+        target could be derived (nothing is persisted in that case).
+        """
+        target = self._extract_rule_target(tool_name, arguments)
+        if not target:
+            return None
+
+        rule_content: str | None = None
+        if tool_name in {"run_shell", "run_powershell", "git_command"}:
+            # git_command's target is normalized to a leading "git " token by
+            # _extract_rule_target, so the shell derivation sees a real command.
+            rule_content = derive_shell_prefix_rule(target)
+        elif tool_name in ({"read_file"} | FILE_WRITE_TOOLS):
+            rule_content = derive_path_prefix_rule(target)
+
+        # Fall back to the exact target when no safe prefix could be derived, so
+        # the decision is still remembered (just not widened).
+        rule_content = rule_content or target
+        self.add_rule(tool_name, "allow", rule_content)
+        return rule_content
 
     def load_settings_rules(self, settings: dict, source: str) -> None:
         """Load rules from settings dict via rule hierarchy.
@@ -152,6 +225,137 @@ class PermissionService:
                 return rule_content
         return None
 
+    @staticmethod
+    def _shell_segment_targets(command: str) -> list[tuple[str, str | None]] | None:
+        """Split a shell command into per-segment rule targets.
+
+        Returns one ``(raw, normalized)`` pair per segment (using the same
+        quote-aware tokenizer as the classifier) so allow/deny rules are matched
+        against each command in a chain individually. This prevents an
+        ``echo:*`` allow rule from matching ``echo hi; rm -rf ~`` and an
+        ``rm:*`` deny rule from being skipped in ``ls && rm -rf x``.
+
+        ``raw`` is the whitespace-joined segment exactly as written (leading
+        ``VAR=val`` assignments and safe runner wrappers preserved). ``normalized``
+        is the effective inner command after stripping those leading assignments
+        and known command-runner wrappers (``env``/``timeout``/``nice``/...),
+        reusing the Wave-1 runner resolver; it is ``None`` when nothing was
+        stripped or the segment resolves to nothing concrete. Rule matching tries
+        both forms so a prefix rule like ``npm test:*`` generalizes across
+        ``FOO=bar npm test`` and ``env npm test --watch``.
+
+        Returns ``None`` when the command cannot be parsed (unbalanced quotes),
+        so callers fall back to whole-string matching + static classification.
+        """
+        if not command or not command.strip():
+            return None
+        try:
+            segments = _tokenize_segments(command)
+        except ValueError:
+            return None
+        targets: list[tuple[str, str | None]] = [
+            (" ".join(tokens), normalize_segment_for_rule(tokens)) for tokens in segments if tokens
+        ]
+        return targets or None
+
+    def _match_shell_rules(
+        self, tool_name: str, command: str, target: str | None
+    ) -> PermissionEvaluationResult | None:
+        """Evaluate allow/deny rules per shell segment (deny takes precedence).
+
+        - A DENY fires if ANY segment matches a deny rule.
+        - An ALLOW auto-approves ONLY if EVERY segment matches some allow rule.
+        - Single-segment commands behave exactly like whole-string matching.
+
+        Returns a decision when a rule is dispositive, else ``None`` so the
+        caller continues to static classification. Read-only auto-allow is left
+        to the static classifier (see ``evaluate_tool_call``).
+        """
+        segment_targets = self._shell_segment_targets(command)
+        if segment_targets is None or len(segment_targets) <= 1:
+            # Single segment (or unparseable): keep the whole original command
+            # string as the raw form so quoting/spacing is preserved exactly, and
+            # normalize it too so a wrapped single command (``env npm test``) can
+            # still match a prefix allow rule. Single-segment raw behavior is
+            # identical to the pre-fix whole-string matching.
+            if target:
+                normalized = self._normalize_shell_target(command)
+                segment_targets = [(target, normalized)]
+            else:
+                segment_targets = []
+
+        # Deny takes precedence: any segment whose RAW or NORMALIZED form matches
+        # a deny rule denies the whole command. Matching the normalized form too
+        # only makes deny STRICTER — a wrapper (``env rm -rf x``) can never
+        # smuggle its inner command past an ``rm`` deny.
+        for raw_segment, normalized_segment in segment_targets:
+            deny_rule = self._match_rule(tool_name, "deny", raw_segment) or self._match_rule(
+                tool_name, "deny", normalized_segment
+            )
+            if deny_rule:
+                self.denial_log.record(tool_name, f"Denied by rule: {deny_rule}")
+                return PermissionEvaluationResult.deny(
+                    tool_name=tool_name,
+                    reason=f"Denied by rule: {deny_rule}",
+                    mode=self.mode,
+                    matched_rule=deny_rule,
+                )
+
+        # Command/process substitution smuggles an arbitrary inner command inside
+        # an otherwise benign-looking segment: ``make $(rm -rf ~)`` still starts
+        # with ``make`` so a ``make:*`` allow rule would greenlight it, yet the
+        # real work is the hidden ``rm -rf ~``. A prefix allow rule only vouches
+        # for the VISIBLE outer command, never for whatever runs inside ``$(...)``
+        # / backticks / ``<(...)``. So a command containing substitution can never
+        # be auto-allowed by a rule — it falls through to static classification
+        # (which already flags substitution as requires_approval). Deny is
+        # unaffected (checked above), so this only ever makes the gate stricter.
+        if _contains_command_substitution(command):
+            return None
+
+        # Allow only when EVERY segment is individually allowed by a rule. A
+        # segment counts as allowed when its RAW or NORMALIZED form matches an
+        # allow rule, so a prefix rule like ``npm test:*`` generalizes across
+        # ``FOO=bar npm test`` and ``env npm test --watch`` without weakening the
+        # every-segment discipline.
+        matched_rules: list[str] = []
+        for raw_segment, normalized_segment in segment_targets:
+            allow_rule = self._match_rule(tool_name, "allow", raw_segment) or self._match_rule(
+                tool_name, "allow", normalized_segment
+            )
+            if not allow_rule:
+                matched_rules = []
+                break
+            matched_rules.append(allow_rule)
+        if matched_rules and segment_targets:
+            return PermissionEvaluationResult.allow(
+                tool_name=tool_name,
+                mode=self.mode,
+                reason=f"Allowed by rule: {matched_rules[0]}",
+                matched_rule=matched_rules[0],
+            )
+        return None
+
+    @staticmethod
+    def _normalize_shell_target(command: str) -> str | None:
+        """Normalize a whole (single-segment) shell command for rule matching.
+
+        Tokenizes the command with the classifier's quote-aware tokenizer and
+        strips leading ``VAR=val`` assignments / safe runner wrappers via the
+        Wave-1 resolver, returning the effective inner command string (or
+        ``None`` when nothing is stripped or the command is unparseable). Used so
+        a single wrapped command still matches a prefix allow/deny rule.
+        """
+        try:
+            segments = _tokenize_segments(command)
+        except ValueError:
+            return None
+        # A single logical segment is expected here; if the tokenizer split it
+        # into several, this path is not used (multi-segment handling above).
+        if len(segments) != 1 or not segments[0]:
+            return None
+        return normalize_segment_for_rule(segments[0])
+
     def _apply_mode_override(
         self, result: PermissionEvaluationResult
     ) -> PermissionEvaluationResult:
@@ -168,16 +372,21 @@ class PermissionService:
     async def _consult_ai_classifier(self, command: str) -> PermissionEvaluationResult | None:
         """Consult AI classifier for shell command evaluation.
 
+        The AI classifier is only consulted for commands the static classifier
+        already flagged as requiring approval. It is therefore capped so it can
+        only make the verdict *stricter* (DENY) or leave it unchanged
+        (approval-required); it must NEVER convert a static approval requirement
+        into an auto-run. Otherwise a single "safe" hallucination would let the
+        model silently execute an approval-gated command.
+
         Returns None when the classifier is unavailable or errors, so callers
-        fall back to the static classification result (typically an approval
-        request) instead of treating classifier downtime as a denial.
+        fall back to the static classification result (an approval request)
+        instead of treating classifier downtime as a denial.
         """
         if self._ai_classifier is None:
             return None
 
         try:
-            from .ai_classifier import RiskLevel
-
             classification = await self._ai_classifier.classify(command)
 
             if classification.error:
@@ -191,18 +400,14 @@ class PermissionService:
                     mode=self.mode,
                 )
 
-            if classification.risk_level == RiskLevel.MODERATE:
-                return PermissionEvaluationResult.approval_required(
-                    tool_name="run_shell",
-                    reason=f"AI classifier requires approval: {classification.reason}",
-                    mode=self.mode,
-                )
-
-            # SAFE or allowed
-            return PermissionEvaluationResult.allow(
+            # SAFE or MODERATE: the classifier may not downgrade a static
+            # approval requirement to auto-run, so both keep approval required.
+            # (The static classifier already decided this command is not
+            # auto-allowable; the AI can only deny it, not release it.)
+            return PermissionEvaluationResult.approval_required(
                 tool_name="run_shell",
+                reason=f"AI classifier requires approval: {classification.reason}",
                 mode=self.mode,
-                reason=f"AI classifier approved: {classification.reason}",
             )
 
         except Exception:
@@ -231,7 +436,17 @@ class PermissionService:
             additional_roots=self.additional_roots,
         )
         if decision.requires_approval and self.mode == PermissionMode.ACCEPT_EDITS:
-            if tool_name in FILE_WRITE_TOOLS and decision.allowed:
+            # acceptEdits only auto-approves an ordinary workspace write. A path
+            # policy that flagged the target as a dangerous file/directory (e.g.
+            # .git/, .vscode/, .idea/, .koder/, dotfiles like .gitconfig) still
+            # returns allowed=True + requires_approval=True; those must keep
+            # their approval prompt so acceptEdits cannot silently rewrite git
+            # hooks or editor configs.
+            if (
+                tool_name in FILE_WRITE_TOOLS
+                and decision.allowed
+                and decision.reason != "dangerous file or directory"
+            ):
                 return PermissionEvaluationResult.allow(
                     tool_name=tool_name,
                     mode=self.mode,
@@ -259,24 +474,35 @@ class PermissionService:
     def evaluate_tool_call(self, tool_name: str, arguments: dict) -> PermissionEvaluationResult:
         target = self._extract_rule_target(tool_name, arguments)
 
-        deny_rule = self._match_rule(tool_name, "deny", target)
-        if deny_rule:
-            self.denial_log.record(tool_name, f"Denied by rule: {deny_rule}")
-            return PermissionEvaluationResult.deny(
-                tool_name=tool_name,
-                reason=f"Denied by rule: {deny_rule}",
-                mode=self.mode,
-                matched_rule=deny_rule,
-            )
+        # For shell tools, match allow/deny rules PER SEGMENT so an ``echo:*``
+        # allow cannot green-light ``echo hi; rm -rf ~`` and an ``rm:*`` deny is
+        # not skipped in ``ls && rm -rf x``. Deny wins; allow needs every
+        # segment covered. Other tools keep whole-string matching.
+        if tool_name in {"run_shell", "run_powershell"} and isinstance(
+            arguments.get("command"), str
+        ):
+            shell_rule_result = self._match_shell_rules(tool_name, arguments["command"], target)
+            if shell_rule_result is not None:
+                return shell_rule_result
+        else:
+            deny_rule = self._match_rule(tool_name, "deny", target)
+            if deny_rule:
+                self.denial_log.record(tool_name, f"Denied by rule: {deny_rule}")
+                return PermissionEvaluationResult.deny(
+                    tool_name=tool_name,
+                    reason=f"Denied by rule: {deny_rule}",
+                    mode=self.mode,
+                    matched_rule=deny_rule,
+                )
 
-        allow_rule = self._match_rule(tool_name, "allow", target)
-        if allow_rule:
-            return PermissionEvaluationResult.allow(
-                tool_name=tool_name,
-                mode=self.mode,
-                reason=f"Allowed by rule: {allow_rule}",
-                matched_rule=allow_rule,
-            )
+            allow_rule = self._match_rule(tool_name, "allow", target)
+            if allow_rule:
+                return PermissionEvaluationResult.allow(
+                    tool_name=tool_name,
+                    mode=self.mode,
+                    reason=f"Allowed by rule: {allow_rule}",
+                    matched_rule=allow_rule,
+                )
 
         if self.mode == PermissionMode.PLAN:
             from .modes import READ_ONLY_TOOLS

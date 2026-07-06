@@ -204,7 +204,13 @@ async def test_permission_service_with_hierarchy():
 
 @pytest.mark.asyncio
 async def test_permission_service_ai_classifier_integration():
-    """Test PermissionService consults AI classifier for ambiguous commands."""
+    """AI classifier is consulted but may not upgrade a static approval to allow.
+
+    The static classifier requires approval for ``some-unknown-command``. Even
+    when the AI classifier returns SAFE, the verdict must remain
+    approval-required: the AI can only make things stricter (deny), never
+    convert an approval requirement into an auto-run.
+    """
     hierarchy = RuleHierarchy()
     ai_classifier = AiShellClassifier()
 
@@ -227,9 +233,11 @@ async def test_permission_service_ai_classifier_integration():
             {"command": "some-unknown-command"},
         )
 
-        # AI classifier should have been consulted
+        # AI classifier should have been consulted, but a SAFE verdict must NOT
+        # auto-allow a statically approval-gated command.
         ai_classifier.classify.assert_called_once()
-        assert result.allowed
+        assert not result.allowed
+        assert result.requires_approval
         assert "Safe read-only command" in result.reason
 
 

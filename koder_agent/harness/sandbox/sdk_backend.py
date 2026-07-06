@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from koder_agent.harness.session_env import is_probably_secret_env_name
+
 from .backend import SandboxExecutionContext, SandboxExecutionResult
 from .policy import SandboxPolicy
 from .registry import create_backend_client_and_options, get_backend_status, select_backend_id
@@ -18,10 +20,21 @@ def _decode(value: bytes | str | None) -> str:
     return value
 
 
+def _scrub_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop secret-looking vars from the env before it enters the sandbox.
+
+    Callers assemble the sandbox env from the host process (which carries API
+    keys and tokens). Forwarding those wholesale would leak host credentials
+    into sandboxed commands (finding #2), so strip anything that looks like a
+    secret here regardless of how the caller built the env.
+    """
+    return {key: value for key, value in env.items() if not is_probably_secret_env_name(key)}
+
+
 def _build_manifest(root: Path, env: dict[str, str]):
     from agents.sandbox.manifest import Environment, Manifest
 
-    return Manifest(root=str(root), environment=Environment(value=env))
+    return Manifest(root=str(root), environment=Environment(value=_scrub_env(env)))
 
 
 async def execute_with_sdk_backend(
@@ -71,6 +84,16 @@ async def execute_with_sdk_backend(
             reason=violation,
         )
 
+    # Honesty-first (finding #4): the resolved backend may be unable to enforce
+    # the network policy the user configured. The SDK Manifest exposes no network
+    # controls, so we cannot silently claim enforcement — surface it explicitly.
+    network_note = None
+    if policy.network_restricted_but_unenforced:
+        network_note = (
+            f"[sandbox] network policy is NOT enforced by backend {backend_id}; "
+            "network_access/allowed_domains/denied_domains are advisory only"
+        )
+
     client = None
     session = None
     try:
@@ -80,10 +103,13 @@ async def execute_with_sdk_backend(
         async with session:
             result = await session.exec(context.command, timeout=context.timeout, shell=True)
         await client.delete(session)
+        stderr = _decode(result.stderr)
+        if network_note:
+            stderr = f"{network_note}\n{stderr}" if stderr else network_note
         return SandboxExecutionResult(
             status="success" if result.exit_code == 0 else "error",
             stdout=_decode(result.stdout),
-            stderr=_decode(result.stderr),
+            stderr=stderr,
             exit_code=result.exit_code,
             backend_id=backend_id,
             sandboxed=True,

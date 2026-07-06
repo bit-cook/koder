@@ -12,7 +12,7 @@ class _RecordingScheduler:
         self.fail = fail
         self.delay = delay
 
-    async def handle(self, prompt: str, render_output: bool = True) -> str:
+    async def handle(self, prompt: str, render_output: bool = True, multimodal_input=None) -> str:
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.fail:

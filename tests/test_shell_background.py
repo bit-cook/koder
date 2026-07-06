@@ -353,9 +353,14 @@ async def test_security_validation_blocks_forbidden_commands():
         ),
     )
 
-    # bash_security.py now provides the reason string
-    assert result is not None and (
-        "rm" in result.lower() or "removal" in result.lower() or "root filesystem" in result.lower()
+    # bash_security.py now provides the reason string. The hardened matcher
+    # (bash-security-rm-home-wildcard-gap fix) refuses recursive deletes of a
+    # protected root with a "Recursive deletion targeting a protected root"
+    # message, so assert the command is blocked and the reason names the danger.
+    assert result is not None
+    lowered = result.lower()
+    assert (
+        "deletion" in lowered or "delete" in lowered or "recursive" in lowered or "root" in lowered
     )
 
 
@@ -406,3 +411,127 @@ async def test_scheduler_cleanup_terminates_background_shells():
     await scheduler.cleanup()
 
     assert shell_id not in BackgroundShellManager.get_available_ids()
+
+
+# ---------------------------------------------------------------------------
+# Bounded background output buffer (memory-leak hardening)
+# ---------------------------------------------------------------------------
+
+
+async def test_background_shell_buffer_is_bounded(monkeypatch):
+    """BackgroundShell.output_lines is capped so verbose output can't leak memory."""
+    from koder_agent.tools.shell import BackgroundShell
+
+    monkeypatch.setenv("KODER_BG_SHELL_MAX_LINES", "25")
+
+    class _FakeProcess:
+        returncode = None
+        pid = None
+
+    shell = BackgroundShell(
+        shell_id="cap",
+        command="noisy",
+        process=_FakeProcess(),
+        start_time=0.0,
+    )
+    assert shell.output_lines.maxlen == 25
+
+    for i in range(500):
+        shell.add_output(f"line-{i}")
+
+    assert len(shell.output_lines) == 25
+    assert shell.output_lines[-1] == "line-499"
+    assert shell._total_appended == 500
+
+
+async def test_background_shell_reader_survives_eviction(monkeypatch):
+    """get_new_output stays correct after old lines are evicted (no crash/re-read)."""
+    from koder_agent.tools.shell import BackgroundShell
+
+    monkeypatch.setenv("KODER_BG_SHELL_MAX_LINES", "10")
+
+    class _FakeProcess:
+        returncode = None
+        pid = None
+
+    shell = BackgroundShell(
+        shell_id="evict",
+        command="noisy",
+        process=_FakeProcess(),
+        start_time=0.0,
+    )
+
+    for i in range(5):
+        shell.add_output(f"line-{i}")
+    assert shell.get_new_output() == [f"line-{i}" for i in range(5)]
+
+    for i in range(5, 105):
+        shell.add_output(f"line-{i}")
+
+    tail = shell.get_new_output()
+    assert tail == [f"line-{i}" for i in range(95, 105)]
+    # Subsequent read with no new appends returns nothing.
+    assert shell.get_new_output() == []
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="process-group semantics are POSIX-only")
+async def test_foreground_timeout_reports_and_returns_promptly():
+    """A foreground command that times out reports timeout and returns promptly.
+
+    On timeout the tool must SIGKILL the wrapper's process group (not just the sh
+    wrapper) and drain output under a hard bound, so it returns without hanging.
+    Group-reaping of disowned grandchildren is asserted separately in
+    ``test_shell_kill_reaps_grandchildren``.
+    """
+    import asyncio
+    import time as _time
+
+    cmd = "sleep 30"
+
+    start = _time.monotonic()
+    result = await asyncio.wait_for(
+        run_shell.on_invoke_tool(None, json.dumps({"command": cmd, "timeout": 1})),
+        timeout=10,
+    )
+    elapsed = _time.monotonic() - start
+
+    assert "timed out" in result
+    # Must not hang: timeout(1s) + drain(<=1s) + slack.
+    assert elapsed < 8, f"foreground timeout path took too long: {elapsed:.1f}s"
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="process-group semantics are POSIX-only")
+async def test_new_session_kwargs_posix():
+    """_new_session_kwargs requests a new session on POSIX."""
+    from koder_agent.tools.shell import _new_session_kwargs
+
+    assert _new_session_kwargs() == {"start_new_session": True}
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="process-group semantics are POSIX-only")
+async def test_shell_kill_reaps_grandchildren():
+    """shell_kill terminates the whole process group of a background shell."""
+    import asyncio
+    import os
+    import signal
+
+    cmd = "sleep 30 & echo started; wait"
+    result = await run_shell.on_invoke_tool(
+        None,
+        json.dumps({"command": cmd, "run_in_background": True}),
+    )
+    shell_id = _parse_shell_id(result)
+    shell = BackgroundShellManager.get(shell_id)
+    assert shell is not None
+
+    await asyncio.sleep(0.2)
+    pgid = os.getpgid(shell.process.pid)
+
+    kill_result = await shell_kill.on_invoke_tool(None, json.dumps({"shell_id": shell_id}))
+    assert f"Shell {shell_id} terminated." in kill_result
+    assert shell_id not in BackgroundShellManager.get_available_ids()
+
+    # The whole process group must be gone: signalling it raises ProcessLookupError.
+    await asyncio.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)

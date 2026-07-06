@@ -359,13 +359,22 @@ class EnhancedSQLiteSession(SQLiteSession):
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Persist items to the session storage.
 
-        This session is a pure storage layer: compaction is owned entirely by
-        the scheduler's ``AutoCompactManager`` + ``llm_compact_messages`` path.
-        The legacy per-user-turn summarizer that previously lived here has been
-        removed (it competed with the scheduler's modern path and used bare
-        ``print()`` which corrupted the Rich Live UI). The
-        ``summarization_threshold`` attribute is kept for backwards
+        This session is a pure storage layer for *full* (LLM-based) compaction,
+        which is owned entirely by the scheduler's ``AutoCompactManager`` +
+        ``llm_compact_messages`` path. The legacy per-user-turn summarizer that
+        previously lived here has been removed (it competed with the scheduler's
+        modern path and used bare ``print()`` which corrupted the Rich Live UI).
+        The ``summarization_threshold`` attribute is kept for backwards
         compatibility with callers that still set it, but it is now inert.
+
+        ``add_items`` *is* the interception point for **micro-compaction**: the
+        openai-agents Runner feeds tool outputs back into the conversation and
+        then persists them here, so this is the one place we can truncate a
+        single oversized tool result before it is written to disk (and re-read
+        into future turns). Micro-compaction only *truncates* individual
+        oversized outputs -- it never drops items or breaks
+        tool_call/tool_result pairing, so item count and call ids are preserved.
+        It is a no-op for small outputs, so normal operation is unchanged.
 
         Args:
             items: List of message dictionaries to add
@@ -374,7 +383,30 @@ class EnhancedSQLiteSession(SQLiteSession):
             await super().add_items(items)
             return
 
+        items = self._apply_micro_compaction(items)
         await super().add_items(items)
+
+    def _apply_micro_compaction(self, items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        """Truncate oversized tool outputs before persisting.
+
+        Reuses ``micro_compact_messages`` (which handles both ``role=='tool'``
+        content and ``type=='function_call_output'`` output shapes). Threshold
+        and toggle come from environment variables via
+        ``MicroCompactConfig.from_env``. This is intentionally defensive: any
+        failure falls back to the original items so persistence is never broken.
+        """
+        try:
+            from ..harness.memory.micro_compact import (
+                MicroCompactConfig,
+                micro_compact_messages,
+            )
+
+            config = MicroCompactConfig.from_env()
+            if not config.enabled:
+                return items
+            return micro_compact_messages(items, config=config)
+        except Exception:
+            return items
 
     def _estimate_tokens(self, messages: List[Dict]) -> int:
         """Accurately calculate token count for message history.

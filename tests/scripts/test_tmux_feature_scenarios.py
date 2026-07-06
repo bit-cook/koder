@@ -3774,18 +3774,18 @@ def test_rewind_scenario_is_acceptance_backed_by_prompt_restore_and_db_trim():
         "send": "/rewind",
         "expect_all": [
             "Rewind targets",
-            "1. second prompt (removes 2 newer transcript items)",
-            "2. first prompt (removes 4 newer transcript items)",
-            "Use /rewind <number> to restore the conversation and place that prompt back into the input.",
+            "1. second prompt",
+            "2. first prompt",
+            "Use /rewind <number> [conversation|code|both].",
         ],
     }
     assert scenario["turns"][2] == {
         "send": "/rewind help",
-        "expect_all": ["Usage: /rewind [number]"],
+        "expect_all": ["Usage: /rewind [number] [conversation|code|both]"],
     }
     assert scenario["turns"][3] == {
         "send": "/rewind nope",
-        "expect_all": ["Usage: /rewind [number]"],
+        "expect_all": ["Usage: /rewind [number] [conversation|code|both]"],
     }
     assert scenario["turns"][4] == {
         "send": "/rewind 99",
@@ -3795,7 +3795,6 @@ def test_rewind_scenario_is_acceptance_backed_by_prompt_restore_and_db_trim():
         "send": "/rewind 1",
         "expect_all": [
             "Rewound conversation to prompt 1.",
-            "Removed transcript items: 2",
             "Restored input: second prompt",
         ],
     }

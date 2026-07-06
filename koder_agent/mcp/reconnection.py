@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,65 @@ class ReconnectionManager:
     def __init__(self, config: ReconnectionConfig | None = None):
         self.config = config or ReconnectionConfig()
         self.attempt_count = 0
+        # Retained after a successful initial connect so a later health check
+        # can rebuild the connection without re-deriving trust/channel wiring.
+        self.config_ref: Any = None
+        self.server: Any = None
+        self._connect_fn: Callable[[], Awaitable] | None = None
+
+    def bind(
+        self,
+        *,
+        config: Any = None,
+        server: Any = None,
+        connect_fn: Callable[[], Awaitable] | None = None,
+    ) -> None:
+        """Retain the server, its config, and the factory closure.
+
+        This lets callers hold onto the manager and later trigger a reconnect
+        for a dropped server. Without this the manager was discarded and no
+        runtime reconnection was possible.
+        """
+        if config is not None:
+            self.config_ref = config
+        if server is not None:
+            self.server = server
+        if connect_fn is not None:
+            self._connect_fn = connect_fn
+
+    def _server_is_healthy(self) -> bool:
+        """Best-effort liveness check for the retained server.
+
+        A connected SDK ``MCPServer`` exposes a non-None ``session``; we treat a
+        missing/None session as "needs reconnect". Servers that do not expose a
+        ``session`` attribute are assumed healthy (nothing to probe).
+        """
+        server = self.server
+        if server is None:
+            return False
+        if not hasattr(server, "session"):
+            return True
+        return getattr(server, "session", None) is not None
+
+    async def reconnect_if_needed(self) -> bool:
+        """Reconnect the retained server if it looks unhealthy.
+
+        Returns True if the server is healthy (already, or after a successful
+        reconnect), False if it is unhealthy and reconnection failed or no
+        factory closure was bound.
+        """
+        if self._server_is_healthy():
+            return True
+        if self._connect_fn is None:
+            logger.debug("reconnect_if_needed: no connect_fn bound; cannot reconnect")
+            return False
+
+        connect_fn = self._connect_fn
+
+        async def _do_connect() -> None:
+            self.server = await connect_fn()
+
+        return await self.reconnect_with_backoff(_do_connect)
 
     def get_next_delay(self) -> float:
         """Calculate next delay with exponential backoff."""

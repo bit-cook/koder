@@ -60,6 +60,7 @@ from ..harness.memory.compact import (
     replayable_session_items,
 )
 from ..harness.memory.extraction import llm_extract_memories
+from ..harness.memory.post_compact import PostCompactRepair
 from ..harness.memory.session_memory import SessionMemoryManager
 from ..harness.reasoning_display import normalize_reasoning_display_mode
 from ..tools import BackgroundShellManager, get_all_tools
@@ -94,6 +95,14 @@ GOAL_CONTINUATION_MARKER = GOAL_CONTEXT_MARKER
 # calls update_goal on an unbudgeted goal.
 DEFAULT_GOAL_MAX_CONTINUATIONS = 25
 
+# Cumulative-token backstop for the automatic goal-continuation loop. An
+# unbudgeted ACTIVE goal never transitions to BUDGET_LIMITED, so the count cap
+# alone can let a large number of continuation turns burn an unbounded number
+# of tokens. This guard breaks the loop once the continuations have spent more
+# than this many billable tokens (measured against a baseline captured before
+# the loop). The count cap remains as a secondary backstop.
+DEFAULT_GOAL_MAX_CONTINUATION_TOKENS = 400_000
+
 
 def _goal_max_continuations() -> int:
     raw = os.environ.get("KODER_GOAL_MAX_CONTINUATIONS")
@@ -105,6 +114,18 @@ def _goal_max_continuations() -> int:
         except ValueError:
             pass
     return DEFAULT_GOAL_MAX_CONTINUATIONS
+
+
+def _goal_max_continuation_tokens() -> int:
+    raw = os.environ.get("KODER_GOAL_MAX_CONTINUATION_TOKENS")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_GOAL_MAX_CONTINUATION_TOKENS
 
 
 @dataclass
@@ -142,12 +163,23 @@ class StreamingOutputUI(Protocol):
     def set_final_text(self, text: str) -> None: ...
 
 
-def _format_execution_error(error: Exception) -> str:
-    status_code = None
+def _error_status_code(error: Exception) -> int | None:
+    """Best-effort HTTP status extraction from an exception."""
     if hasattr(error, "status_code"):
-        status_code = error.status_code
-    elif hasattr(error, "response") and hasattr(error.response, "status_code"):
-        status_code = error.response.status_code
+        return error.status_code
+    if hasattr(error, "response") and hasattr(error.response, "status_code"):
+        return error.response.status_code
+    return None
+
+
+def _is_context_overflow_error(error: Exception) -> bool:
+    """Classify whether an exception is a context-window overflow."""
+    classified = classify_api_error(error, status_code=_error_status_code(error))
+    return classified.category == ApiErrorCategory.CONTEXT_OVERFLOW
+
+
+def _format_execution_error(error: Exception) -> str:
+    status_code = _error_status_code(error)
 
     classified = classify_api_error(error, status_code=status_code)
     if classified.category == ApiErrorCategory.UNKNOWN:
@@ -228,6 +260,7 @@ class AgentScheduler:
         instructions_override: str | None = None,
         instructions_append: str | None = None,
         permission_service=None,
+        approver=None,
     ):
         self.session = EnhancedSQLiteSession(session_id=session_id)
         self.agent_definition = agent_definition
@@ -245,6 +278,12 @@ class AgentScheduler:
         self.dev_agent = None  # Will be initialized in async method
         self.streaming = streaming
         self.permission_service = permission_service
+        # Interactive approver seam: when a call requires approval, this callback
+        # (tool_name, arguments, decision) -> "allow"/"always"/"deny" is consulted
+        # by enforce_tool_permission. Passing it through to the permission context
+        # is what makes the "always allow -> persist a rule" flow reachable at
+        # runtime (without it, add_approval_rule is never called on the main path).
+        self.approver = approver
         # Create hooks that wrap display hooks with permission checking
         display_hooks = get_display_hooks(streaming_mode=streaming)
         if agent_definition is not None:
@@ -390,6 +429,36 @@ class AgentScheduler:
 
             self._agent_initialized = True
 
+    async def _reconnect_unhealthy_mcp_servers(self) -> None:
+        """Probe retained MCP servers and reconnect any that dropped.
+
+        MCP servers can silently die between turns (idle timeout, network blip).
+        The reconnection managers are retained by ``load_mcp_servers`` but were
+        never consulted at runtime, so a dropped server stayed dead for the whole
+        session. Called at the start of every turn: it is a best-effort, bounded
+        health check (each manager only reconnects when its own liveness probe
+        says the server is unhealthy) and must never break the turn — any failure
+        is swallowed so a flaky server degrades gracefully rather than crashing
+        the session.
+        """
+        try:
+            from ..mcp import get_reconnection_managers
+        except Exception:
+            return
+        try:
+            managers = get_reconnection_managers()
+        except Exception:
+            return
+        if not managers:
+            return
+        for name, manager in list(managers.items()):
+            try:
+                healthy = await manager.reconnect_if_needed()
+                if not healthy:
+                    logger.warning("MCP server %s is unhealthy and could not reconnect", name)
+            except Exception:
+                logger.debug("MCP reconnect probe failed for %s", name, exc_info=True)
+
     async def _generate_title_background(self, user_input: str) -> None:
         """Background task to generate and save session title."""
         try:
@@ -405,6 +474,7 @@ class AgentScheduler:
         *,
         render_output: bool = True,
         streaming_ui: StreamingOutputUI | None = None,
+        multimodal_input: list | None = None,
     ) -> str:
         """Handle user input and execute agent.
 
@@ -412,12 +482,32 @@ class AgentScheduler:
         continuation turns (still under the turn lock) until the goal leaves
         the active state, the token budget is crossed, or the backstop cap is
         reached — mirroring codex's idle goal continuation.
+
+        ``multimodal_input``, when provided, is the multimodal ``Runner.run``
+        input (a ``list[TResponseInputItem]`` carrying image blocks plus text)
+        that is sent to the model for the FIRST turn only. The plain
+        ``user_input`` string is still used for all bookkeeping (memory,
+        title, goal accounting, magic docs, companion). Hidden goal
+        continuations never carry images.
         """
         async with self._turn_lock:
+            # Bind file checkpointing to this session and open a new checkpoint
+            # for this user turn, so file tools snapshot pre-edit content that
+            # /rewind (code mode) can restore. Hidden goal continuations below
+            # stay within this same checkpoint (they are one logical turn).
+            try:
+                from ..harness import checkpoint as _checkpoint
+
+                _checkpoint.set_active_session(self.session.session_id)
+                _checkpoint.begin_turn()
+            except Exception:
+                logger.debug("Failed to begin file checkpoint turn", exc_info=True)
+
             response = await self._handle_unlocked(
                 user_input,
                 render_output=render_output,
                 streaming_ui=streaming_ui,
+                multimodal_input=multimodal_input,
             )
 
             async def run_continuation(prompt: str) -> str:
@@ -430,10 +520,28 @@ class AgentScheduler:
             return await self._run_goal_continuations(response, run_continuation)
 
     async def _run_goal_continuations(self, response: str, run_turn) -> str:
-        """Run hidden continuation turns while the active goal asks for them."""
+        """Run hidden continuation turns while the active goal asks for them.
+
+        Bounded by two backstops: a cumulative-token guard (primary) and the
+        continuation count cap (secondary). An unbudgeted ACTIVE goal never
+        becomes BUDGET_LIMITED, so the count cap alone would let the loop burn
+        an unbounded number of tokens; the token guard breaks once the
+        continuations spend more than ``KODER_GOAL_MAX_CONTINUATION_TOKENS``
+        beyond the baseline captured before the loop.
+        """
         max_continuations = _goal_max_continuations()
+        max_tokens = _goal_max_continuation_tokens()
+        token_baseline = self._goal_cumulative_tokens()
         continuations = 0
         while continuations < max_continuations:
+            # Primary guard: stop once the continuation turns have collectively
+            # spent more than the configured token budget beyond the baseline.
+            if max_tokens and (self._goal_cumulative_tokens() - token_baseline) > max_tokens:
+                logger.debug(
+                    "Goal continuation loop hit cumulative-token cap (%d tokens)",
+                    max_tokens,
+                )
+                break
             try:
                 continuation = await self.goal_runtime.next_continuation_prompt()
             except Exception:
@@ -451,6 +559,7 @@ class AgentScheduler:
         *,
         render_output: bool = True,
         streaming_ui: StreamingOutputUI | None = None,
+        multimodal_input: list | None = None,
     ) -> str:
         """Handle a single turn after the turn lock has been acquired."""
         # Start before agent init/memory retrieval so the indicator covers the
@@ -461,6 +570,7 @@ class AgentScheduler:
                 user_input,
                 render_output=render_output,
                 streaming_ui=streaming_ui,
+                multimodal_input=multimodal_input,
             )
         finally:
             working_indicator.finish()
@@ -471,12 +581,22 @@ class AgentScheduler:
         *,
         render_output: bool = True,
         streaming_ui: StreamingOutputUI | None = None,
+        multimodal_input: list | None = None,
     ) -> str:
-        """Execute one turn; the caller owns the working-indicator lifecycle."""
+        """Execute one turn; the caller owns the working-indicator lifecycle.
+
+        When ``multimodal_input`` is provided it becomes the actual model
+        ``input`` (image blocks + text) for this turn, while the plain
+        ``user_input`` string continues to drive all bookkeeping (title,
+        memory, goal accounting, magic docs, companion). Only the first turn
+        carries images; goal continuations always pass ``None``.
+        """
         turn_user_input = user_input
 
         # Ensure agent is initialized with MCP servers and migration complete
         await self._ensure_agent_initialized()
+        # Best-effort: reconnect any MCP server that dropped since the last turn.
+        await self._reconnect_unhealthy_mcp_servers()
 
         if self.dev_agent is None:
             console.print("[dim red]Agent not initialized[/dim red]")
@@ -533,49 +653,93 @@ class AgentScheduler:
         # Publish the permission service into the tool layer so the function_tool
         # wrapper can enforce argument-level deny/approval on shell & file tools.
         # Set before Runner.run so the run-loop task copies a context that has it.
-        perm_token = set_tool_permission_context(self.permission_service)
+        perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
         goal_token = set_goal_context(self.goal_runtime)
         await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
         self._last_turn_cancelled = False
         self._last_turn_errored = False
+        # The actual model input: multimodal (image blocks + text) when images
+        # were attached for this turn, otherwise the plain text string. All
+        # bookkeeping below still uses the `user_input` string.
+        run_input = multimodal_input if multimodal_input is not None else user_input
+
+        async def _run_once() -> str:
+            # Re-runs on a context-overflow retry use the SAME run_input so the
+            # multimodal (image blocks + text) payload is preserved across the
+            # single compaction retry below.
+            if self.streaming:
+                return await self._handle_streaming(
+                    user_input,
+                    streaming_ui=streaming_ui,
+                    run_input=run_input,
+                )
+            result = await Runner.run(
+                self.dev_agent,
+                run_input,  # Just current input - session handles history
+                session=self.session,  # Automatic history management
+                run_config=RunConfig(),
+                hooks=self.hooks,
+                max_turns=get_max_turns(),
+            )
+            # Capture token usage from result
+            await self._capture_usage(result)
+
+            # Filter output for security
+            turn_response = self._filter_output(result.final_output)
+
+            # Clean response output without heavy panels
+            if render_output:
+                print()  # Add space before response
+                print_reflowable(console, turn_response)
+                print()  # Add space after response
+            return turn_response
+
+        # Single-shot guard: a CONTEXT_OVERFLOW on the first attempt triggers one
+        # auto-compaction + re-run. A second overflow (or a broken circuit) falls
+        # through to the normal error handling instead of looping.
+        context_overflow_retried = False
         try:
             buddy_runtime.mark_task_start()
             try:
-                if self.streaming:
-                    response = await self._handle_streaming(
-                        user_input,
-                        streaming_ui=streaming_ui,
-                    )
-                else:
-                    result = await Runner.run(
-                        self.dev_agent,
-                        user_input,  # Just current input - session handles history
-                        session=self.session,  # Automatic history management
-                        run_config=RunConfig(),
-                        hooks=self.hooks,
-                        max_turns=get_max_turns(),
-                    )
-                    # Capture token usage from result
-                    await self._capture_usage(result)
-
-                    # Filter output for security
-                    response = self._filter_output(result.final_output)
-
-                    # Clean response output without heavy panels
-                    if render_output:
-                        print()  # Add space before response
-                        print_reflowable(console, response)
-                        print()  # Add space after response
+                response = await _run_once()
             except Exception as e:
-                # Handle execution errors gracefully
-                await self._finish_goal_turn(error=True)
-                error_text = f"Execution error: {_format_execution_error(e)}"
-                response = f"{error_text}\n\nPlease provide new instructions."
-                if render_output:
-                    print_reflowable(
-                        console, f"[red]{error_text}[/red]\n\nPlease provide new instructions."
+                if (
+                    not context_overflow_retried
+                    and _is_context_overflow_error(e)
+                    and self._auto_compact is not None
+                    and not self._auto_compact.is_circuit_broken()
+                ):
+                    context_overflow_retried = True
+                    logger.debug(
+                        "Context overflow on turn; compacting and retrying once",
+                        exc_info=True,
                     )
-                return response
+                    await self._run_auto_compact()
+                    try:
+                        response = await _run_once()
+                    except Exception as retry_error:
+                        # Still failing (or overflowing again): fall through to
+                        # the normal terminal-error handling below.
+                        await self._finish_goal_turn(error=True)
+                        error_text = f"Execution error: {_format_execution_error(retry_error)}"
+                        response = f"{error_text}\n\nPlease provide new instructions."
+                        if render_output:
+                            print_reflowable(
+                                console,
+                                f"[red]{error_text}[/red]\n\nPlease provide new instructions.",
+                            )
+                        return response
+                else:
+                    # Handle execution errors gracefully
+                    await self._finish_goal_turn(error=True)
+                    error_text = f"Execution error: {_format_execution_error(e)}"
+                    response = f"{error_text}\n\nPlease provide new instructions."
+                    if render_output:
+                        print_reflowable(
+                            console,
+                            f"[red]{error_text}[/red]\n\nPlease provide new instructions.",
+                        )
+                    return response
             finally:
                 buddy_runtime.mark_task_complete()
             await self._finish_goal_turn(
@@ -635,6 +799,8 @@ class AgentScheduler:
     ) -> str:
         """Handle a single headless stream-json turn after the turn lock is held."""
         await self._ensure_agent_initialized()
+        # Best-effort: reconnect any MCP server that dropped since the last turn.
+        await self._reconnect_unhealthy_mcp_servers()
 
         if self.dev_agent is None:
             raise RuntimeError("Agent not initialized")
@@ -650,7 +816,7 @@ class AgentScheduler:
                 self._generate_title_background(actual_request)
             )
 
-        perm_token = set_tool_permission_context(self.permission_service)
+        perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
         goal_token = set_goal_context(self.goal_runtime)
         await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
         try:
@@ -811,9 +977,19 @@ class AgentScheduler:
         user_input: str,
         *,
         streaming_ui: StreamingOutputUI | None = None,
+        run_input: Any = None,
     ) -> str:
-        """Handle streaming execution while preserving terminal scrollback."""
+        """Handle streaming execution while preserving terminal scrollback.
+
+        ``run_input`` is the actual model input (multimodal list or plain
+        string). When ``None`` we fall back to the ``user_input`` string so the
+        plain-text path is unchanged. ``user_input`` remains the string used for
+        display/bookkeeping regardless.
+        """
         import sys
+
+        if run_input is None:
+            run_input = user_input
 
         # Create the streaming display manager
         display_manager = StreamingDisplayManager(console)
@@ -856,7 +1032,7 @@ class AgentScheduler:
 
         result = Runner.run_streamed(
             self.dev_agent,
-            user_input,  # Just current input - session handles history
+            run_input,  # Just current input - session handles history
             session=self.session,  # Automatic history management
             run_config=RunConfig(),
             hooks=self.hooks,
@@ -1017,6 +1193,15 @@ class AgentScheduler:
 
         # Handle execution error after Live context has properly closed
         if execution_error is not None:
+            # A context-window overflow must propagate so the caller's single
+            # compact+retry guard can fire. Swallowing it into a returned error
+            # string here (as every non-overflow error is) made that retry DEAD
+            # CODE on the default streaming path — the guard only ever ran on the
+            # rarely-used non-streaming path. The Live context has already closed
+            # cleanly above, so re-raising here is safe; _run_once() propagates it
+            # and the except-block in _run_turn_unlocked compacts and re-runs once.
+            if _is_context_overflow_error(execution_error):
+                raise execution_error
             # Record for goal accounting: a terminal turn error blocks the goal
             # so automatic continuation cannot loop on the same failure.
             self._last_turn_errored = True
@@ -1232,6 +1417,10 @@ class AgentScheduler:
         if len(replayable_items) == len(items):
             return
 
+        # Snapshot the original items so we can restore them if the re-add fails:
+        # clear_session() + add_items() are two separate transactions with no
+        # rollback, so a failure between them would otherwise leave history empty.
+        original_snapshot = list(items)
         try:
             await self.session.clear_session()
             saved_threshold = getattr(self.session, "summarization_threshold", None)
@@ -1245,6 +1434,34 @@ class AgentScheduler:
             await self.refresh_context_usage_from_session(replayable_items)
         except Exception:
             logger.debug("Failed to repair unreplayable session items", exc_info=True)
+            await self._restore_session_items(original_snapshot)
+
+    async def _restore_session_items(self, snapshot: list) -> None:
+        """Best-effort re-add the pre-clear item snapshot after a failed rewrite.
+
+        ``clear_session`` + ``add_items`` are not a single transaction; if the
+        second half fails the conversation would be left empty. This puts the
+        original items back so history is never silently lost.
+        """
+        if not snapshot:
+            return
+        if not hasattr(self.session, "add_items"):
+            return
+        saved_threshold = getattr(self.session, "summarization_threshold", None)
+        try:
+            if hasattr(self.session, "summarization_threshold"):
+                self.session.summarization_threshold = 2**31
+            try:
+                await self.session.add_items(snapshot)
+            finally:
+                if hasattr(self.session, "summarization_threshold"):
+                    self.session.summarization_threshold = saved_threshold
+        except Exception:
+            logger.error(
+                "Failed to restore session items after a failed rewrite; "
+                "conversation history may be incomplete",
+                exc_info=True,
+            )
 
     @staticmethod
     def _usage_int(obj, *names: str) -> int:
@@ -1385,6 +1602,28 @@ class AgentScheduler:
                 pass
         return default
 
+    @staticmethod
+    def _active_todo_preserved_message() -> dict | None:
+        """Formatted active todo list as a replayable message, or None.
+
+        The plan lives in the process-global ``TodoStore`` singleton (not in
+        session history), so a compaction that rewrites the transcript would
+        otherwise leave the model without its plan. Pinning the formatted list
+        as a plain ``{"role", "content"}`` message keeps it replayable and
+        visible after compaction. Best effort: any failure yields None.
+        """
+        try:
+            from ..tools.todo import TodoStore, _format_todo_list
+
+            todos = list(TodoStore().todos or [])
+            if not todos:
+                return None
+            formatted = _format_todo_list(todos, title="Active Plan (pinned across compaction)")
+            return {"role": "user", "content": formatted}
+        except Exception:
+            logger.debug("Failed to build pinned todo message", exc_info=True)
+            return None
+
     async def _run_auto_compact(self) -> None:
         """Run LLM-based auto-compaction on the session history."""
         try:
@@ -1431,8 +1670,23 @@ class AgentScheduler:
                 if result.summary
                 else result.kept_messages
             )
-            if result.summary or compacted_items != original_dict_items:
+            # No-op detection MUST run against the pre-todo compacted items so
+            # pinning the todo list never turns a legitimate no-op into a false
+            # "did something" path (which would wrongly trip the circuit breaker
+            # logic in the no-op branch below).
+            did_compact = bool(result.summary) or compacted_items != original_dict_items
+            if did_compact:
                 # Replace with summary plus compact plain-text tail.
+
+                # Pin the active todo list verbatim into the compacted head so
+                # the plan survives compaction. Placed right after the summary
+                # so it reads as part of the preserved context, not the tail.
+                todo_message = self._active_todo_preserved_message()
+                if todo_message is not None:
+                    insert_at = 1 if result.summary else 0
+                    compacted_items = (
+                        compacted_items[:insert_at] + [todo_message] + compacted_items[insert_at:]
+                    )
 
                 # Replace session contents with compacted version.
                 # NOTE: the session no longer performs any summarization in
@@ -1440,15 +1694,38 @@ class AgentScheduler:
                 # summarization_threshold is a harmless no-op. It is retained
                 # only for backwards compatibility with any callers/tests that
                 # still reference the attribute.
+                #
+                # Snapshot the original items first: clear_session() + add_items()
+                # are two separate transactions with no rollback, so if the re-add
+                # fails we must put the original conversation back rather than
+                # leave history empty.
+                original_snapshot = list(items)
                 await self.session.clear_session()
                 saved_threshold = self.session.summarization_threshold
                 self.session.summarization_threshold = 2**31
                 try:
                     await self.session.add_items(compacted_items)
+                except Exception:
+                    logger.warning(
+                        "Auto-compact add_items failed; restoring original session items",
+                        exc_info=True,
+                    )
+                    self.session.summarization_threshold = saved_threshold
+                    await self._restore_session_items(original_snapshot)
+                    self._auto_compact.record_failure()
+                    return
                 finally:
                     self.session.summarization_threshold = saved_threshold
 
-                context_after = await self.refresh_context_usage_from_session(compacted_items)
+                # Restore recently-accessed files so edits/reads survive the
+                # compaction. Files are collected from the ORIGINAL items (which
+                # still carry the read_file tool calls) and appended as extra
+                # attachments. Failure here must not undo the successful compaction.
+                attachments = await self._append_post_compact_file_restoration(original_snapshot)
+
+                context_after = await self.refresh_context_usage_from_session(
+                    compacted_items + attachments
+                )
 
                 self._auto_compact.record_success()
                 self._dispatch_compact_hooks(
@@ -1468,12 +1745,45 @@ class AgentScheduler:
                     f"[dim]compacted, context size {context_before:,} -> {context_after:,}[/dim]"
                 )
             else:
-                self._auto_compact.record_failure()
-                logger.warning("Auto-compact produced no summary")
+                # Legitimate no-op: history is already minimal, so compaction
+                # produced no summary and the kept messages are identical to the
+                # original. This is NOT a failure and must not advance the
+                # circuit breaker (otherwise 3 no-ops would wedge auto-compact
+                # forever). Only genuine failures — the add_items rollback path
+                # above or the outer except — record_failure.
+                logger.debug("Auto-compact no-op: history already minimal")
         except Exception as e:
             if self._auto_compact:
                 self._auto_compact.record_failure()
             logger.warning("Auto-compact failed: %s", e)
+
+    async def _append_post_compact_file_restoration(self, original_items: list) -> list[dict]:
+        """Re-attach recently-read files so they survive compaction.
+
+        Collects read_file targets from ``original_items`` (the pre-compaction
+        history, which still carries the tool calls) and appends their current
+        contents to the session as restoration attachments. This is best-effort:
+        any failure is logged and swallowed so it can never undo a successful
+        compaction. Returns the attachments actually persisted (empty on any
+        failure or when there is nothing to restore).
+        """
+        try:
+            if not hasattr(self.session, "add_items"):
+                return []
+            dict_items = [item for item in original_items if isinstance(item, dict)]
+            if not dict_items:
+                return []
+            repair = PostCompactRepair()
+            file_paths = repair.collect_recently_accessed_files(dict_items)
+            if not file_paths:
+                return []
+            attachments = await repair.build_file_restoration_attachments(file_paths)
+            if attachments:
+                await self.session.add_items(attachments)
+            return attachments
+        except Exception:
+            logger.debug("Post-compact file restoration failed", exc_info=True)
+            return []
 
     @staticmethod
     def _dispatch_compact_hooks(event_name: str, payload: dict) -> None:

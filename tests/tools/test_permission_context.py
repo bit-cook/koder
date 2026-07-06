@@ -267,3 +267,103 @@ class TestGuardedToolsCoverage:
         assert "read_file" not in GUARDED_TOOLS
         assert "list_directory" not in GUARDED_TOOLS
         assert "glob_search" not in GUARDED_TOOLS
+
+
+class TestAlwaysAllowPersistence:
+    """The interactive approver's 'always' verdict must persist a generalized rule."""
+
+    @pytest.mark.asyncio
+    async def test_always_verdict_persists_prefix_rule_and_auto_approves(self, tmp_path):
+        import json as _json
+
+        from koder_agent.harness.permissions.persistence import PermissionStore
+        from koder_agent.harness.permissions.service import PermissionService
+
+        store = PermissionStore(tmp_path / "perms.json")
+        svc = PermissionService.default(store=store, workspace_root=str(tmp_path))
+
+        async def approver_always(_tool, _args, _decision):
+            return "always"
+
+        token = set_tool_permission_context(svc, approver=approver_always)
+        try:
+            first = await enforce_tool_permission("run_shell", _json.dumps({"command": "npm test"}))
+        finally:
+            reset_tool_permission_context(token)
+        assert first is None  # allowed
+
+        # A generalized rule was persisted to disk.
+        on_disk = _json.loads((tmp_path / "perms.json").read_text())
+        assert "npm test:*" in on_disk["rules"]["run_shell"]["allow"]
+
+        # A later, non-identical invocation is auto-approved WITHOUT consulting
+        # the approver (proves the persisted rule is doing the work).
+        consulted = []
+
+        async def approver_deny(_tool, args, _decision):
+            consulted.append(args)
+            return "deny"
+
+        token2 = set_tool_permission_context(svc, approver=approver_deny)
+        try:
+            second = await enforce_tool_permission(
+                "run_shell", _json.dumps({"command": "npm test --watch"})
+            )
+        finally:
+            reset_tool_permission_context(token2)
+        assert second is None
+        assert consulted == []  # rule matched before the approver was reached
+
+    @pytest.mark.asyncio
+    async def test_always_does_not_widen_destructive_command(self, tmp_path):
+        import json as _json
+
+        from koder_agent.harness.permissions.persistence import PermissionStore
+        from koder_agent.harness.permissions.service import PermissionService
+
+        store = PermissionStore(tmp_path / "perms.json")
+        svc = PermissionService.default(store=store, workspace_root=str(tmp_path))
+
+        async def approver_always(_tool, _args, _decision):
+            return "always"
+
+        token = set_tool_permission_context(svc, approver=approver_always)
+        try:
+            await enforce_tool_permission("run_shell", _json.dumps({"command": "rm -rf build"}))
+        finally:
+            reset_tool_permission_context(token)
+
+        on_disk = _json.loads((tmp_path / "perms.json").read_text())
+        allow = on_disk["rules"]["run_shell"]["allow"]
+        # Destructive command is remembered EXACTLY, never widened to rm:*.
+        assert "rm:*" not in allow
+        assert not any(r.startswith("rm ") and r.endswith(":*") for r in allow)
+
+    @pytest.mark.asyncio
+    async def test_bool_true_still_allows_once_without_persisting(self, tmp_path):
+        import json as _json
+
+        from koder_agent.harness.permissions.persistence import PermissionStore
+        from koder_agent.harness.permissions.service import PermissionService
+
+        store = PermissionStore(tmp_path / "perms.json")
+        svc = PermissionService.default(store=store, workspace_root=str(tmp_path))
+
+        async def approver_true(_tool, _args, _decision):
+            return True
+
+        token = set_tool_permission_context(svc, approver=approver_true)
+        try:
+            result = await enforce_tool_permission(
+                "run_shell", _json.dumps({"command": "npm test"})
+            )
+        finally:
+            reset_tool_permission_context(token)
+        assert result is None  # allowed once
+        # No rule persisted for a plain bool-True (allow-once) verdict.
+        on_disk = (
+            _json.loads((tmp_path / "perms.json").read_text())
+            if (tmp_path / "perms.json").exists()
+            else {"rules": {}}
+        )
+        assert not on_disk.get("rules", {}).get("run_shell", {}).get("allow")

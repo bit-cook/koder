@@ -3,6 +3,8 @@
 import errno
 import logging
 import os
+import stat
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -11,6 +13,7 @@ import whatthepatch
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
+from ..harness.checkpoint import record_pre_edit
 from .compat import function_tool
 from .file_state import ReadFileState
 
@@ -33,6 +36,21 @@ _RIGHT_DOUBLE_CURLY = "\u201d"  # "
 # which also lack the POSIX symlink semantics this guards against.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
+_SYMLINK_WRITE_MSG = "Refusing to write through a symlink"
+
+
+def _no_follow_target(path: str) -> Path:
+    """Return the write target with the parent resolved but the leaf kept literal.
+
+    Resolving only the parent lets ``O_NOFOLLOW`` guard the final component; a
+    full ``Path.resolve()`` would silently redirect a symlinked leaf to its
+    target — the bypass this closes. Never pass a fully ``resolve()``-d path here.
+    """
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    return raw.parent.resolve() / raw.name
+
 
 def _write_bytes_no_follow(path: str, data: bytes, *, append: bool) -> None:
     """Write ``data`` to ``path``'s leaf without following a leaf symlink.
@@ -42,11 +60,7 @@ def _write_bytes_no_follow(path: str, data: bytes, *, append: bool) -> None:
     raises ``OSError`` (``ELOOP``) instead of silently redirecting the write to
     the symlink's target — the case a full ``Path.resolve()`` would mask.
     """
-    raw = Path(path).expanduser()
-    if not raw.is_absolute():
-        raw = Path.cwd() / raw
-    # Resolve only the parent; keep the leaf literal so O_NOFOLLOW can guard it.
-    target = raw.parent.resolve() / raw.name
+    target = _no_follow_target(path)
     flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW
     flags |= os.O_APPEND if append else os.O_TRUNC
     fd = os.open(str(target), flags, 0o644)
@@ -54,6 +68,56 @@ def _write_bytes_no_follow(path: str, data: bytes, *, append: bool) -> None:
         os.write(fd, data)
     finally:
         os.close(fd)
+
+
+def _atomic_write_no_follow(path: str, data: bytes) -> None:
+    """Atomically replace ``path``'s leaf, refusing to write through a symlink.
+
+    Writes ``data`` to a temp file in the leaf's (resolved) parent directory then
+    ``os.replace()``s it over the target, so a crash mid-write cannot leave a
+    truncated/corrupt file. Before writing, the leaf is probed with
+    ``O_NOFOLLOW`` so a symlinked leaf raises ``ELOOP`` (same no-follow semantics
+    as ``_write_bytes_no_follow``) rather than having the link silently swapped
+    for a regular file by ``os.replace``.
+    """
+    target = _no_follow_target(path)
+    # Refuse a symlinked leaf: opening with O_NOFOLLOW raises ELOOP for a symlink.
+    # This keeps a single consistent error surface with the other write paths and
+    # prevents os.replace() from clobbering the link (rather than its target).
+    if _O_NOFOLLOW:
+        probe = os.open(str(target), os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW, 0o644)
+        os.close(probe)
+    # Preserve the existing file's permission bits: mkstemp creates the temp file
+    # 0600, so os.replace() would otherwise silently strip an executable/group
+    # bit (e.g. a 0755 script becomes 0600 after an edit). A brand-new file keeps
+    # the temp default (adjusted to the usual 0644 minus umask) so we don't leak
+    # 0600 for freshly created files either.
+    existing_mode: int | None = None
+    try:
+        existing_mode = stat.S_IMODE(os.lstat(str(target)).st_mode)
+    except OSError:
+        existing_mode = None
+    parent = target.parent
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(parent))
+    try:
+        with os.fdopen(tmp_fd, "wb") as fh:
+            fh.write(data)
+        if existing_mode is not None:
+            # Restore the original file's mode onto the replacement.
+            os.chmod(tmp_name, existing_mode)
+        else:
+            # New file: apply the process umask to the 0666 default so it lands
+            # at the conventional 0644 (not the private 0600 mkstemp uses).
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp_name, 0o666 & ~umask)
+        os.replace(tmp_name, str(target))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _normalize_quotes(s: str) -> str:
@@ -228,6 +292,25 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
         if error:
             return error
 
+        # Whole-file re-read caching/dedup: if the caller requests the entire
+        # file (no offset/limit) and we already have its full (non-partial)
+        # content in context and it has not changed on disk, avoid re-emitting
+        # the body to save context tokens. Partial/offset/limit reads are never
+        # short-circuited.
+        is_whole_file = offset is None and limit is None
+        if is_whole_file and _file_state.has_been_read(str(p)) and not _file_state.is_stale(str(p)):
+            prior_content = _file_state.get_full_content(str(p))
+            if prior_content is not None:
+                prior_line_count = prior_content.count("\n") + (
+                    0 if prior_content.endswith("\n") or prior_content == "" else 1
+                )
+                # Refresh mtime/size/hash so subsequent staleness checks stay accurate.
+                _file_state.record_read(str(p), content=prior_content, is_partial=False)
+                return (
+                    f"File unchanged since last read ({prior_line_count} lines); "
+                    "prior content still in context"
+                )
+
         # Read file content with line numbers
         with open(p, encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
@@ -251,11 +334,6 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
 
         content = "\n".join(numbered_lines)
 
-        # Track the read for staleness detection
-        is_partial = offset is not None or limit is not None
-        full_content = "".join(lines) if not is_partial else None
-        _file_state.record_read(str(p), content=full_content, is_partial=is_partial)
-
         if p.suffix.lower() == ".md":
             try:
                 from koder_agent.harness.magic_docs import register_magic_doc
@@ -264,10 +342,20 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
             except Exception:
                 logger.debug("Failed to register magic doc", exc_info=True)
 
-        # Apply token truncation if needed
-        content = truncate_text_by_tokens(content)
+        # Apply token truncation if needed. If the display content is actually
+        # truncated, the model never saw the whole file even for a full read, so
+        # the recorded read MUST be marked partial — otherwise edit_file's
+        # is_partial_view guard would wrongly allow a diff/string edit against a
+        # file the model only partially saw.
+        display_content = truncate_text_by_tokens(content)
+        was_truncated = display_content != content
 
-        return content
+        # Track the read for staleness detection
+        is_partial = offset is not None or limit is not None or was_truncated
+        full_content = "".join(lines) if not is_partial else None
+        _file_state.record_read(str(p), content=full_content, is_partial=is_partial)
+
+        return display_content
     except PermissionError as e:
         return str(e)
     except Exception as e:
@@ -366,8 +454,11 @@ def write_file(path: str, content: str) -> str:
             except Exception:
                 old_content = ""
 
-        # Write the new content (refusing to follow a leaf symlink)
-        _write_bytes_no_follow(path, content.encode("utf-8"), append=False)
+        # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
+        record_pre_edit(str(p))
+
+        # Write the new content atomically, refusing to follow a leaf symlink.
+        _atomic_write_no_follow(path, content.encode("utf-8"))
         _file_state.record_read(str(p), content=content)
 
         # Generate diff for display
@@ -381,7 +472,7 @@ def write_file(path: str, content: str) -> str:
 
     except OSError as e:
         if e.errno == errno.ELOOP:
-            return f"Refusing to write through a symlink: {path}"
+            return f"{_SYMLINK_WRITE_MSG}: {path}"
         return str(e)
     except Exception as e:
         return f"Error writing file: {str(e)}"
@@ -418,6 +509,9 @@ def append_file(path: str, content: str) -> str:
                 old_content = p.read_text(encoding="utf-8")
             except Exception:
                 old_content = ""
+
+        # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
+        record_pre_edit(str(p))
 
         # Append the content (refusing to follow a leaf symlink)
         _write_bytes_no_follow(path, content.encode("utf-8"), append=True)
@@ -458,12 +552,28 @@ def edit_file_by_replacement(
     if old_string == new_string:
         return "No changes to make: old_string and new_string are the same."
 
-    # Empty old_string = file creation
+    # Empty old_string = file creation. A file that exists on disk with ANY
+    # bytes (including whitespace-only) counts as existing content, so we never
+    # silently clobber it. This is a create, not an edit, so refusing to
+    # overwrite is the correct answer regardless of read state (the earlier
+    # ".strip()" check let whitespace-only files be silently clobbered).
     if old_string == "":
-        if p.exists() and p.read_text(encoding="utf-8").strip():
-            return "Cannot create new file — file already exists with content."
+        if p.exists():
+            try:
+                existing = p.read_text(encoding="utf-8")
+            except Exception:
+                existing = ""
+            if existing != "":
+                return "Cannot create new file — file already exists with content."
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(new_string, encoding="utf-8")
+        # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
+        record_pre_edit(str(p))
+        try:
+            _atomic_write_no_follow(path, new_string.encode("utf-8"))
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return f"{_SYMLINK_WRITE_MSG}: {path}"
+            return str(e)
         _file_state.record_read(str(p), content=new_string)
         return f"Created {path} ({len(new_string)} bytes)"
 
@@ -474,6 +584,8 @@ def edit_file_by_replacement(
     # Enforce read-before-edit, matching write_file and the diff-mode path
     if not _file_state.has_been_read(str(p)):
         return "File has not been read yet. Read it first before editing it."
+    if _file_state.is_partial_view(str(p)):
+        return "File was only partially read. Read the full file before editing."
     if _file_state.is_stale(str(p)):
         return (
             "File has been modified since it was last read. "
@@ -510,7 +622,15 @@ def edit_file_by_replacement(
     if new_content == content:
         return "No changes were applied."
 
-    p.write_text(new_content, encoding="utf-8")
+    # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
+    record_pre_edit(str(p))
+
+    try:
+        _atomic_write_no_follow(path, new_content.encode("utf-8"))
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"{_SYMLINK_WRITE_MSG}: {path}"
+        return str(e)
     _file_state.record_read(str(p), content=new_content)
 
     diff_output = _generate_diff_output(content, new_content, p.name)
@@ -576,10 +696,14 @@ def edit_file(
             new_content, error = apply_diff(content, diff)
             if error:
                 return f"Failed to apply diff: {error}"
-            p.write_text(new_content, encoding="utf-8")
+            # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
+            record_pre_edit(str(p))
+            _atomic_write_no_follow(path, new_content.encode("utf-8"))
             _file_state.record_read(str(p), content=new_content)
             return f"Successfully applied diff to {path}\n---DIFF---\n{diff}"
-        except PermissionError as e:
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                return f"{_SYMLINK_WRITE_MSG}: {path}"
             return str(e)
         except Exception as e:
             return f"Error editing file: {str(e)}"

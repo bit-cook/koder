@@ -173,6 +173,170 @@ class TestHomePathPrefixStripping:
         assert result.has_sensitive_path_write
 
 
+class TestRmDangerousRootDeletion:
+    """Regression tests for bash-security-rm-home-wildcard-gap.
+
+    The old single regex only matched `rm` with a combined -rf/-fr short flag
+    followed by a bare `/`. It let through home/wildcard/system-dir deletions,
+    separate -r -f flags, long flags, and cwd deletions after `cd /`. The
+    tokenized analyzer must block all of these while leaving legitimate
+    recursive deletes of project subdirectories untouched.
+    """
+
+    # --- Dangerous forms enumerated in the finding (must all block) ---
+
+    def test_blocks_rm_rf_root_wildcard(self):
+        result = analyze_command("rm -rf /*")
+        assert result.blocked
+        assert result.reason
+
+    def test_blocks_rm_rf_tilde(self):
+        result = analyze_command("rm -rf ~")
+        assert result.blocked
+
+    def test_blocks_rm_rf_tilde_slash(self):
+        result = analyze_command("rm -rf ~/")
+        assert result.blocked
+
+    def test_blocks_rm_rf_home_env(self):
+        result = analyze_command("rm -rf $HOME")
+        assert result.blocked
+
+    def test_blocks_rm_rf_home_env_braced(self):
+        result = analyze_command("rm -rf ${HOME}")
+        assert result.blocked
+
+    def test_blocks_rm_long_flags_root(self):
+        result = analyze_command("rm --recursive --force /")
+        assert result.blocked
+
+    def test_blocks_rm_separate_short_flags_root(self):
+        result = analyze_command("rm -r -f /")
+        assert result.blocked
+
+    def test_blocks_cd_root_then_rm_rf_dot(self):
+        result = analyze_command("cd / && rm -rf .")
+        assert result.blocked
+
+    def test_blocks_rm_rf_root_bare(self):
+        result = analyze_command("rm -rf /")
+        assert result.blocked
+
+    # --- Additional dangerous variants ---
+
+    def test_blocks_rm_fr_root(self):
+        result = analyze_command("rm -fr /")
+        assert result.blocked
+
+    def test_blocks_rm_capital_r_root(self):
+        result = analyze_command("rm -Rf /")
+        assert result.blocked
+
+    def test_blocks_sudo_rm_rf_root(self):
+        result = analyze_command("sudo rm -rf /")
+        assert result.blocked
+
+    def test_blocks_rm_no_preserve_root(self):
+        result = analyze_command("sudo rm -rf --no-preserve-root /")
+        assert result.blocked
+
+    def test_blocks_rm_recursive_only_root(self):
+        # No -f at all: recursive delete of / is still catastrophic.
+        result = analyze_command("rm -r /")
+        assert result.blocked
+
+    def test_blocks_rm_rf_system_dir(self):
+        result = analyze_command("rm -rf /usr")
+        assert result.blocked
+
+    def test_blocks_rm_rf_system_dir_trailing_slash(self):
+        result = analyze_command("rm -rf /etc/")
+        assert result.blocked
+
+    def test_blocks_rm_rf_home_wildcard(self):
+        result = analyze_command("rm -rf ~/*")
+        assert result.blocked
+
+    def test_blocks_rm_rf_home_env_slash(self):
+        result = analyze_command("rm -rf $HOME/")
+        assert result.blocked
+
+    def test_blocks_rm_rf_home_toplevel_dir(self):
+        result = analyze_command("rm -rf /home")
+        assert result.blocked
+
+    def test_blocks_cd_home_then_rm_rf_star(self):
+        result = analyze_command("cd $HOME && rm -rf *")
+        assert result.blocked
+
+    def test_blocks_rm_with_leading_env_assignment(self):
+        result = analyze_command("FOO=bar rm -rf /")
+        assert result.blocked
+
+    def test_blocks_absolute_bin_rm_root(self):
+        result = analyze_command("/bin/rm -rf /")
+        assert result.blocked
+
+    # --- Legitimate forms enumerated in the finding (must all be allowed) ---
+
+    def test_allows_rm_rf_build_dir(self):
+        result = analyze_command("rm -rf ./build")
+        assert not result.blocked
+
+    def test_allows_rm_rf_node_modules(self):
+        result = analyze_command("rm -rf node_modules")
+        assert not result.blocked
+
+    def test_allows_rm_single_file(self):
+        result = analyze_command("rm file.txt")
+        assert not result.blocked
+
+    # --- Additional legitimate variants ---
+
+    def test_allows_rm_rf_dot_without_cd(self):
+        # Bare `rm -rf .` in a normal project dir is a common operation.
+        result = analyze_command("rm -rf .")
+        assert not result.blocked
+
+    def test_allows_rm_rf_star_without_cd(self):
+        result = analyze_command("rm -rf *")
+        assert not result.blocked
+
+    def test_allows_rm_rf_project_subdir(self):
+        result = analyze_command("rm -rf src/generated")
+        assert not result.blocked
+
+    def test_allows_rm_rf_home_subdir(self):
+        result = analyze_command("rm -rf ~/project/build")
+        assert not result.blocked
+
+    def test_allows_rm_rf_home_env_subdir(self):
+        result = analyze_command("rm -rf $HOME/project")
+        assert not result.blocked
+
+    def test_allows_rm_rf_dot_after_safe_cd(self):
+        # cd into a non-dangerous dir first, then rm -rf . is fine.
+        result = analyze_command("cd /tmp/work && rm -rf .")
+        assert not result.blocked
+
+    def test_allows_rm_r_named_dir(self):
+        result = analyze_command("rm -r mydir")
+        assert not result.blocked
+
+    def test_allows_rm_rf_build_glob(self):
+        result = analyze_command("rm -rf ./build/*")
+        assert not result.blocked
+
+    def test_allows_rmdir_empty(self):
+        result = analyze_command("rmdir emptydir")
+        assert not result.blocked
+
+    def test_allows_ls_root(self):
+        # `ls` at / is not a deletion.
+        result = analyze_command("ls -la /")
+        assert not result.blocked
+
+
 class TestSystemCommandCommandPosition:
     """The dangerous-system-command regex must only match at command position,
     not when the word appears as a quoted argument/string."""
@@ -208,3 +372,30 @@ class TestSystemCommandCommandPosition:
     def test_allows_init_word_in_string(self):
         result = analyze_command('echo "init 0 complete"')
         assert not result.blocked
+
+
+class TestRmRootEquivalentNormalization:
+    """rm -rf on paths that collapse to '/' must be blocked (acceptance gap)."""
+
+    def test_double_slash_root_blocked(self):
+        assert analyze_command("rm -rf //").blocked
+
+    def test_dot_root_blocked(self):
+        # GNU coreutils treats '/.' as root and it bypasses --preserve-root.
+        assert analyze_command("rm -rf /.").blocked
+
+    def test_dotdot_root_blocked(self):
+        assert analyze_command("rm -rf /..").blocked
+
+    def test_nested_dotdot_root_blocked(self):
+        assert analyze_command("rm -rf /../..").blocked
+
+    def test_trailing_dot_slash_root_blocked(self):
+        assert analyze_command("rm -rf /./").blocked
+
+    def test_legit_relative_dotdot_not_blocked(self):
+        # Resolves to /tmp, not root — must stay allowed.
+        assert not analyze_command("rm -rf /tmp/foo/..").blocked
+
+    def test_legit_build_dir_not_blocked(self):
+        assert not analyze_command("rm -rf ./build").blocked

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ import aiosqlite
 
 from ..config import MCPLocalProjectConfigYaml, MCPServerConfigYaml, get_config_manager
 from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
+
+logger = logging.getLogger(__name__)
 
 # File-based locking: use fcntl on Unix, fall back to no-op on Windows/other platforms.
 try:
@@ -356,9 +359,38 @@ class MCPServerManager:
         return payload
 
     def _effective_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
-        merged = self._load_user_servers()
-        merged.update(self._load_project_servers(cwd))
-        merged.update(self._load_local_servers(cwd))
+        user = self._load_user_servers()
+        project = self._load_project_servers(cwd)
+        local = self._load_local_servers(cwd)
+
+        merged = dict(user)
+
+        # Project (.mcp.json, lower trust) must NOT silently override a
+        # user/global server of the same name — that would let a checked-in repo
+        # file shadow the user's own trusted config. Keep the user entry and log
+        # a visible warning on collision.
+        for name, config in project.items():
+            if name in user:
+                logger.warning(
+                    "MCP name collision: project server '%s' (from %s) is ignored "
+                    "because a higher-trust user-scoped server with the same name exists.",
+                    name,
+                    config.source_path,
+                )
+                continue
+            merged[name] = config
+
+        # Local scope lives in the user's own config.yaml (mcp_local_projects),
+        # so it is trusted and may intentionally override user/project entries.
+        for name, config in local.items():
+            if name in project and name not in user:
+                logger.debug(
+                    "MCP name collision: local server '%s' overrides the "
+                    "project server of the same name.",
+                    name,
+                )
+            merged[name] = config
+
         return merged
 
     async def add_server(

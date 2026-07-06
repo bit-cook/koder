@@ -24,6 +24,7 @@ from rich.console import Console
 from ..auth.tool_utils import clean_json_schema
 from ..config import get_config
 from ..harness.agents.definitions import get_agent_definitions
+from ..harness.output_styles import load_active_output_style_body
 from ..harness.reasoning_display import normalize_reasoning_display_mode
 from ..mcp import MCPServerFactory, load_mcp_servers
 from ..tools.skill import build_skills_metadata_prompt, discover_merged_skills
@@ -644,6 +645,17 @@ async def create_dev_agent(
     )
     if brief_enabled:
         system_prompt = f"{system_prompt.rstrip()}\n\n{_BRIEF_MODE_INSTRUCTION}"
+
+    # Inject the active output-style persona body into the system prompt.
+    # Only for the main agent — subagents that pass a full instructions_override
+    # already carry their own persona/instructions.
+    if instructions_override is None:
+        try:
+            persona_body = load_active_output_style_body(Path.cwd())
+        except Exception:
+            persona_body = None
+        if persona_body:
+            system_prompt = f"{system_prompt.rstrip()}\n\n{persona_body.strip()}"
 
     dev_agent = Agent(
         name=name,

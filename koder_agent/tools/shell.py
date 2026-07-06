@@ -4,19 +4,29 @@ Supports both bash (Unix/Linux/macOS) and PowerShell (Windows).
 """
 
 import asyncio
+import contextlib
+import inspect
 import os
 import platform
 import re
 import shlex
+import signal
 import time
 import uuid
 from collections import deque
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional, Union
 
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
 from .compat import function_tool
+
+# Signature of the callback threaded into the harness shell executor to decide,
+# at runtime, whether a command may fall back to UNSANDBOXED execution when the
+# sandbox backend is unavailable/unsupported. Given a one-line reason, it must
+# return True to approve the (warned) unsandboxed run or False to keep the
+# fail-closed error. May be sync or async.
+SandboxUnavailableApproval = Callable[[str], Union[bool, Awaitable[bool]]]
 
 # Detect OS once at module load
 IS_WINDOWS = platform.system() == "Windows"
@@ -40,6 +50,69 @@ def _bg_shell_max_lines() -> int:
     if value <= 0:
         return DEFAULT_BG_SHELL_MAX_LINES
     return value
+
+
+def _new_session_kwargs() -> dict:
+    """Subprocess kwargs that place the child in its own process group/session.
+
+    On POSIX this makes the spawned shell wrapper a session/group leader, so we
+    can signal the whole group (wrapper + grandchildren) on timeout instead of
+    orphaning grandchildren. No-op on Windows.
+    """
+    if IS_WINDOWS:
+        return {}
+    return {"start_new_session": True}
+
+
+def _signal_process_group(process: "asyncio.subprocess.Process", sig: int) -> None:
+    """Send ``sig`` to the child's whole process group (POSIX), guarded.
+
+    Only signals the group when the child is a group leader distinct from our
+    own process group — i.e. it was spawned with ``start_new_session=True``.
+    This is a hard safety check: if the child shares our group (e.g. it was not
+    started in a new session), ``killpg`` would signal this very process, so we
+    fall back to signalling just the child. Also falls back if the group can't
+    be resolved/signalled or on Windows. Never raises.
+    """
+    pid = process.pid
+    if not IS_WINDOWS and pid is not None:
+        try:
+            child_pgid = os.getpgid(pid)
+            # Refuse to signal our own group — that would kill this process too.
+            if child_pgid != os.getpgid(0):
+                os.killpg(child_pgid, sig)
+                return
+        except (ProcessLookupError, PermissionError, OSError):
+            # Group already gone or not signalable; fall through to plain signal.
+            pass
+    with contextlib.suppress(ProcessLookupError, OSError):
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
+
+
+def _kill_process_group(process: "asyncio.subprocess.Process") -> None:
+    """SIGKILL the child and its whole process group (POSIX), guarded."""
+    _signal_process_group(process, signal.SIGKILL)
+
+
+async def _drain_after_kill(
+    process: "asyncio.subprocess.Process", timeout: float = 1.0
+) -> tuple[str, str]:
+    """Drain buffered output after a kill without blocking forever.
+
+    ``communicate()`` on a killed process can still hang (e.g. an inherited pipe
+    held open by a surviving grandchild), so wrap it in a timeout. Returns
+    decoded ``(stdout, stderr)`` or empty strings if nothing could be read.
+    """
+    try:
+        out, err = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
+        return "", ""
+    stdout = out.decode("utf-8", errors="replace").strip() if out else ""
+    stderr = err.decode("utf-8", errors="replace").strip() if err else ""
+    return stdout, stderr
 
 
 class ShellModel(BaseModel):
@@ -132,13 +205,18 @@ class BackgroundShell:
             self.status = "running"
 
     async def terminate(self):
-        """Terminate the background process."""
+        """Terminate the background process (and its process group on POSIX)."""
         if self.process.returncode is None:
-            self.process.terminate()
+            # SIGTERM the whole group (not just the wrapper) so grandchildren
+            # spawned via '&' are asked to exit too.
+            _signal_process_group(self.process, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self.process.kill()
+                # Escalate to SIGKILL of the whole group so nothing is orphaned.
+                _kill_process_group(self.process)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.process.wait(), timeout=5)
         self.status = "terminated"
         self.exit_code = self.process.returncode
 
@@ -257,6 +335,34 @@ class BackgroundShellManager:
         return shell
 
 
+def build_sandbox_unavailable_approval(
+    approver: Optional[Callable[[str], Union[bool, Awaitable[bool]]]] = None,
+) -> SandboxUnavailableApproval:
+    """Build a sandbox-degradation approval callback for the shell executor.
+
+    This lives in the tool/permission layer (which owns the interactive approval
+    context) and is threaded into ``execute_shell_command`` so that, when the
+    sandbox backend is unavailable/unsupported, a command may still run
+    UNSANDBOXED — but only behind an explicit yes from ``approver`` and always
+    with a visible warning surfaced by the executor.
+
+    ``approver`` receives the one-line degradation reason and returns True to
+    approve or False to keep the fail-closed error. It may be sync or async. If
+    ``approver`` is omitted the default is fail-closed (deny), matching the safe
+    behaviour of ``execute_shell_command`` when no callback is supplied.
+    """
+
+    async def _approval(reason: str) -> bool:
+        if approver is None:
+            return False
+        result = approver(reason)
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+
+    return _approval
+
+
 @function_tool
 async def run_shell(command: str, timeout: int = 120, run_in_background: bool = False) -> str:
     """Execute a shell command with security checks.
@@ -307,7 +413,8 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
             # Background execution
             shell_id = str(uuid.uuid4())[:8]
 
-            # Start background process with combined stdout/stderr
+            # Start background process with combined stdout/stderr. Place it in
+            # its own process group so shell_kill can signal the whole tree.
             if IS_WINDOWS:
                 process = await asyncio.create_subprocess_exec(
                     "powershell.exe",
@@ -316,12 +423,14 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    **_new_session_kwargs(),
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    **_new_session_kwargs(),
                 )
 
             # Create background shell and add to manager
@@ -344,7 +453,9 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
             )
 
         else:
-            # Foreground execution
+            # Foreground execution. Place the child in its own process group so
+            # a timeout can kill the whole tree (wrapper + grandchildren) instead
+            # of orphaning grandchildren by only killing the sh wrapper.
             if IS_WINDOWS:
                 process = await asyncio.create_subprocess_exec(
                     "powershell.exe",
@@ -353,27 +464,23 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **_new_session_kwargs(),
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **_new_session_kwargs(),
                 )
 
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
-                process.kill()
-                # Attempt to read any partial output already buffered
-                partial_stdout = ""
-                partial_stderr = ""
-                try:
-                    out, err = await asyncio.wait_for(process.communicate(), timeout=1)
-                    partial_stdout = out.decode("utf-8", errors="replace").strip() if out else ""
-                    partial_stderr = err.decode("utf-8", errors="replace").strip() if err else ""
-                except Exception:
-                    pass
+                # Kill the entire process group, then drain any buffered output
+                # under a hard timeout so a surviving pipe holder can't block us.
+                _kill_process_group(process)
+                partial_stdout, partial_stderr = await _drain_after_kill(process, timeout=1)
                 if partial_stdout or partial_stderr:
                     msg = f"Command timed out after {timeout} seconds. Partial output:\n{partial_stdout}"
                     if partial_stderr:
@@ -498,7 +605,8 @@ async def git_command(command: str, timeout: int = 60) -> str:
         if error:
             return error
 
-        # Execute git command (always foreground)
+        # Execute git command (always foreground). Own process group so a
+        # timeout kills the whole tree, not just the sh wrapper.
         if IS_WINDOWS:
             process = await asyncio.create_subprocess_exec(
                 "powershell.exe",
@@ -507,18 +615,21 @@ async def git_command(command: str, timeout: int = 60) -> str:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **_new_session_kwargs(),
             )
         else:
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **_new_session_kwargs(),
             )
 
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            process.kill()
+            _kill_process_group(process)
+            await _drain_after_kill(process, timeout=1)
             return f"Git command timed out after {timeout} seconds"
 
         # Decode output

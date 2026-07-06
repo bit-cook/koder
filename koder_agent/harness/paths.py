@@ -21,6 +21,14 @@ def project_agents_dir(cwd: str | Path) -> Path:
     return harness_project_dir(cwd) / "agents"
 
 
+def user_commands_dir() -> Path:
+    return harness_home_dir() / "commands"
+
+
+def project_commands_dir(cwd: str | Path) -> Path:
+    return harness_project_dir(cwd) / "commands"
+
+
 def settings_path(cwd: str | Path) -> Path:
     return harness_project_dir(cwd) / "settings.json"
 

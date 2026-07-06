@@ -161,9 +161,20 @@ class TestTokenExpiry:
         }
         assert MCPOAuthFlow._is_expired(tokens) is True
 
-    def test_no_expiry_info_not_expired(self):
+    def test_no_expiry_info_treated_as_expired(self):
+        # A token that carries no usable expiry metadata must not be assumed
+        # valid forever; it is treated as expired so the caller re-validates
+        # (refresh when possible, else a fresh flow).
         tokens = {"access_token": "x"}
-        assert MCPOAuthFlow._is_expired(tokens) is False
+        assert MCPOAuthFlow._is_expired(tokens) is True
+
+    def test_missing_obtained_at_treated_as_expired(self):
+        tokens = {"access_token": "x", "expires_in": 3600}
+        assert MCPOAuthFlow._is_expired(tokens) is True
+
+    def test_missing_expires_in_treated_as_expired(self):
+        tokens = {"access_token": "x", "obtained_at": time.time()}
+        assert MCPOAuthFlow._is_expired(tokens) is True
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +218,155 @@ class TestAuthenticateCachedTokens:
             headers = asyncio.run(flow.authenticate())
             mock_refresh.assert_awaited_once()
             assert headers == {"Authorization": "Bearer refreshed-token"}
+
+    def test_cached_token_without_expiry_refreshes_when_possible(self, tmp_path, monkeypatch):
+        # A cached token that lacks expiry metadata but has a refresh_token
+        # must be refreshed rather than assumed valid forever.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        save_tokens(
+            "no-expiry-refresh",
+            {
+                "access_token": "stale-token",
+                "refresh_token": "ref-tok",
+                "client_id": "cid",
+            },
+        )
+        config = MCPOAuthConfig(client_id="cid")
+        flow = MCPOAuthFlow("no-expiry-refresh", "https://example.com/mcp", config)
+
+        with patch.object(flow, "refresh_token", new_callable=AsyncMock) as mock_refresh:
+            mock_refresh.return_value = {"Authorization": "Bearer fresh-token"}
+            headers = asyncio.run(flow.authenticate())
+            mock_refresh.assert_awaited_once()
+            assert headers == {"Authorization": "Bearer fresh-token"}
+
+    def test_cached_token_without_expiry_no_refresh_starts_new_flow(self, tmp_path, monkeypatch):
+        # No expiry AND no refresh_token: the stale token must NOT be returned;
+        # instead the full flow is (attempted to be) started.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        save_tokens(
+            "no-expiry-noref",
+            {"access_token": "stale-token", "client_id": "cid"},
+        )
+        config = MCPOAuthConfig(client_id="cid")
+        flow = MCPOAuthFlow("no-expiry-noref", "https://example.com/mcp", config)
+
+        with patch.object(flow, "_discover_metadata", new_callable=AsyncMock) as mock_discover:
+            mock_discover.side_effect = RuntimeError("new flow started")
+            # The stale token must not be returned; a new flow is attempted.
+            try:
+                asyncio.run(flow.authenticate())
+            except RuntimeError as exc:
+                assert "new flow started" in str(exc)
+            else:  # pragma: no cover - defensive
+                raise AssertionError("stale token should not have been returned")
+            mock_discover.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _OAuthCallbackHandler — CSRF/state validation & per-flow isolation
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackStateValidation:
+    @staticmethod
+    def _bind(server, state, path="/callback"):
+        server.oauth_expected_state = state
+        server.oauth_callback_path = path
+
+    @staticmethod
+    def _get(port, path):
+        import urllib.request
+
+        with urllib.request.urlopen(  # noqa: S310 - loopback only
+            f"http://127.0.0.1:{port}{path}"
+        ) as resp:
+            return resp.status, resp.read()
+
+    def test_correct_state_accepted(self):
+        server, port = _start_callback_server(None)
+        self._bind(server, "good-state")
+        try:
+            status, _ = self._get(port, "/callback?code=the-code&state=good-state")
+            assert status == 200
+            assert server.oauth_result.auth_code == "the-code"
+            assert server.oauth_result.error is None
+        finally:
+            server.shutdown()
+
+    def test_wrong_state_rejected(self):
+        server, port = _start_callback_server(None)
+        self._bind(server, "expected-state")
+        try:
+            import urllib.error
+
+            try:
+                self._get(port, "/callback?code=evil-code&state=attacker-state")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            else:  # pragma: no cover - defensive
+                raise AssertionError("wrong state should be rejected with HTTP 400")
+            # The forged code must NOT be captured.
+            assert server.oauth_result.auth_code is None
+            assert server.oauth_result.error == "state_mismatch"
+        finally:
+            server.shutdown()
+
+    def test_missing_state_rejected(self):
+        server, port = _start_callback_server(None)
+        self._bind(server, "expected-state")
+        try:
+            import urllib.error
+
+            try:
+                self._get(port, "/callback?code=evil-code")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            else:  # pragma: no cover - defensive
+                raise AssertionError("missing state should be rejected with HTTP 400")
+            assert server.oauth_result.auth_code is None
+            assert server.oauth_result.error == "state_mismatch"
+        finally:
+            server.shutdown()
+
+    def test_concurrent_flows_are_isolated(self):
+        # Two live servers (two flows) must not share the code/state that the
+        # other captured — previously stored as handler CLASS attributes.
+        server_a, port_a = _start_callback_server(None)
+        server_b, port_b = _start_callback_server(None)
+        self._bind(server_a, "state-a")
+        self._bind(server_b, "state-b")
+        try:
+            self._get(port_a, "/callback?code=code-a&state=state-a")
+            self._get(port_b, "/callback?code=code-b&state=state-b")
+            assert server_a.oauth_result.auth_code == "code-a"
+            assert server_b.oauth_result.auth_code == "code-b"
+            assert server_a.oauth_result is not server_b.oauth_result
+        finally:
+            server_a.shutdown()
+            server_b.shutdown()
+
+    def test_wait_for_code_reads_per_flow_result(self):
+        server, _port = _start_callback_server(None)
+        server.oauth_result.auth_code = "captured"
+        try:
+            code = asyncio.run(MCPOAuthFlow._wait_for_code(server, timeout=1))
+            assert code == "captured"
+        finally:
+            server.shutdown()
+
+    def test_wait_for_code_raises_on_state_mismatch_error(self):
+        server, _port = _start_callback_server(None)
+        server.oauth_result.error = "state_mismatch"
+        try:
+            try:
+                asyncio.run(MCPOAuthFlow._wait_for_code(server, timeout=1))
+            except RuntimeError as exc:
+                assert "state_mismatch" in str(exc)
+            else:  # pragma: no cover - defensive
+                raise AssertionError("expected RuntimeError on state mismatch")
+        finally:
+            server.shutdown()
 
 
 # ---------------------------------------------------------------------------

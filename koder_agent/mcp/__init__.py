@@ -10,6 +10,7 @@ try:  # pragma: no cover - depends on optional SDK extras at import time
 except ImportError:  # pragma: no cover
     MCPServer = Any
 
+from .project_approvals import is_project_connect_allowed
 from .prompts import (
     MCPPrompt,
     MCPPromptRegistry,
@@ -17,8 +18,8 @@ from .prompts import (
     get_prompt_registry,
     normalize_mcp_name,
 )
-from .reconnection import ReconnectionConfig
-from .server_config import MCPServerConfig, MCPServerType
+from .reconnection import ReconnectionConfig, ReconnectionManager
+from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
 from .server_manager import MCPServerManager
 
 try:  # pragma: no cover - optional transport dependencies may be absent
@@ -29,6 +30,33 @@ except ImportError:  # pragma: no cover
 # Dedicated stderr console so MCP-connection warnings reach the user even when
 # the root logger is pinned high elsewhere.
 _console = Console(stderr=True)
+
+# Reconnection managers for servers connected in the most recent
+# load_mcp_servers() call, keyed by server name. Retained (rather than
+# discarded) so a caller/scheduler can trigger runtime reconnects via
+# reconnect_unhealthy_servers().
+_reconnection_managers: "dict[str, ReconnectionManager]" = {}
+
+
+def get_reconnection_managers() -> "dict[str, ReconnectionManager]":
+    """Return the reconnection managers from the last load_mcp_servers() call."""
+    return _reconnection_managers
+
+
+async def reconnect_unhealthy_servers() -> "dict[str, bool]":
+    """Reconnect any retained MCP servers whose connection looks unhealthy.
+
+    Returns a mapping of server name -> healthy(after) for every managed server.
+    This is the runtime reconnect entry point; wiring it into the scheduler's
+    lifecycle is a cross-file concern handled outside this package.
+    """
+    results: dict[str, bool] = {}
+    for name, mgr in _reconnection_managers.items():
+        try:
+            results[name] = await mgr.reconnect_if_needed()
+        except Exception:  # pragma: no cover - defensive
+            results[name] = False
+    return results
 
 
 def _load_plugin_mcp_configs() -> List[MCPServerConfig]:
@@ -175,17 +203,41 @@ async def load_mcp_servers() -> List[MCPServer]:
         reconnection_config = ReconnectionConfig(max_attempts=3, initial_delay=1.0, max_delay=10.0)
         servers: List[MCPServer] = []
         connected: list[tuple[MCPServerConfig, MCPServer]] = []
+        project_root = os.getcwd()
+        _reconnection_managers.clear()
         for config in configs:
             try:
+                # SECURITY GATE: PROJECT-scoped servers come from an in-repo
+                # .mcp.json and can run arbitrary commands / auth helpers. Only
+                # connect them when the project is explicitly approved. Undecided
+                # or rejected => skip (safe headless default). User/local scopes
+                # (the user's own config) are unaffected.
+                is_project = config.scope == MCPServerScope.PROJECT
+                if is_project and not is_project_connect_allowed(project_root):
+                    _logger.warning(
+                        "Skipping unapproved project MCP server '%s' (%s). "
+                        "Approve it for this project to enable it.",
+                        config.name,
+                        config.source_path,
+                    )
+                    continue
+
                 cb = channel_callback if config.name in channel_server_names else None
                 _logger.debug(
                     "Creating server '%s': channel_callback=%s",
                     config.name,
                     cb is not None,
                 )
-                # Use create_and_connect_with_retry for resilient connection
-                server, _reconnection_mgr = await MCPServerFactory.create_and_connect_with_retry(
-                    config, channel_callback=cb, reconnection_config=reconnection_config
+                # A project server only reaches here when the gate above passed,
+                # so every server at this point is trusted. The trusted flag also
+                # gates the headersHelper inside the factory. Use
+                # create_and_connect_with_retry for resilient connection and
+                # retain the reconnection manager for runtime reconnects.
+                server, reconnection_mgr = await MCPServerFactory.create_and_connect_with_retry(
+                    config,
+                    channel_callback=cb,
+                    reconnection_config=reconnection_config,
+                    trusted=True,
                 )
                 _logger.debug(
                     "Server '%s' class: %s",
@@ -194,6 +246,7 @@ async def load_mcp_servers() -> List[MCPServer]:
                 )
                 servers.append(server)
                 connected.append((config, server))
+                _reconnection_managers[config.name] = reconnection_mgr
                 if config.name in channel_server_names:
                     # Verify capability after connection
                     caps = getattr(server, "server_initialize_result", None)
@@ -308,6 +361,8 @@ async def discover_mcp_resources(
 __all__ = [
     "load_mcp_servers",
     "discover_mcp_resources",
+    "get_reconnection_managers",
+    "reconnect_unhealthy_servers",
     "MCPPrompt",
     "MCPPromptRegistry",
     "MCPServerConfig",

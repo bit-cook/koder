@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 import pytest
 
-from koder_agent.core.usage_tracker import SessionUsage, UsageTracker, usage_snapshot_path
+from koder_agent.core.usage_tracker import (
+    SessionUsage,
+    UsageSummary,
+    UsageTracker,
+    usage_snapshot_path,
+)
 
 
 class TestSessionUsage:
@@ -237,3 +242,169 @@ class TestReset:
         assert tracker.session_usage.request_count == 0
         assert tracker._model is None
         assert tracker._cached_costs is None
+
+
+class TestSessionCacheTokens:
+    """Tests that cache-read/write tokens accumulate at the session level."""
+
+    def test_record_usage_accumulates_session_cache_tokens(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)
+
+        tracker.record_usage(100, 50, cache_read_tokens=800, cache_write_tokens=40, model="m")
+        tracker.record_usage(200, 100, cache_read_tokens=1200, cache_write_tokens=0, model="m")
+
+        assert tracker.session_usage.cache_read_tokens == 2000
+        assert tracker.session_usage.cache_write_tokens == 40
+
+    def test_session_cache_defaults_to_zero(self):
+        usage = SessionUsage()
+        assert usage.cache_read_tokens == 0
+        assert usage.cache_write_tokens == 0
+
+
+class TestPricingKnown:
+    """Tests for the pricing_known helper."""
+
+    def test_pricing_known_true_with_rates(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.00001, 0.00003)
+        assert tracker.pricing_known() is True
+
+    def test_pricing_known_false_with_zero_rates(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)
+        assert tracker.pricing_known() is False
+
+
+class TestSummary:
+    """Tests for the /cost-style UsageSummary snapshot."""
+
+    def test_summary_includes_cache_read_split(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.00001, 0.00003)
+
+        tracker.record_usage(
+            1000, 500, cache_read_tokens=4000, cache_write_tokens=200, model="gpt-x"
+        )
+
+        summary = tracker.summary()
+        assert isinstance(summary, UsageSummary)
+        assert summary.input_tokens == 1000
+        assert summary.output_tokens == 500
+        assert summary.cache_read_tokens == 4000
+        assert summary.cache_write_tokens == 200
+        assert summary.fresh_input_tokens == 1000
+        # 1000 * 0.00001 + 500 * 0.00003 = 0.025
+        assert summary.total_cost == pytest.approx(0.025)
+        assert summary.cost_unavailable is False
+
+    def test_summary_marks_cost_unavailable_for_unknown_pricing(self):
+        """Subscription/OAuth-style: tokens flow but per-token price is 0."""
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)  # pricing unknown
+
+        tracker.record_usage(5000, 2000, cache_read_tokens=1000, model="oauth-model")
+
+        summary = tracker.summary()
+        assert summary.input_tokens == 5000
+        assert summary.output_tokens == 2000
+        assert summary.cache_read_tokens == 1000
+        assert summary.total_cost == 0.0
+        assert summary.cost_unavailable is True
+
+    def test_summary_cost_available_when_positive_even_if_pricing_lookup_zero(self):
+        """A recorded positive cost should not be flagged unavailable."""
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)
+        # Simulate a cost that was recorded some other way.
+        tracker.session_usage.total_cost = 0.42
+
+        summary = tracker.summary()
+        assert summary.cost_unavailable is False
+        assert summary.total_cost == pytest.approx(0.42)
+
+    def test_summary_backfills_cache_from_per_model_snapshot(self, tmp_path):
+        """Older snapshots may lack session-level cache counters; backfill them."""
+        tracker = UsageTracker()
+        # Simulate a loaded snapshot: session-level cache is zero, per-model has data.
+        tracker.session_usage = SessionUsage(input_tokens=100, output_tokens=50)
+        from koder_agent.core.usage_tracker import ModelUsage
+
+        tracker._per_model = {
+            "m": ModelUsage(model="m", cache_read_tokens=777, cache_write_tokens=11),
+        }
+        tracker._cached_costs = (0.0, 0.0)
+
+        summary = tracker.summary()
+        assert summary.cache_read_tokens == 777
+        assert summary.cache_write_tokens == 11
+
+
+class TestFormatSummaryText:
+    """Tests for the format_summary text output."""
+
+    def test_format_summary_shows_cache_read_and_unavailable_cost(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)  # unknown pricing
+        tracker.record_usage(3000, 1000, cache_read_tokens=1500, model="oauth-model")
+
+        text = tracker.format_summary()
+        assert "Cache Read Tokens: 1,500" in text
+        assert "unavailable" in text
+        assert "$0.0000" not in text
+
+    def test_format_summary_shows_dollar_cost_when_known(self):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.00001, 0.00003)
+        tracker.record_usage(1000, 500, model="gpt-x")
+
+        text = tracker.format_summary()
+        assert "$0.0250" in text
+        assert "unavailable" not in text
+
+
+class TestSnapshotRoundTripWithCache:
+    """Tests that cache tokens survive save/load."""
+
+    def test_save_and_load_preserves_session_cache_tokens(self, tmp_path):
+        tracker = UsageTracker()
+        tracker._cached_costs = (0.0, 0.0)
+        tracker.record_usage(100, 50, cache_read_tokens=900, cache_write_tokens=30, model="m")
+
+        path = tmp_path / "usage.json"
+        tracker.save(path)
+
+        loaded = UsageTracker()
+        loaded.load(path)
+        assert loaded.session_usage.cache_read_tokens == 900
+        assert loaded.session_usage.cache_write_tokens == 30
+
+    def test_load_legacy_snapshot_without_cache_fields(self, tmp_path):
+        """A snapshot written before session cache fields existed still loads."""
+        import json
+
+        path = tmp_path / "legacy.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "session_usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_cost": 0.0,
+                        "request_count": 1,
+                        "last_input_tokens": 10,
+                        "last_output_tokens": 5,
+                        "current_context_tokens": 15,
+                    },
+                    "per_model": {},
+                }
+            )
+        )
+
+        tracker = UsageTracker()
+        tracker.load(path)
+        assert tracker.session_usage.input_tokens == 10
+        # Missing cache fields default to zero.
+        assert tracker.session_usage.cache_read_tokens == 0
+        assert tracker.session_usage.cache_write_tokens == 0

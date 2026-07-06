@@ -50,7 +50,7 @@ class _FakeScheduler:
         self.usage_tracker = object()
         self._title_generation_task = None
 
-    async def handle(self, prompt: str, render_output: bool = True) -> str:
+    async def handle(self, prompt: str, render_output: bool = True, multimodal_input=None) -> str:
         self.prompts.append((prompt, render_output))
         return prompt
 

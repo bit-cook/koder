@@ -14,6 +14,7 @@ from koder_agent.harness.config.service import RuntimeConfigService
 from koder_agent.harness.paths import harness_home_dir
 from koder_agent.harness.permissions.ai_classifier import AiShellClassifier
 from koder_agent.harness.permissions.modes import PermissionMode
+from koder_agent.harness.permissions.persistence import PermissionStore
 from koder_agent.harness.permissions.rule_sources import RuleHierarchy
 from koder_agent.harness.permissions.service import PermissionService
 from koder_agent.harness.session_flow import run_harness_session_flow
@@ -77,8 +78,15 @@ class HarnessRuntime:
         except ValueError:
             effective_mode = PermissionMode.DEFAULT
 
+        # A disk-backed store makes "always allow" decisions survive across
+        # sessions: PermissionService.add_rule/add_approval_rule only persist when
+        # a store is present, so without this an approved-always rule was kept
+        # in-memory for one process and forgotten on the next run.
+        permission_store = PermissionStore(harness_home_dir() / "permissions.json")
+
         permission_service = PermissionService.default(
             mode=effective_mode,
+            store=permission_store,
             rule_hierarchy=rule_hierarchy,
             ai_classifier=ai_classifier,
         )

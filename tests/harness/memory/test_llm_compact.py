@@ -167,7 +167,10 @@ async def test_llm_compact_summarizes_tool_pairs_instead_of_replaying_them():
 
 
 @pytest.mark.asyncio
-async def test_llm_compact_summarizes_response_function_call_pairs():
+async def test_llm_compact_preserves_trailing_response_function_call_pair():
+    # The trailing contiguous response-format function_call / function_call_output
+    # pair is preserved verbatim (item 4) so the kept tail stays replayable, in
+    # addition to the recent plain-text messages.
     messages = [
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old answer"},
@@ -182,13 +185,21 @@ async def test_llm_compact_summarizes_response_function_call_pairs():
     ):
         result = await llm_compact_messages(messages, keep_recent=2)
 
-    assert result.kept_messages == messages[:2]
-    assert all("type" not in msg for msg in result.kept_messages)
+    # Plain-text tail is kept first, then the trailing tool pair verbatim.
+    assert result.kept_messages[:2] == messages[:2]
+    assert result.kept_messages[2:] == messages[2:]
 
 
 @pytest.mark.asyncio
 async def test_llm_compact_does_not_grow_already_compacted_context():
+    # Enough older plain content to force a real summary on the first pass, plus
+    # a trailing tool pair preserved verbatim (item 4). Re-compacting the
+    # already-compacted context must be idempotent and preserve the tail.
     messages = [
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old answer"},
         {"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": "{}"},
@@ -208,6 +219,9 @@ async def test_llm_compact_does_not_grow_already_compacted_context():
         second = await llm_compact_messages(compacted_context, keep_recent=2)
 
     assert first.summary is not None
+    # The trailing tool pair survived the first compaction verbatim.
+    assert first.kept_messages[-2:] == messages[-2:]
+    # Re-compacting is idempotent: no new summary, context unchanged.
     assert second.summary is None
     assert second.kept_messages == compacted_context
 

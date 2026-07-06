@@ -140,11 +140,19 @@ def create_config_subparsers(subparsers):
     config_parser = subparsers.add_parser("config", help="Manage configuration")
     config_subparsers = config_parser.add_subparsers(dest="config_action", help="Config actions")
 
-    config_subparsers.add_parser("show", help="Show current configuration")
+    show_parser = config_subparsers.add_parser("show", help="Show current configuration")
+    show_parser.add_argument(
+        "--effective",
+        action="store_true",
+        help="Overlay environment variables over config for known keys before dumping",
+    )
     config_subparsers.add_parser("list", help="List current configuration")
     config_subparsers.add_parser("path", help="Show config file path")
     config_subparsers.add_parser("edit", help="Open config file in default editor")
     config_subparsers.add_parser("init", help="Initialize config file with defaults")
+    config_subparsers.add_parser(
+        "validate", help="Validate the config file and report schema errors"
+    )
 
     export_parser = config_subparsers.add_parser("export", help="Export a local settings bundle")
     export_parser.add_argument("path", help="Output JSON bundle path")
@@ -265,6 +273,12 @@ def create_auth_subparsers(subparsers):
         default=300,
         help="Timeout in seconds for OAuth flow (default: 300)",
     )
+    login_parser.add_argument(
+        "--token",
+        default=None,
+        help="Ingest a token without a browser. Use '-' to read from stdin, "
+        "or set KODER_AUTH_TOKEN in the environment.",
+    )
 
     # koder auth list
     auth_subparsers.add_parser("list", help="List configured OAuth providers")
@@ -284,6 +298,66 @@ def create_auth_subparsers(subparsers):
         nargs="?",
         choices=auth_provider_choices,
         help="Optional: specific provider to show",
+    )
+    status_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit a serializable JSON status dict instead of Rich panels",
+    )
+
+
+def create_doctor_subparser(subparsers):
+    """Create the top-level doctor subcommand parser."""
+    doctor_parser = subparsers.add_parser("doctor", help="Run environment diagnostics")
+    doctor_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit a redacted JSON diagnostics dict",
+    )
+
+
+def create_review_subparser(subparsers):
+    """Create the top-level review subcommand parser."""
+    review_parser = subparsers.add_parser("review", help="Run a headless code review")
+    review_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Optional PR reference (e.g. #123) to review",
+    )
+    review_parser.add_argument(
+        "--base",
+        default=None,
+        help="Review the diff of base...HEAD",
+    )
+    review_parser.add_argument(
+        "--uncommitted",
+        action="store_true",
+        help="Review uncommitted changes (git diff HEAD)",
+    )
+
+
+def create_completion_subparser(subparsers):
+    """Create the top-level completion subcommand parser."""
+    from .harness.cli.completion import SUPPORTED_SHELLS
+
+    completion_parser = subparsers.add_parser("completion", help="Print a shell completion script")
+    completion_parser.add_argument(
+        "shell",
+        choices=list(SUPPORTED_SHELLS),
+        help="Target shell (bash, zsh, or fish)",
+    )
+
+
+def create_upgrade_subparser(subparsers):
+    """Create the top-level upgrade subcommand parser."""
+    upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade the koder installation")
+    upgrade_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the detected upgrade command without running it",
     )
 
 
@@ -325,7 +399,13 @@ def _build_cli_parser(first_arg: Optional[str]) -> argparse.ArgumentParser:
         nargs="?",
         const=True,
         default=None,
-        help="Resume a previous session by ID, or open the interactive picker when no ID is provided",
+        help="Resume a previous session by ID or title, or open the interactive picker when no value is provided",
+    )
+    parser.add_argument(
+        "--all",
+        dest="resume_all",
+        action="store_true",
+        help="With --resume, list sessions across all directories in the picker",
     )
     parser.add_argument(
         "-p",
@@ -409,6 +489,16 @@ def _build_cli_parser(first_arg: Optional[str]) -> argparse.ArgumentParser:
         help="Load a plugin from a directory for this session only (can be repeated)",
     )
     parser.add_argument(
+        "-i",
+        "--image",
+        dest="image",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Attach a local image file to the first prompt (can be repeated). "
+        "The initial user message becomes multimodal (image + text).",
+    )
+    parser.add_argument(
         "--channels",
         type=str,
         default=None,
@@ -422,13 +512,28 @@ def _build_cli_parser(first_arg: Optional[str]) -> argparse.ArgumentParser:
         help="Comma-separated dev channel entries (bypasses allowlist for local testing)",
     )
 
-    if first_arg in ("mcp", "config", "auth", "agents", "plugin", "plugins"):
+    if first_arg in (
+        "mcp",
+        "config",
+        "auth",
+        "agents",
+        "plugin",
+        "plugins",
+        "doctor",
+        "review",
+        "completion",
+        "upgrade",
+    ):
         subparsers = parser.add_subparsers(dest="command", help="Available commands")
         create_mcp_subparsers(subparsers)
         create_config_subparsers(subparsers)
         create_agents_subparsers(subparsers)
         create_plugin_subparsers(subparsers)
         create_auth_subparsers(subparsers)
+        create_doctor_subparser(subparsers)
+        create_review_subparser(subparsers)
+        create_completion_subparser(subparsers)
+        create_upgrade_subparser(subparsers)
     else:
         parser.add_argument(
             "prompt", nargs="*", help="Prompt text (if not provided, starts interactive mode)"
@@ -446,11 +551,19 @@ def _append_subcommand_help(help_text: str) -> str:
         "  mcp                 Manage MCP servers",
         "                      mcp <add|add-json|list|get|remove|reset-project-choices|serve>",
         "  config              Manage configuration",
-        "                      config <show|list|path|edit|init|set>",
+        "                      config <show|list|path|edit|init|set|validate|export|import>",
         "  agents              List configured agents",
         "                      agents",
         "  plugin, plugins     Manage installed plugins",
         "                      plugin <list|install|uninstall|enable|disable|validate|marketplace>",
+        "  doctor              Run environment diagnostics",
+        "                      doctor [--json]",
+        "  review              Run a headless code review",
+        "                      review [--base <ref>] [--uncommitted] [#PR]",
+        "  completion          Print a shell completion script",
+        "                      completion <bash|zsh|fish>",
+        "  upgrade             Upgrade the koder installation",
+        "                      upgrade [--dry-run]",
         "",
         "Use `koder <command> --help` for subcommand details.",
     ]

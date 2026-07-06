@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel
 
 from koder_agent.config import get_config
+from koder_agent.harness.memory.budget import estimate_text_tokens
 from koder_agent.harness.paths import harness_home_dir
 from koder_agent.harness.skills.bundled import get_bundled_skills
 from koder_agent.harness.skills.discovery import discover_skills_for_paths
@@ -27,9 +28,17 @@ MAX_DESCRIPTION_LENGTH = 1024
 NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9:.-]*[a-z0-9])?$")
 SKILL_ADDITIONAL_DIRS_ENV = "KODER_ADDITIONAL_DIRS"
 INLINE_COMMAND_RE = re.compile(r"!\`([^`]+)\`")
+# Matches positional argument placeholders: ``$ARGUMENTS[<n>]`` or bare ``$<n>``.
+# Using ``\d+`` (not a per-index loop) so multi-digit indices like ``$10`` are
+# substituted atomically instead of ``$1`` matching the ``$1`` prefix of ``$10``.
+_POSITIONAL_ARG_RE = re.compile(r"\$ARGUMENTS\[(?P<bracket>\d+)\]|\$(?P<bare>\d+)")
 SKILL_BUDGET_CONTEXT_PERCENT = 0.01
-CHARS_PER_TOKEN = 4
-DEFAULT_CHAR_BUDGET = 8_000
+# ``DEFAULT_TOKEN_BUDGET`` is the token-space equivalent of the previous
+# ``DEFAULT_CHAR_BUDGET`` of 8_000 characters. Budgeting is now token-accurate
+# (via ``estimate_text_tokens``) rather than a fixed 4-chars-per-token heuristic,
+# so both the env override and the ~1% context-window budget are expressed in
+# tokens.
+DEFAULT_TOKEN_BUDGET = 2_000
 MAX_LISTING_DESC_CHARS = 250
 
 
@@ -94,9 +103,16 @@ class Skill:
         final = self.content
         joined = " ".join(args).strip()
 
-        for index, value in enumerate(args):
-            final = final.replace(f"$ARGUMENTS[{index}]", value)
-            final = final.replace(f"${index}", value)
+        # Substitute positional placeholders in a single regex pass so multi-digit
+        # indices resolve correctly. A naive ascending ``str.replace`` loop turns
+        # ``$10`` into ``<value of $1>0``; matching the whole ``\d+`` avoids that.
+        def _positional(match: re.Match[str]) -> str:
+            index = int(match.group("bracket") or match.group("bare"))
+            if 0 <= index < len(args):
+                return args[index]
+            return match.group(0)
+
+        final = _POSITIONAL_ARG_RE.sub(_positional, final)
 
         if "$ARGUMENTS" in final:
             final = final.replace("$ARGUMENTS", joined)
@@ -121,33 +137,66 @@ class Skill:
         if not command:
             return ""
 
+        # Security gate 0: trust scoping. Inline ``!`cmd`` expansion runs at
+        # render time with NO human in the loop, so an untrusted third-party
+        # skill must never be able to run a command merely by being rendered.
+        # A read-only classifier is not sufficient here: a read-only command
+        # like ``cat ~/.ssh/id_rsa`` exfiltrates secrets into the rendered
+        # (LLM-visible) prompt, which IS the attack. Only first-party (bundled)
+        # skills may execute inline commands; user/project/plugin/additional
+        # skills get a placeholder instead. Operators who deliberately trust a
+        # local skill can still run it via a normal tool call.
+        if not _inline_commands_trusted(self.source):
+            return "[blocked: inline command execution is only permitted for built-in skills]"
+
         # Security gate 1: allow operators to disable inline command execution
         # entirely via env flag (consistent with the codebase's env-flag style).
         # When disabled, never execute -- substitute a clear placeholder.
         if not _inline_commands_enabled():
             return "[inline command execution disabled]"
 
+        # Security gate 1b: command/process substitution smuggles an arbitrary
+        # command inside an otherwise read-only line (e.g. ``echo $(rm -rf /)``).
+        # The static classifiers below are word/segment based and do not police
+        # what runs inside ``$(...)``/backticks, so reject substitution outright
+        # for both shells before classification.
+        if _contains_command_substitution(command):
+            return "[blocked: command substitution is not permitted in inline commands]"
+
         if self.shell == "powershell":
-            # Security gate 2 (PowerShell): route the candidate through the
-            # PowerShell classifier BEFORE executing. Inline expansion happens at
-            # render time with no human in the loop, so only clearly read-only
-            # commands (allowed and not requiring approval) may run; everything
-            # else is blocked, mirroring the bash branch's [blocked] behavior.
+            # Security gate 2 (PowerShell): ALLOWLIST posture. Inline expansion
+            # runs at render time with no human in the loop, so only clearly
+            # read-only commands (allowed AND read_only AND not requiring
+            # approval) may run; everything else is blocked.
             from koder_agent.harness.permissions.powershell_classifier import (
                 classify_powershell_command,
             )
 
             decision = classify_powershell_command(command)
-            if not decision.allowed or decision.requires_approval:
+            if not (decision.allowed and decision.read_only and not decision.requires_approval):
                 return f"[blocked: {decision.reason}]"
 
             argv = ["powershell", "-NoProfile", "-Command", command]
         else:
-            # Security gate 2: route the candidate command through the existing
-            # bash security analyzer BEFORE executing. This prevents a malicious
-            # third-party skill from gaining arbitrary code execution simply by
-            # rendering its prompt. Blocked commands are never run -- a clear
-            # placeholder is substituted instead of the command output.
+            # Security gate 2 (bash): ALLOWLIST posture mirroring the PowerShell
+            # branch instead of a weak denylist. Inline expansion happens at
+            # render time with no human in the loop, so a malicious third-party
+            # skill could otherwise gain arbitrary code execution just by having
+            # its prompt rendered. Only clearly read-only commands may run: the
+            # classifier must report allowed AND read_only AND not
+            # requires_approval. Anything that mutates the filesystem, executes
+            # arbitrary code (e.g. curl|sh), contains command substitution, or
+            # otherwise needs approval is blocked.
+            from koder_agent.harness.permissions.shell_classifier import (
+                classify_shell_command,
+            )
+
+            decision = classify_shell_command(command)
+            if not (decision.allowed and decision.read_only and not decision.requires_approval):
+                return f"[blocked: {decision.reason}]"
+
+            # Keep the legacy bash analyzer as an ADDITIONAL block on top of the
+            # allowlist -- its denylist may catch patterns the classifier permits.
             from koder_agent.core.bash_security import analyze_command
 
             analysis = analyze_command(command)
@@ -175,6 +224,35 @@ class Skill:
 
 
 SKILL_INLINE_COMMANDS_ENV = "KODER_SKILL_INLINE_COMMANDS"
+
+# Substrings indicating command/process substitution. Applies to both bash
+# (``$(...)`` / backticks / ``<(...)`` / ``>(...)``) and PowerShell
+# (``$(...)`` / backticks). A read-only classifier cannot reason about the
+# arbitrary command hidden inside these, so they are rejected before running.
+_COMMAND_SUBSTITUTION_MARKERS = ("$(", "`", "<(", ">(", "${")
+
+
+def _contains_command_substitution(command: str) -> bool:
+    return any(marker in command for marker in _COMMAND_SUBSTITUTION_MARKERS)
+
+
+# Skill sources whose content is first-party / shipped with koder. Only these
+# may run inline ``!`cmd`` expansions at render time. Everything else
+# (user/project/plugin/additional) is untrusted third-party content.
+_TRUSTED_INLINE_SOURCES = frozenset({"bundled"})
+
+
+def _inline_commands_trusted(source: str | None) -> bool:
+    """Whether a skill's source is trusted enough to run inline commands.
+
+    Inline expansion runs with no human in the loop, so only first-party
+    (bundled) skills qualify. An env override lets operators opt a specific
+    deployment into trusting all sources, but it must be set explicitly.
+    """
+    override = os.environ.get("KODER_SKILL_INLINE_TRUST_ALL")
+    if override is not None and override.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return source in _TRUSTED_INLINE_SOURCES
 
 
 def _inline_commands_enabled() -> bool:
@@ -573,13 +651,21 @@ def _additional_dirs_from_env() -> list[Path]:
     return [Path(part).expanduser().resolve() for part in raw.split(os.pathsep) if part.strip()]
 
 
-def _get_skill_char_budget(context_window_tokens: int | None = None) -> int:
+def _get_skill_token_budget(context_window_tokens: int | None = None) -> int:
+    """Return the metadata-prompt budget as a token count.
+
+    Budgeting is token-accurate (see ``build_skills_metadata_prompt``). The
+    ``SLASH_COMMAND_TOOL_CHAR_BUDGET`` env override is honored as an explicit
+    token cap (its historical name is kept for backwards compatibility), and the
+    ~1% context-window budget is expressed directly in tokens rather than being
+    multiplied by a fixed 4-chars-per-token heuristic.
+    """
     raw = os.environ.get("SLASH_COMMAND_TOOL_CHAR_BUDGET")
     if raw and raw.isdigit():
         return int(raw)
     if context_window_tokens:
-        return int(context_window_tokens * CHARS_PER_TOKEN * SKILL_BUDGET_CONTEXT_PERCENT)
-    return DEFAULT_CHAR_BUDGET
+        return int(context_window_tokens * SKILL_BUDGET_CONTEXT_PERCENT)
+    return DEFAULT_TOKEN_BUDGET
 
 
 def build_skills_metadata_prompt(
@@ -593,9 +679,9 @@ def build_skills_metadata_prompt(
     if not visible:
         return "No skills are currently available."
 
-    budget = _get_skill_char_budget(context_window_tokens)
+    budget = _get_skill_token_budget(context_window_tokens)
     lines = ["Available skills:", ""]
-    used = len("Available skills:\n\n")
+    used = estimate_text_tokens("Available skills:\n\n")
 
     for skill in sorted(visible, key=lambda s: s.name.lower()):
         desc = (skill.description or "").strip()
@@ -603,19 +689,64 @@ def build_skills_metadata_prompt(
             desc = desc[: MAX_LISTING_DESC_CHARS - 1] + "…"
         prefix = f"- {skill.name}: "
         entry = prefix + desc
-        if used + len(entry) + 1 > budget:
-            remaining = budget - used - len(prefix) - 1
-            if remaining < 1:
+        entry_tokens = estimate_text_tokens(entry) + 1  # +1 for the joining newline
+        if used + entry_tokens > budget:
+            # No room for even the bare "- name:" prefix -> stop, but ensure at
+            # least one entry is emitted so the prompt is never just a header.
+            prefix_tokens = estimate_text_tokens(prefix) + 1
+            if used + prefix_tokens > budget:
                 if len(lines) == 2:
                     lines.append(prefix.rstrip())
                 break
-            if remaining < 20 and len(lines) > 2:
+            if len(lines) > 2:
                 break
-            trimmed = desc[: max(0, remaining - 1)] + "…"
+            # Trim the description down to fit the remaining token budget.
+            trimmed = _trim_desc_to_tokens(desc, budget - used - prefix_tokens)
             entry = prefix + trimmed
+            entry_tokens = estimate_text_tokens(entry) + 1
         lines.append(entry)
-        used += len(entry) + 1
+        used += entry_tokens
     return "\n".join(lines)
+
+
+def _trim_desc_to_tokens(desc: str, token_room: int) -> str:
+    """Trim *desc* so ``desc + '…'`` fits within *token_room* tokens.
+
+    Falls back to a character-proportional guess then shrinks until the token
+    estimate fits, so the result is token-accurate rather than heuristic.
+    """
+    if token_room <= 0:
+        return "…"
+    if estimate_text_tokens(desc + "…") <= token_room:
+        return desc + "…"
+    # Start from a proportional character estimate and shrink to fit.
+    approx_chars = max(1, len(desc) * token_room // max(1, estimate_text_tokens(desc)))
+    for length in range(min(approx_chars, len(desc)), 0, -1):
+        candidate = desc[:length] + "…"
+        if estimate_text_tokens(candidate) <= token_room:
+            return candidate
+    return "…"
+
+
+def _merge_skill(merged: dict[str, Skill], skill: Skill) -> None:
+    """Insert *skill* into *merged* under its name, warning on cross-source shadowing.
+
+    Precedence is unchanged (last writer wins), but when the incoming skill
+    overrides an existing entry that came from a DIFFERENT source, a warning is
+    emitted recording ``shadowed source -> overriding source`` and the name.
+    This surfaces the previously-silent case where, e.g., a user/project/plugin
+    skill named ``docx`` clobbers the bundled one. Same-source overrides (e.g.
+    two project dirs) stay silent to avoid noise.
+    """
+    existing = merged.get(skill.name)
+    if existing is not None and existing.source != skill.source:
+        logger.warning(
+            "skill '%s' from source '%s' overrides skill of the same name from " "source '%s'",
+            skill.name,
+            skill.source,
+            existing.source,
+        )
+    merged[skill.name] = skill
 
 
 def discover_merged_skills(
@@ -642,30 +773,30 @@ def discover_merged_skills(
 
     merged: dict[str, Skill] = {}
 
-    for name, skill in get_bundled_skills().items():
-        merged[name] = skill
+    for _name, skill in get_bundled_skills().items():
+        _merge_skill(merged, skill)
 
     if resolved_user_dir.exists():
         for skill in SkillLoader(resolved_user_dir).discover_skills(source="user"):
-            merged[skill.name] = skill
+            _merge_skill(merged, skill)
 
     if resolved_project_dir is not None and resolved_project_dir.exists():
         for skill in SkillLoader(resolved_project_dir).discover_skills(source="project"):
-            merged[skill.name] = skill
+            _merge_skill(merged, skill)
 
     for project_dir in _project_skill_dirs(current_cwd):
         for skill in SkillLoader(project_dir).discover_skills(source="project"):
-            merged[skill.name] = skill
+            _merge_skill(merged, skill)
 
     for extra_dir in _additional_skill_dirs(resolved_additional_dirs):
         for skill in SkillLoader(extra_dir).discover_skills(source="additional"):
-            merged[skill.name] = skill
+            _merge_skill(merged, skill)
 
     for skills_dir, plugin_name in _plugin_skill_dirs(resolved_plugin_root):
         for skill in SkillLoader(skills_dir).discover_skills(
             source="plugin", plugin_name=plugin_name
         ):
-            merged[skill.name] = skill
+            _merge_skill(merged, skill)
 
     return merged
 
@@ -707,6 +838,47 @@ def _dir_max_mtime(path: Path) -> float:
     return max_mt
 
 
+def _compute_merged_skills_cache_key(
+    *,
+    cwd: str,
+    user_dir: str,
+    project_dir: str,
+    plugin_root: str,
+    additional: tuple[str, ...],
+) -> tuple:
+    """Build the cache key for ``_get_merged_skills``.
+
+    The key folds ``_dir_max_mtime`` over the FULL set of skill directories --
+    computed the same way ``discover_merged_skills`` does, including walked-up
+    parents, nested monorepo packages, and dynamically discovered dirs from
+    ``_project_skill_dirs`` -- so editing a SKILL.md in any of them invalidates
+    the cache without a process restart. A key built from only the configured
+    user/project/plugin/additional roots would serve stale content for those.
+    """
+    scanned_dirs: list[Path] = [Path(user_dir), Path(project_dir), Path(plugin_root)]
+    scanned_dirs.extend(_project_skill_dirs(Path(cwd)))
+    scanned_dirs.extend(Path(p) for p in additional)
+    scanned_dirs.extend(_additional_skill_dirs([Path(p) for p in additional]))
+
+    # Fold mtimes over every scanned dir, keyed by resolved path so duplicates
+    # collapse and ordering is stable.
+    dir_mtimes = tuple(
+        sorted(
+            (str(path.resolve()), _dir_max_mtime(path))
+            for path in {d.resolve(): d for d in scanned_dirs}.values()
+        )
+    )
+
+    return (
+        cwd,
+        user_dir,
+        project_dir,
+        plugin_root,
+        additional,
+        dir_mtimes,
+    )
+
+
 def _get_merged_skills() -> dict[str, Skill]:
     global _merged_skills, _merged_skills_key
 
@@ -717,23 +889,12 @@ def _get_merged_skills() -> dict[str, Skill]:
     plugin_root = str((harness_home_dir() / "plugins").resolve())
     additional = tuple(str(path) for path in _additional_dirs_from_env())
 
-    # Include max mtime of each skills directory in the cache key so edits
-    # to skill files invalidate the cache without a process restart.
-    user_mtime = _dir_max_mtime(Path(user_dir))
-    project_mtime = _dir_max_mtime(Path(project_dir))
-    plugin_mtime = _dir_max_mtime(Path(plugin_root))
-    additional_mtimes = tuple(_dir_max_mtime(Path(p)) for p in additional)
-
-    cache_key = (
-        cwd,
-        user_dir,
-        project_dir,
-        plugin_root,
-        additional,
-        user_mtime,
-        project_mtime,
-        plugin_mtime,
-        additional_mtimes,
+    cache_key = _compute_merged_skills_cache_key(
+        cwd=cwd,
+        user_dir=user_dir,
+        project_dir=project_dir,
+        plugin_root=plugin_root,
+        additional=additional,
     )
 
     if _merged_skills is None or _merged_skills_key != cache_key:

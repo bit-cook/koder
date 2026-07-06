@@ -114,11 +114,11 @@ async def test_server_factory_with_retry_success():
     call_count = 0
     mock_server = MockMCPServer("test-server")
 
-    async def mock_create_server(cfg, channel_callback=None):
+    async def mock_create_server(cfg, channel_callback=None, *, trusted=True):
         return mock_server
 
     # Patch server creation to fail first 2 times
-    async def failing_create(cfg, channel_callback=None):
+    async def failing_create(cfg, channel_callback=None, *, trusted=True):
         nonlocal call_count
         call_count += 1
         if call_count <= 2:
@@ -150,7 +150,7 @@ async def test_server_factory_with_retry_max_failures():
         source_path="/tmp/test",
     )
 
-    async def always_fail(cfg, channel_callback=None):
+    async def always_fail(cfg, channel_callback=None, *, trusted=True):
         raise ConnectionError("Always fails")
 
     with patch.object(MCPServerFactory, "create_server", always_fail):
@@ -177,7 +177,7 @@ async def test_server_factory_returns_reconnection_manager():
 
     mock_server = MockMCPServer("test-server")
 
-    async def mock_create_server(cfg, channel_callback=None):
+    async def mock_create_server(cfg, channel_callback=None, *, trusted=True):
         return mock_server
 
     with patch.object(MCPServerFactory, "create_server", mock_create_server):

@@ -116,21 +116,66 @@ def clear_tokens(server_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """Tiny handler that captures the ``code`` query parameter."""
+@dataclass
+class _CallbackResult:
+    """Per-flow container for the loopback callback outcome.
+
+    Instances are bound to a single :class:`HTTPServer` so concurrent OAuth
+    flows never share mutable state (previously stored as class attributes on
+    the handler, which raced across flows).
+    """
 
     auth_code: str | None = None
     error: str | None = None
 
+
+class _OAuthCallbackHandler(BaseHTTPRequestHandler):
+    """Handler that captures the ``code`` query parameter for one flow.
+
+    Expected ``state`` (CSRF token), the callback path, and the result
+    container are read from the owning :class:`HTTPServer` instance so that
+    each flow validates against its own generated state and writes into its
+    own container. A request whose ``state`` does not match the value this
+    flow generated is rejected without recording an auth code.
+    """
+
     def do_GET(self) -> None:  # noqa: N802
         from urllib.parse import parse_qs, urlparse
 
-        query = parse_qs(urlparse(self.path).query)
+        result: _CallbackResult = getattr(self.server, "oauth_result", None) or _CallbackResult()
+        expected_state: str | None = getattr(self.server, "oauth_expected_state", None)
+        expected_path: str | None = getattr(self.server, "oauth_callback_path", None)
+
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
         code = query.get("code", [None])[0]
         err = query.get("error", [None])[0]
+        returned_state = query.get("state", [None])[0]
+
+        # Reject callbacks on an unexpected path (ignore favicon/probes, etc.).
+        if expected_path is not None and parsed.path != expected_path:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Not found.</h2></body></html>")
+            return
+
+        # CSRF protection: the returned state MUST match the value this flow
+        # generated. A missing or mismatched state is rejected outright so a
+        # forged callback carrying an attacker-chosen ``code`` cannot be
+        # accepted (RFC 6749 section 10.12).
+        if expected_state is not None and returned_state != expected_state:
+            result.error = "state_mismatch"
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><h2>Authorization failed: state mismatch.</h2></body></html>"
+            )
+            return
 
         if code:
-            _OAuthCallbackHandler.auth_code = code
+            result.auth_code = code
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -140,7 +185,7 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
                 b"</body></html>"
             )
         else:
-            _OAuthCallbackHandler.error = err or "unknown_error"
+            result.error = err or "unknown_error"
             self.send_response(400)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -153,9 +198,19 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 
 def _start_callback_server(port: int | None) -> tuple[HTTPServer, int]:
-    """Start a local HTTP server and return ``(server, actual_port)``."""
+    """Start a local HTTP server and return ``(server, actual_port)``.
+
+    The returned server carries a fresh :class:`_CallbackResult` on
+    ``server.oauth_result``; the caller binds the expected ``state`` and
+    callback path before opening the browser.
+    """
     bind_port = port or 0  # 0 = OS picks a free port
     server = HTTPServer(("127.0.0.1", bind_port), _OAuthCallbackHandler)
+    # Per-flow state lives on the server instance, not on the handler class,
+    # so concurrent flows do not clobber each other.
+    server.oauth_result = _CallbackResult()  # type: ignore[attr-defined]
+    server.oauth_expected_state = None  # type: ignore[attr-defined]
+    server.oauth_callback_path = None  # type: ignore[attr-defined]
     actual_port = server.server_address[1]
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -280,7 +335,12 @@ class MCPOAuthFlow:
         expires_in = tokens.get("expires_in")
         obtained_at = tokens.get("obtained_at")
         if expires_in is None or obtained_at is None:
-            return False  # assume valid if we can't tell
+            # No usable expiry metadata: do NOT assume infinite validity.
+            # Treat the token as expired so the caller re-validates it —
+            # refreshing when a refresh_token exists, otherwise re-running the
+            # full authorization flow. This is conservative on purpose; a token
+            # that carries expiry still uses the precise check below.
+            return True
         return time.time() > obtained_at + expires_in - 30  # 30s grace
 
     async def _discover_metadata(self) -> Dict[str, Any]:
@@ -423,9 +483,13 @@ class MCPOAuthFlow:
         code_verifier, code_challenge = _generate_pkce()
         state = secrets.token_urlsafe(32)
 
-        # Reset handler state
-        _OAuthCallbackHandler.auth_code = None
-        _OAuthCallbackHandler.error = None
+        # Bind the expected CSRF state and callback path to THIS server so the
+        # handler validates the returned state and only this flow's result
+        # container is written. State lives on the server instance (the fresh
+        # ``oauth_result`` created by ``_start_callback_server``), not on the
+        # handler class, so concurrent flows stay isolated.
+        server.oauth_expected_state = state  # type: ignore[attr-defined]
+        server.oauth_callback_path = urlparse(redirect_uri).path  # type: ignore[attr-defined]
 
         # Build authorization URL
         auth_params: Dict[str, str] = {
@@ -446,8 +510,8 @@ class MCPOAuthFlow:
         logger.info("Opening browser for OAuth authorization...")
         webbrowser.open(auth_url)
 
-        # Wait for callback
-        code = await self._wait_for_code(timeout=300)
+        # Wait for callback (validates state via the handler)
+        code = await self._wait_for_code(server, timeout=300)
 
         # Exchange code for tokens
         token_payload: Dict[str, str] = {
@@ -473,14 +537,20 @@ class MCPOAuthFlow:
         return token_data
 
     @staticmethod
-    async def _wait_for_code(timeout: float = 300) -> str:
-        """Poll until the callback handler has received the auth code."""
+    async def _wait_for_code(server: HTTPServer, timeout: float = 300) -> str:
+        """Poll until this flow's callback handler has received the auth code.
+
+        The result is read from the per-flow container bound to *server*, so a
+        callback that failed state (CSRF) validation surfaces as an error and
+        never yields a code.
+        """
+        result: _CallbackResult = getattr(server, "oauth_result", None) or _CallbackResult()
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if _OAuthCallbackHandler.auth_code:
-                return _OAuthCallbackHandler.auth_code
-            if _OAuthCallbackHandler.error:
-                raise RuntimeError(f"OAuth authorization failed: {_OAuthCallbackHandler.error}")
+            if result.auth_code:
+                return result.auth_code
+            if result.error:
+                raise RuntimeError(f"OAuth authorization failed: {result.error}")
             await asyncio.sleep(0.25)
         raise TimeoutError("Timed out waiting for OAuth authorization callback")
 

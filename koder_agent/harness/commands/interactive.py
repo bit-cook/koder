@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -66,6 +65,12 @@ from koder_agent.harness.hooks.runtime import (
 )
 from koder_agent.harness.memory.budget import estimate_messages_tokens, estimate_text_tokens
 from koder_agent.harness.memory.compact import compactable_session_items, llm_compact_messages
+from koder_agent.harness.output_styles import (
+    discover_output_styles,
+    find_output_style,
+    load_active_output_style_name,
+    save_active_output_style_name,
+)
 from koder_agent.harness.paths import (
     harness_home_dir,
     project_agents_dir,
@@ -455,6 +460,14 @@ class HarnessInteractiveCommandHandler:
             if skill.argument_hint:
                 description = f"{description} {skill.argument_hint}"
             command_list.append((skill.name, description))
+        # Add standalone .koder/commands prompt commands
+        for prompt_command in self._prompt_commands().values():
+            if prompt_command.name in self.commands:
+                continue
+            description = prompt_command.description or "Prompt command"
+            if prompt_command.argument_hint:
+                description = f"{description} {prompt_command.argument_hint}"
+            command_list.append((prompt_command.name, description))
         # Add MCP prompt commands
         from koder_agent.mcp.prompts import get_prompt_registry
 
@@ -516,6 +529,12 @@ class HarnessInteractiveCommandHandler:
             skills = self._user_visible_skills()
             if command_name in skills:
                 return await self._execute_dynamic_skill(skills[command_name], scheduler, args)
+            # Check standalone .koder/commands prompt commands
+            prompt_commands = self._prompt_commands()
+            if command_name in prompt_commands:
+                return await self._execute_prompt_command(
+                    prompt_commands[command_name], scheduler, args
+                )
             # Check MCP prompt commands
             if command_name.startswith("mcp__"):
                 from koder_agent.mcp.prompts import get_prompt_registry
@@ -1498,45 +1517,21 @@ Koder understands your codebase, edits files with your permission, and runs loca
 
     @staticmethod
     def _detect_installation_type() -> str:
-        repo_root = Path(__file__).resolve().parents[3]
-        executable = Path(sys.executable).resolve()
-        argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else executable
+        from koder_agent.harness.diagnostics import detect_installation_type
 
-        if (repo_root / "pyproject.toml").exists() and str(repo_root) in {
-            *map(str, executable.parents),
-            *map(str, argv0.parents),
-        }:
-            return "development"
-        if ".venv" in str(executable):
-            return "local"
-        return "unknown"
+        return detect_installation_type()
 
     @staticmethod
     def _detect_invoked_binary() -> str:
-        candidate = sys.argv[0] if sys.argv and sys.argv[0] else sys.executable
-        try:
-            return str(Path(candidate).expanduser().resolve())
-        except Exception:
-            return candidate
+        from koder_agent.harness.diagnostics import detect_invoked_binary
+
+        return detect_invoked_binary()
 
     @staticmethod
     def _detect_ripgrep_status() -> tuple[bool, str, str]:
-        rg_path = shutil.which("rg")
-        if not rg_path:
-            return False, "missing", "not found"
-        try:
-            proc = subprocess.run(
-                [rg_path, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if proc.returncode == 0:
-                return True, "system", rg_path
-        except Exception:
-            pass
-        return False, "system", rg_path
+        from koder_agent.harness.diagnostics import detect_ripgrep_status
+
+        return detect_ripgrep_status()
 
     async def _execute_files(self, _scheduler, _args: list[str]) -> str:
         if _scheduler is None or not hasattr(_scheduler, "session"):
@@ -1858,36 +1853,51 @@ Koder understands your codebase, edits files with your permission, and runs loca
         return await load_context()
 
     async def _execute_cost(self, scheduler, _args: list[str]) -> str:
-        usage = scheduler.usage_tracker.session_usage if scheduler else None
+        tracker = getattr(scheduler, "usage_tracker", None) if scheduler else None
+        if tracker is None:
+            return (
+                "requests: 0\ninput_tokens: 0\noutput_tokens: 0\n"
+                "cache_read_tokens: 0\ncache_write_tokens: 0\ncontext_tokens: 0\ncost: 0.0000"
+            )
+        # Prefer the summary() API which splits cache-read tokens and flags cost
+        # as unavailable (subscription/OAuth) instead of printing a misleading $0.
+        summary = tracker.summary() if hasattr(tracker, "summary") else None
+        if summary is not None:
+            cost_line = (
+                "cost: unavailable (pricing unknown for this model)"
+                if getattr(summary, "cost_unavailable", False)
+                else f"cost: {summary.total_cost:.4f}"
+            )
+            return (
+                f"requests: {summary.request_count}\n"
+                f"input_tokens: {summary.input_tokens}\n"
+                f"output_tokens: {summary.output_tokens}\n"
+                f"cache_read_tokens: {summary.cache_read_tokens}\n"
+                f"cache_write_tokens: {summary.cache_write_tokens}\n"
+                f"context_tokens: {summary.context_tokens}\n"
+                f"{cost_line}"
+            )
+        usage = tracker.session_usage
         if usage is None:
-            return "requests: 0\ninput_tokens: 0\noutput_tokens: 0\ncontext_tokens: 0\ncost: 0.0000"
+            return (
+                "requests: 0\ninput_tokens: 0\noutput_tokens: 0\n"
+                "cache_read_tokens: 0\ncache_write_tokens: 0\ncontext_tokens: 0\ncost: 0.0000"
+            )
         return (
             f"requests: {getattr(usage, 'request_count', 0)}\n"
             f"input_tokens: {getattr(usage, 'input_tokens', 0)}\n"
             f"output_tokens: {getattr(usage, 'output_tokens', 0)}\n"
+            f"cache_read_tokens: {getattr(usage, 'cache_read_tokens', 0)}\n"
+            f"cache_write_tokens: {getattr(usage, 'cache_write_tokens', 0)}\n"
             f"context_tokens: {getattr(usage, 'current_context_tokens', 0)}\n"
             f"cost: {getattr(usage, 'total_cost', 0.0):.4f}"
         )
 
     async def _execute_doctor(self, _scheduler, _args: list[str]) -> str:
-        config = get_config()
-        mcp_manager = MCPServerManager()
-        servers = await mcp_manager.list_servers(cwd=os.getcwd())
-        rg_working, rg_mode, rg_path = self._detect_ripgrep_status()
-        return (
-            f"cwd: {os.getcwd()}\n"
-            f"python: {sys.executable}\n"
-            f"installation_type: {self._detect_installation_type()}\n"
-            f"invoked_binary: {self._detect_invoked_binary()}\n"
-            f"config_path: {Path.home() / '.koder' / 'config.yaml'}\n"
-            f"model: {config.model.name}\n"
-            f"provider: {config.model.provider}\n"
-            f"permission_mode: {config.harness.permission_mode}\n"
-            f"mcp_servers: {len(servers)}\n"
-            f"ripgrep_working: {str(rg_working).lower()}\n"
-            f"ripgrep_mode: {rg_mode}\n"
-            f"ripgrep_path: {rg_path}"
-        )
+        from koder_agent.harness.diagnostics import collect_doctor_report, render_doctor_text
+
+        report = await collect_doctor_report()
+        return render_doctor_text(report)
 
     async def _execute_memory(self, _scheduler, _args: list[str]) -> str:
         from pathlib import Path
@@ -2456,18 +2466,20 @@ If verification fails because this skill's instructions are stale, ask before ed
             else:
                 self.vim_enabled = _load_vim_enabled()
             statusline = resolve_statusline_config(Path.cwd())
+            active_style = load_active_output_style_name()
             lines = [
                 "output-style:",
                 f"theme: {self.current_theme}",
                 f"color: {current_color}",
                 f"vim_mode: {str(self.vim_enabled).lower()}",
+                f"style: {active_style if active_style else 'none'}",
             ]
             if statusline is None:
                 lines.append("statusline: not configured")
             else:
                 lines.append(f"statusline: {statusline.command}")
                 lines.append(f"statusline_source: {statusline.source_path}")
-            lines.append("controls: /theme, /color, /statusline, /vim")
+            lines.append("controls: /theme, /color, /statusline, /vim, /output-style set <name>")
             return "\n".join(lines)
 
         action = args[0]
@@ -2483,6 +2495,14 @@ If verification fails because this skill's instructions are stale, ask before ed
             return await self._execute_statusline(scheduler, args[1:])
         if action == "vim":
             return await self._execute_vim(scheduler, args[1:])
+        if action in {"styles", "list-styles"}:
+            return self._render_output_styles_listing()
+        if action == "set":
+            if len(args) < 2:
+                return "Usage: /output-style set <name>"
+            return await self._execute_output_style_set(scheduler, " ".join(args[1:]))
+        if action in {"unset", "clear"}:
+            return await self._execute_output_style_set(scheduler, None)
         if action == "reset":
             self.current_theme = "adaptive"
             self.current_color = "default"
@@ -2494,17 +2514,70 @@ If verification fails because this skill's instructions are stale, ask before ed
             else:
                 vim_settings_path = _save_vim_enabled(False)
             theme_settings_path = _save_output_theme(self.current_theme)
+            style_settings_path = save_active_output_style_name(None)
+            await self._reset_scheduler_agent(scheduler)
             settings_path = update_user_statusline_config(None)
             return (
                 "output-style: reset\n"
                 "theme: adaptive\n"
                 "color: default\n"
                 "vim_mode: false\n"
+                "style: none\n"
                 f"theme_settings_path: {theme_settings_path}\n"
                 f"vim_settings_path: {vim_settings_path}\n"
+                f"style_settings_path: {style_settings_path}\n"
                 f"statusline_settings_path: {settings_path}"
             )
-        return "Usage: /output-style [status|theme <name>|color <name>|statusline ...|vim [on|off]|reset]"
+        return (
+            "Usage: /output-style [status|theme <name>|color <name>|statusline ...|"
+            "vim [on|off]|styles|set <name>|unset|reset]"
+        )
+
+    def _render_output_styles_listing(self) -> str:
+        styles = discover_output_styles(Path.cwd())
+        active = load_active_output_style_name()
+        active_key = active.lower() if active else None
+        lines = ["output-style styles:"]
+        if not styles:
+            lines.append("(no output styles found)")
+            lines.append(
+                "hint: add markdown personas to .koder/output-styles/ " "or ~/.koder/output-styles/"
+            )
+            return "\n".join(lines)
+        for key in sorted(styles):
+            style = styles[key]
+            marker = "* " if key == active_key else "- "
+            summary = style.description or "(no description)"
+            lines.append(f"{marker}{style.name} [{style.source}]: {summary}")
+        lines.append(f"active: {active if active else 'none'}")
+        return "\n".join(lines)
+
+    async def _execute_output_style_set(self, scheduler, name: Optional[str]) -> str:
+        if name is None:
+            style_settings_path = save_active_output_style_name(None)
+            agent_reloaded = await self._reset_scheduler_agent(scheduler)
+            return (
+                "output-style: style cleared\n"
+                "style: none\n"
+                f"settings_path: {style_settings_path}\n"
+                f"agent_reloaded: {agent_reloaded}"
+            )
+        requested = name.strip()
+        if not requested:
+            return "Usage: /output-style set <name>"
+        style = find_output_style(requested, Path.cwd())
+        if style is None:
+            available = sorted(discover_output_styles(Path.cwd()))
+            available_display = ", ".join(available) if available else "(none)"
+            return f"output-style: unknown style {requested}\navailable: {available_display}"
+        style_settings_path = save_active_output_style_name(style.name)
+        agent_reloaded = await self._reset_scheduler_agent(scheduler)
+        return (
+            f"output-style: style set to {style.name}\n"
+            f"source: {style.source}\n"
+            f"settings_path: {style_settings_path}\n"
+            f"agent_reloaded: {agent_reloaded}"
+        )
 
     async def _execute_usage(self, scheduler, _args: list[str]) -> str:
         usage = scheduler.usage_tracker.session_usage if scheduler else None
@@ -2694,82 +2767,11 @@ If verification fails because this skill's instructions are stale, ask before ed
 
     async def _execute_review(self, _scheduler, _args: list[str]) -> str:
         """Review uncommitted code changes for quality, bugs, and security."""
-        from koder_agent.utils.client import llm_completion
+        from koder_agent.harness.review_flow import run_review
 
-        # Get the diff to review
-        if _args and _args[0].startswith("#"):
-            # PR number provided — fetch PR diff via gh
-            pr_num = _args[0].lstrip("#")
-            try:
-                diff_result = subprocess.run(
-                    ["gh", "pr", "diff", pr_num],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if diff_result.returncode != 0:
-                    return f"Failed to fetch PR #{pr_num}: {diff_result.stderr.strip()}"
-                diff = diff_result.stdout
-                context = f"PR #{pr_num}"
-            except FileNotFoundError:
-                return "gh CLI not found. Install it: https://cli.github.com"
-        else:
-            # Review uncommitted changes
-            diff_result = subprocess.run(
-                ["git", "diff", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            diff = diff_result.stdout
-            if not diff:
-                # Try staged only
-                diff_result = subprocess.run(
-                    ["git", "diff", "--cached"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                diff = diff_result.stdout
-            if not diff:
-                return (
-                    "No changes to review. Make some changes or specify a PR number: /review #123"
-                )
-            context = "uncommitted changes"
-
-        # Truncate if too large
-        if len(diff) > 15000:
-            diff = diff[:15000] + "\n\n... (diff truncated, showing first 15K chars)"
-
-        # Use LLM to review
-        prompt = f"""Review the following code changes ({context}).
-
-Focus on:
-1. Bugs and logic errors
-2. Security vulnerabilities
-3. Code quality and readability
-4. Missing error handling
-5. Test coverage gaps
-
-Be specific — reference file names and line numbers. Prioritize issues by severity.
-
-```diff
-{diff}
-```"""
-
-        try:
-            review = await llm_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert code reviewer. Be concise, specific, and actionable.",
-                    },
-                    {"role": "user", "content": prompt},
-                ]
-            )
-            return f"Code Review ({context}):\n\n{review}"
-        except Exception as e:
-            return f"Review failed: {e}"
+        pr = _args[0] if _args and _args[0].startswith("#") else None
+        text, _has_findings = await run_review(pr=pr)
+        return text
 
     async def _execute_advisor(self, _scheduler, _args: list[str]) -> str:
         focus = " ".join(_args).strip() or None
@@ -2962,12 +2964,29 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         dirty = str(status != "Clean working tree.").lower()
         return f"branch: {desired}\naction: {action}\ndirty: {dirty}\nstatus:\n{status}"
 
+    _REWIND_MODES = {"conversation", "code", "both"}
+    _REWIND_USAGE = "Usage: /rewind [number] [conversation|code|both]"
+
     async def _execute_rewind(self, _scheduler, _args: list[str]) -> str:
         self._pending_input_text = None
-        if len(_args) == 1 and _args[0] in {"help", "-h", "--help"}:
-            return "Usage: /rewind [number]"
-        if len(_args) > 1:
-            return "Usage: /rewind [number]"
+
+        # Parse optional [number] and [mode] in any order.
+        selection: int | None = None
+        mode = "conversation"
+        for arg in _args:
+            token = arg.strip().lower()
+            if not token:
+                continue
+            if token in {"help", "-h", "--help"}:
+                return self._rewind_help_text()
+            if token in self._REWIND_MODES:
+                mode = token
+                continue
+            try:
+                selection = int(token)
+            except ValueError:
+                return self._REWIND_USAGE
+
         if _scheduler is None or not hasattr(_scheduler, "session"):
             return "Rewind requires an active session."
         session = _scheduler.session
@@ -2984,13 +3003,20 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         if not prompt_targets:
             return "Nothing to rewind to yet."
 
+        # Map each user prompt (newest first) to a checkpoint counter value.
+        # The Nth-oldest user prompt corresponds to checkpoint N; restoring
+        # code "to prompt N" reverts files edited during prompt N and later.
         newest_first = list(reversed(prompt_targets))
+        total_prompts = len(newest_first)
 
-        if not _args:
+        if selection is None:
             lines = [
                 "Rewind targets",
                 "Choose a previous user prompt to restore the conversation before that point.",
-                "Use /rewind <number> to restore the conversation and place that prompt back into the input.",
+                "Use /rewind <number> [conversation|code|both].",
+                "  conversation - trim history and restore the prompt to input (default)",
+                "  code         - restore tracked files to that point",
+                "  both         - do both",
             ]
             for number, (item_index, prompt_text) in enumerate(newest_first, start=1):
                 trimmed = len(items) - item_index
@@ -3000,26 +3026,71 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                 )
             return "\n".join(lines)
 
-        try:
-            selection = int(_args[0])
-        except ValueError:
-            return "Usage: /rewind [number]"
-
-        if selection < 1 or selection > len(newest_first):
-            return f"Rewind target must be between 1 and {len(newest_first)}."
+        if selection < 1 or selection > total_prompts:
+            return f"Rewind target must be between 1 and {total_prompts}."
 
         selected_index, selected_prompt = newest_first[selection - 1]
-        kept_items = items[:selected_index]
-        removed_count = len(items) - selected_index
-        await session.clear_session()
-        if kept_items:
-            await session.add_items(kept_items)
-        self._pending_input_text = selected_prompt
+        # Checkpoint boundary: prompt #selection is the (total-selection+1)-th
+        # oldest user prompt. Restoring code should undo edits made from that
+        # prompt onward, i.e. revert everything after checkpoint (target-1).
+        target_checkpoint = total_prompts - selection
 
-        return (
-            f"Rewound conversation to prompt {selection}.\n"
-            f"Removed transcript items: {removed_count}\n"
-            f"Restored input: {selected_prompt}"
+        result_lines: list[str] = []
+
+        if mode in {"conversation", "both"}:
+            kept_items = items[:selected_index]
+            removed_count = len(items) - selected_index
+            await session.clear_session()
+            if kept_items:
+                await session.add_items(kept_items)
+            self._pending_input_text = selected_prompt
+            result_lines.append(f"Rewound conversation to prompt {selection}.")
+            result_lines.append(f"Removed transcript items: {removed_count}")
+            result_lines.append(f"Restored input: {selected_prompt}")
+
+        if mode in {"code", "both"}:
+            result_lines.extend(
+                self._restore_code_checkpoint(session, target_checkpoint, selection)
+            )
+
+        return "\n".join(result_lines) if result_lines else self._REWIND_USAGE
+
+    def _restore_code_checkpoint(
+        self, session, target_checkpoint: int, selection: int
+    ) -> list[str]:
+        """Restore tracked files to a checkpoint; return message lines."""
+        from koder_agent.harness import checkpoint as checkpoint_store
+
+        if not checkpoint_store.checkpoints_enabled():
+            return ["Code restore is disabled (file checkpointing turned off)."]
+
+        session_id = getattr(session, "session_id", None)
+        if session_id is None:
+            return ["Code restore requires a session with an id."]
+
+        try:
+            restored = checkpoint_store.restore_to(str(session_id), target_checkpoint)
+        except Exception as exc:  # defensive
+            return [f"Code restore failed: {exc}"]
+
+        if not restored:
+            return [f"No tracked file changes to restore for prompt {selection}."]
+
+        lines = [f"Restored {len(restored)} file(s) to before prompt {selection}:"]
+        for path in restored:
+            lines.append(f"  {path}")
+        return lines
+
+    def _rewind_help_text(self) -> str:
+        return "\n".join(
+            [
+                self._REWIND_USAGE,
+                "Restore the conversation and/or tracked files to a previous prompt.",
+                "Modes:",
+                "  conversation - trim history and restore the prompt to input (default)",
+                "  code         - restore tracked files edited since that prompt",
+                "  both         - conversation + code",
+            ]
         )
 
     async def _execute_exit(self, _scheduler, _args: list[str]) -> str:
@@ -5185,6 +5256,21 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         return {
             name: skill for name, skill in self._available_skills().items() if skill.user_invocable
         }
+
+    def _prompt_commands(self):
+        """Discover standalone ``.koder/commands/*.md`` prompt commands."""
+        from koder_agent.harness.commands.prompt_commands import discover_prompt_commands
+
+        return discover_prompt_commands(cwd=Path.cwd())
+
+    async def _execute_prompt_command(self, prompt_command, scheduler, args: list[str]) -> str:
+        """Render a prompt command body as a prompt and dispatch it."""
+        prompt = prompt_command.render_prompt(args)
+        if not prompt:
+            return f"prompt command '{prompt_command.name}' has an empty body"
+        if scheduler is not None:
+            return await scheduler.handle(prompt, render_output=self.emit_console)
+        return prompt
 
     async def _execute_dynamic_skill(
         self,

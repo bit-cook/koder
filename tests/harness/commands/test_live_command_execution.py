@@ -321,10 +321,11 @@ def test_live_rewind_help_is_available_without_history(tmp_path):
     scheduler = SimpleNamespace(session=session)
     handler = HarnessInteractiveCommandHandler(emit_console=False)
 
-    assert (
-        _run_with_scheduler("/rewind help", handler=handler, scheduler=scheduler)
-        == "Usage: /rewind [number]"
-    )
+    help_output = _run_with_scheduler("/rewind help", handler=handler, scheduler=scheduler)
+    assert help_output.startswith("Usage: /rewind [number] [conversation|code|both]")
+    assert "conversation" in help_output
+    assert "code" in help_output
+    assert "both" in help_output
 
 
 def test_live_rewind_lists_trim_counts_and_reports_removed_items(tmp_path):
@@ -1583,9 +1584,21 @@ def test_compact_command_summarizes_response_items_instead_of_replaying_them(mon
     output = asyncio.run(handler.handle_slash_input("/compact", scheduler=scheduler))
 
     assert output == "compacted, context size 123 -> 123"
-    assert {item.get("role") for item in session.items} == {"user", "assistant"}
-    assert all("type" not in item for item in session.items)
-    assert all("function_call" not in str(item) for item in session.items[1:])
+    # Earlier turns are summarized into a plain-text head (user/assistant only),
+    # but the most recent replayable tool round-trip (function_call + matching
+    # function_call_output) is now preserved verbatim so the model can continue
+    # an in-flight tool sequence after compaction (llm-compact tail
+    # preservation). The unknown-role placeholder is dropped.
+    plain_roles = {item.get("role") for item in session.items if "type" not in item}
+    assert plain_roles == {"user", "assistant"}
+    tool_items = [
+        item
+        for item in session.items
+        if item.get("type") in {"function_call", "function_call_output"}
+    ]
+    assert [item["type"] for item in tool_items] == ["function_call", "function_call_output"]
+    # The preserved pair stays matched by call_id (never a dangling half).
+    assert {item["call_id"] for item in tool_items} == {"call-1"}
     assert scheduler.refreshed_items == session.items
     Converter.items_to_messages(session.items)
 

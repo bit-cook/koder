@@ -143,14 +143,85 @@ def _is_already_compacted_context(messages: list[dict], keep_recent: int) -> boo
     first = _plain_context_message_from_item(messages[0])
     if not first or not first.get("content", "").startswith(_COMPACTED_PREFIX):
         return False
-    plain_items = _recent_plain_context_items(messages, None)
-    if len(plain_items) != len(messages):
+    # A previously-compacted context may carry a trailing run of preserved
+    # replayable tool items (item 4). Treat that tail as already-compacted so a
+    # re-compaction short-circuits instead of needlessly re-summarizing the
+    # plain head each pass. Everything outside the tail must be plain text.
+    tail = _trailing_replayable_tool_items(messages)
+    head = messages[: len(messages) - len(tail)] if tail else messages
+    plain_items = _recent_plain_context_items(head, None)
+    if len(plain_items) != len(head):
         return False
     return len(plain_items) <= keep_recent + 1
 
 
+def _already_compacted_kept_messages(messages: list[dict]) -> list[dict]:
+    """Kept messages for an already-compacted context: plain head + tool tail.
+
+    The plain head is normalized to ``{role, content}`` form; any preserved
+    trailing replayable tool items are kept verbatim so the tail stays
+    replayable and is never dropped.
+    """
+    tail = _trailing_replayable_tool_items(messages)
+    head = messages[: len(messages) - len(tail)] if tail else messages
+    return [message for _, message in _recent_plain_context_items(head, None)] + list(tail)
+
+
 def _summary_message(summary: str) -> dict:
     return {"role": "user", "content": f"{_COMPACTED_PREFIX}\n\n{summary}"}
+
+
+def _is_replayable_tool_item(item: Any) -> bool:
+    """Whether an item is a replayable function_call / function_call_output."""
+    if not is_replayable_session_item(item):
+        return False
+    return isinstance(item, dict) and item.get("type") in {
+        "function_call",
+        "function_call_output",
+    }
+
+
+def _trailing_replayable_tool_items(messages: list[dict]) -> list[dict]:
+    """Return the trailing contiguous run of replayable tool_call/result items.
+
+    The kept tail must stay replayable, so any trailing ``function_call_output``
+    is paired back to its originating ``function_call`` via ``call_id``. We walk
+    backwards while items are replayable function_call / function_call_output
+    items and stop at the first non-tool item, then drop any leading
+    function_call_output whose matching function_call was not captured (so we
+    never emit an orphan output the SDK would reject).
+    """
+    if not messages:
+        return []
+
+    start = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        if _is_replayable_tool_item(messages[index]):
+            start = index
+        else:
+            break
+
+    tail = messages[start:]
+    if not tail:
+        return []
+
+    # Keep pairing intact: only emit a function_call_output when its matching
+    # function_call is present earlier in the captured tail; an unpaired output
+    # is not replayable on its own.
+    seen_call_ids: set = set()
+    trimmed: list[dict] = []
+    for item in tail:
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if item_type == "function_call":
+            if call_id is not None:
+                seen_call_ids.add(call_id)
+            trimmed.append(item)
+        elif item_type == "function_call_output":
+            if call_id is not None and call_id in seen_call_ids:
+                trimmed.append(item)
+            # else: leading orphan output whose call is outside the tail — skip.
+    return trimmed
 
 
 def _item_role(message: dict) -> str:
@@ -192,7 +263,7 @@ def compact_messages(
     """Compact a transcript into a summary plus recent plain text messages."""
     original_count = len(messages)
     if max_messages is not None and _is_already_compacted_context(messages, max_messages):
-        kept_messages = [message for _, message in _recent_plain_context_items(messages, None)]
+        kept_messages = _already_compacted_kept_messages(messages)
         return CompactionResult(
             summary=None,
             kept_messages=kept_messages,
@@ -325,8 +396,13 @@ async def llm_compact_messages(
     """
     Compact messages using LLM-based summarization.
 
-    Generates a structured 9-section summary while preserving only recent plain
-    text messages. Tool calls and tool outputs are summarized, not replayed.
+    Generates a structured 9-section summary while preserving recent plain text
+    messages. Most tool calls and tool outputs are summarized rather than
+    replayed, but the trailing contiguous run of replayable function_call /
+    function_call_output items is ALSO preserved verbatim (appended after the
+    summary and plain-text tail) so the kept context stays replayable and the
+    most recent tool interaction is not reduced to prose. Tool_call/tool_result
+    pairing is preserved via call_id.
 
     Args:
         messages: List of conversation messages to compact
@@ -340,7 +416,7 @@ async def llm_compact_messages(
     if _is_already_compacted_context(messages, keep_recent):
         return CompactionResult(
             summary=None,
-            kept_messages=[message for _, message in _recent_plain_context_items(messages, None)],
+            kept_messages=_already_compacted_kept_messages(messages),
             token_count=estimate_messages_tokens(messages),
             original_count=original_count,
         )
@@ -348,13 +424,32 @@ async def llm_compact_messages(
     kept_pairs = _recent_plain_context_items(messages, keep_recent)
     to_keep = [message for _, message in kept_pairs]
     kept_indices = {index for index, _ in kept_pairs}
-    to_summarize = [message for index, message in enumerate(messages) if index not in kept_indices]
+
+    # Preserve the trailing tool_call/result pair verbatim so it stays
+    # replayable. These items are appended after the plain-text tail and are
+    # excluded from summarization (deduped by identity) to avoid representing
+    # them both verbatim and in prose.
+    tail_tool_items = _trailing_replayable_tool_items(messages)
+    tail_ids = {id(item) for item in tail_tool_items}
+
+    def _keep_tail(base: list[dict]) -> list[dict]:
+        # Append tail items not already present (deduped by identity), keeping
+        # tool_call/tool_result pairing intact.
+        existing = {id(item) for item in base}
+        return base + [item for item in tail_tool_items if id(item) not in existing]
+
+    to_summarize = [
+        message
+        for index, message in enumerate(messages)
+        if index not in kept_indices and id(message) not in tail_ids
+    ]
 
     if not to_summarize:
+        kept_messages = _keep_tail(to_keep)
         return CompactionResult(
             summary=None,
-            kept_messages=to_keep,
-            token_count=estimate_messages_tokens(to_keep),
+            kept_messages=kept_messages,
+            token_count=estimate_messages_tokens(kept_messages),
             original_count=original_count,
         )
 
@@ -385,13 +480,24 @@ async def llm_compact_messages(
             # If no tags, use the whole response
             summary = response.strip()
 
+        kept_messages = _keep_tail(to_keep)
         return CompactionResult(
             summary=summary,
-            kept_messages=to_keep,
-            token_count=estimate_messages_tokens([_summary_message(summary), *to_keep]),
+            kept_messages=kept_messages,
+            token_count=estimate_messages_tokens([_summary_message(summary), *kept_messages]),
             original_count=original_count,
         )
 
     except Exception:
-        # Fall back to deterministic compaction
-        return compact_messages(messages, max_messages=keep_recent)
+        # Fall back to deterministic compaction, still preserving the trailing
+        # replayable tool pair verbatim so it is not lost on the fallback path.
+        fallback = compact_messages(messages, max_messages=keep_recent)
+        kept_messages = _keep_tail(fallback.kept_messages)
+        if kept_messages == fallback.kept_messages:
+            return fallback
+        return CompactionResult(
+            summary=fallback.summary,
+            kept_messages=kept_messages,
+            token_count=estimate_messages_tokens(kept_messages),
+            original_count=fallback.original_count,
+        )
