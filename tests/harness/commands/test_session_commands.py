@@ -17,8 +17,6 @@ from koder_agent.harness.commands.registry import CommandRegistry  # noqa: E402
 
 def test_command_registry_contains_session_domain():
     registry = CommandRegistry.with_defaults()
-    assert {"session", "resume", "rename", "status", "usage", "stats", "effort"} <= set(
+    assert {"session", "resume", "rename", "status", "usage", "effort"} <= set(
         registry.list_names()
     )
-    assert "tag" in registry.list_names()
-    assert "session" in registry.get("tag").help_text.lower()

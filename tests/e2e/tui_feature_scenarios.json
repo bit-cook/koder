@@ -368,7 +368,7 @@
           "send": "/autofix-pr",
           "expect_all": [
             "Usage: /autofix-pr #<PR-number>",
-            "Analyzes a PR and suggests fixes."
+            "Inspects the PR diff size and tells you how to request an automated fix."
           ]
         },
         {
@@ -1564,101 +1564,6 @@
         }
       ]
     },
-    "copy": {
-      "validation_level": "acceptance",
-      "purpose": "Copy seeded assistant responses by default and explicit index through a stub clipboard command while preserving empty and invalid UX.",
-      "env": {
-        "KODER_CLIPBOARD_COMMAND": "python -c \"import pathlib,sys; pathlib.Path('clipboard.txt').write_text(sys.stdin.read(), encoding='utf-8')\""
-      },
-      "acceptance_criteria": [
-        "empty sessions report no assistant responses",
-        "a deterministic session with two assistant responses can be seeded from the TUI",
-        "default /copy selects the latest assistant response",
-        "/copy 2 selects the older assistant response",
-        "the configured clipboard command receives the copied content",
-        "out-of-range and invalid arguments return clear UX"
-      ],
-      "acceptance_artifacts": [
-        "empty-state capture",
-        "seed fixture capture",
-        "copy latest capture",
-        "copy indexed capture",
-        "clipboard.txt",
-        "invalid edge captures"
-      ],
-      "turns": [
-        {
-          "send": "/copy",
-          "expect_all": [
-            "copy: no assistant responses available"
-          ]
-        },
-        {
-          "send": "/session",
-          "expect_all": [
-            "session_id:"
-          ]
-        },
-        {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import asyncio,sqlite3; from pathlib import Path; from koder_agent.core.session import EnhancedSQLiteSession; db=Path.home()/\".koder\"/\"koder.db\"; conn=sqlite3.connect(db); sid=conn.execute(\"select session_id from session_metadata order by updated_at desc limit 1\").fetchone()[0]; s=EnhancedSQLiteSession(sid); asyncio.run(s.add_items([{\"role\":\"user\",\"content\":\"copy request\"},{\"role\":\"assistant\",\"content\":\"first copy answer\"},{\"role\":\"assistant\",\"content\":\"latest copy answer\"}])); Path(\"copy-seed.txt\").write_text(\"seeded copy session\\n\", encoding=\"utf-8\"); print(\"copy-fixture\", sid)'",
-          "expect_all": [
-            "copy-fixture"
-          ]
-        },
-        {
-          "send": "/copy",
-          "expect_all": [
-            "copy: copied to clipboard",
-            "copy_index: 1",
-            "available_responses: 2",
-            "clipboard: KODER_CLIPBOARD_COMMAND",
-            "latest copy answer"
-          ]
-        },
-        {
-          "send": "/copy 2",
-          "expect_all": [
-            "copy: copied to clipboard",
-            "copy_index: 2",
-            "available_responses: 2",
-            "first copy answer"
-          ]
-        },
-        {
-          "send": "!cat clipboard.txt",
-          "expect_all": [
-            "first copy answer"
-          ]
-        },
-        {
-          "send": "/copy 3",
-          "expect_all": [
-            "copy: requested response 3 is unavailable",
-            "available_responses: 2"
-          ]
-        },
-        {
-          "send": "/copy nope",
-          "expect_all": [
-            "Usage: /copy [N]"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/copy-seed.txt",
-            "seeded copy session"
-          ]
-        },
-        {
-          "file_contains": [
-            "$REPO/clipboard.txt",
-            "first copy answer"
-          ]
-        }
-      ]
-    },
     "cost": {
       "validation_level": "acceptance",
       "purpose": "Display zero, known-model, and unknown-model session cost data from durable usage snapshots.",
@@ -1769,7 +1674,8 @@
         "/ctx_viz reports exact seeded user/assistant message count",
         "/ctx_viz reports seeded session context files",
         "/ctx_viz renders recent transcript lines",
-        "/context agrees that conversation, files, and instructions are present"
+        "/context agrees that conversation, files, and instructions are present",
+        "estimated token usage is broken down by category with proportion bars"
       ],
       "acceptance_artifacts": [
         "fresh /ctx_viz capture",
@@ -1805,7 +1711,10 @@
             "- docs/runtime-notes.md",
             "Recent transcript:",
             "user: ctx viz user prompt",
-            "assistant: ctx viz assistant answer"
+            "assistant: ctx viz assistant answer",
+            "Context usage (estimated):",
+            "project context:",
+            "free space:"
           ]
         },
         {
@@ -2898,185 +2807,6 @@
         }
       ]
     },
-    "heapdump": {
-      "validation_level": "acceptance",
-      "purpose": "Write a local Python heap diagnostic JSON file, inspect its required fields and privacy boundary, and continue using the same TUI session.",
-      "env": {
-        "KODER_HEAPDUMP_MARKER": "heapdump-json-ok",
-        "KODER_HEAPDUMP_SECRET": "heapdump-secret-value"
-      },
-      "acceptance_criteria": [
-        "/heapdump writes a diagnostic file under the scenario HOME",
-        "the command response includes path, pid, object count, top type count, and tracemalloc status",
-        "the generated JSON can be parsed and contains cwd, gc, top_types, and tracemalloc sections",
-        "diagnostic output does not persist unrelated secret environment values",
-        "the same TUI session remains usable after heapdump generation"
-      ],
-      "acceptance_artifacts": [
-        "/heapdump command capture",
-        "heapdump JSON parser shell capture",
-        "/doctor follow-up capture",
-        "generated ~/.koder/diagnostics/heapdump-*.json"
-      ],
-      "turns": [
-        {
-          "send": "/heapdump",
-          "expect_all": [
-            "heapdump: written",
-            "path:",
-            "pid:",
-            "objects:",
-            "top_types:",
-            "tracemalloc_top_files:"
-          ],
-          "timeout": 40
-        },
-        {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import glob,json,os,pathlib; paths=sorted(glob.glob(os.path.expanduser(\"~/.koder/diagnostics/heapdump-*.json\"))); assert paths, \"missing heapdump\"; data=json.loads(pathlib.Path(paths[-1]).read_text()); print(\"heapdump-files\", len(paths)); print(\"heapdump-cwd\", pathlib.Path(data[\"cwd\"]).name); print(\"heapdump-top-types\", len(data[\"top_types\"])); print(\"heapdump-tracing\", data[\"tracemalloc\"][\"tracing\"]); print(os.environ[\"KODER_HEAPDUMP_MARKER\"])'",
-          "expect_all": [
-            "heapdump-files",
-            "heapdump-cwd repo",
-            "heapdump-top-types",
-            "heapdump-tracing True",
-            "heapdump-json-ok"
-          ],
-          "expect_not": [
-            "heapdump-secret-value"
-          ]
-        },
-        {
-          "send": "/doctor",
-          "expect_all": [
-            "cwd:",
-            "python:",
-            "ripgrep_working:"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "path_glob_exists": "$HOME/.koder/diagnostics/heapdump-*.json"
-        },
-        {
-          "file_glob_contains": [
-            "$HOME/.koder/diagnostics/heapdump-*.json",
-            [
-              "\"cwd\"",
-              "\"gc\"",
-              "\"top_types\"",
-              "\"tracemalloc\""
-            ]
-          ]
-        },
-        {
-          "file_glob_not_contains": [
-            "$HOME/.koder/diagnostics/heapdump-*.json",
-            "heapdump-secret-value"
-          ]
-        }
-      ]
-    },
-    "ide": {
-      "validation_level": "acceptance",
-      "purpose": "Detect a stubbed local IDE launcher, validate status and edge UX, route open commands to the stub, and assert no real app launch is needed.",
-      "env": {
-        "PATH": "$REPO/bin:$PATH",
-        "TERM_PROGRAM": "ScenarioTerm",
-        "VSCODE_PID": "12345",
-        "KODER_IDE_VERIFY_MARKER": "ide-open-log-ok"
-      },
-      "acceptance_criteria": [
-        "a stub code launcher is created inside the scenario repo and placed first on PATH",
-        "/ide status detects the stubbed Visual Studio Code launcher and terminal hints",
-        "/ide open without a selector shows launcher-selection guidance",
-        "unknown launchers are rejected while listing available launchers",
-        "invalid subcommands return usage",
-        "opening vscode routes to the stub launcher with the requested target path",
-        "the stub log proves the command args without opening a real IDE"
-      ],
-      "acceptance_artifacts": [
-        "launcher fixture shell capture",
-        "status capture",
-        "selector and unknown-launcher edge captures",
-        "open command capture",
-        "stub ide-open.log",
-        "stub bin/code launcher"
-      ],
-      "turns": [
-        {
-          "send": "!mkdir -p bin ide-target && printf '%s\\n' '#!/bin/sh' 'printf \"stub-code:%s\\n\" \"$@\" > ide-open.log' > bin/code && chmod +x bin/code && echo ide-fixture",
-          "expect_all": [
-            "ide-fixture"
-          ]
-        },
-        {
-          "send": "/ide",
-          "expect_all": [
-            "ide:",
-            "integration_scope: local launcher/status",
-            "- vscode: Visual Studio Code (cli, code)",
-            "terminal_hints:",
-            "- TERM_PROGRAM: ScenarioTerm",
-            "- VSCODE_PID: 12345",
-            "open_command: /ide open <launcher> [path]"
-          ]
-        },
-        {
-          "send": "/ide open",
-          "expect_all": [
-            "ide: select a launcher",
-            "launchers:",
-            "- vscode: Visual Studio Code (cli, code)",
-            "usage: /ide open <launcher> [path]"
-          ]
-        },
-        {
-          "send": "/ide open __missing_launcher__ ide-target",
-          "expect_all": [
-            "ide: unknown launcher: __missing_launcher__",
-            "- vscode: Visual Studio Code (cli, code)"
-          ]
-        },
-        {
-          "send": "/ide nope",
-          "expect_all": [
-            "Usage: /ide [status|open <launcher> [path]]"
-          ]
-        },
-        {
-          "send": "/ide open vscode ide-target",
-          "expect_all": [
-            "ide: open",
-            "status: launched",
-            "launcher: vscode",
-            "name: Visual Studio Code",
-            "target:",
-            "ide-target",
-            "command:"
-          ]
-        },
-        {
-          "send": "!grep -F 'stub-code:' ide-open.log >/dev/null && grep -F 'ide-target' ide-open.log >/dev/null && test -d ide-target && echo \"$KODER_IDE_VERIFY_MARKER\"",
-          "expect_all": [
-            "ide-open-log-ok"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/ide-open.log",
-            "ide-target"
-          ]
-        },
-        {
-          "file_contains": [
-            "$REPO/bin/code",
-            "stub-code"
-          ]
-        }
-      ]
-    },
     "hooks": {
       "validation_level": "acceptance",
       "purpose": "List project-configured hook events, matchers, and commands from the real TUI.",
@@ -3149,7 +2879,7 @@
         {
           "send": "/init",
           "expect_all": [
-            "AGENTS.md already exists."
+            "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
           ]
         },
         {
@@ -3171,7 +2901,8 @@
             "path:",
             "commands_detected: 0",
             "Found 1 magic doc(s):",
-            "docs/runtime-notes.md: Runtime Notes"
+            "docs/runtime-notes.md: Runtime Notes",
+            "tip: run /init-explore"
           ]
         },
         {
@@ -3187,7 +2918,7 @@
         {
           "send": "/init",
           "expect_all": [
-            "AGENTS.md already exists."
+            "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
           ]
         }
       ],
@@ -3305,7 +3036,8 @@
         "a deterministic session transcript and context-file tool calls can be seeded from the TUI",
         "seeded output reports exact transcript item, message, role, tool-call, tool-result, and context-file counts",
         "seeded output lists the exact context files",
-        "debug-tool-call agrees with the seeded tool-call record"
+        "debug-tool-call agrees with the seeded tool-call record",
+        "per-tool usage counts are listed"
       ],
       "acceptance_artifacts": [
         "fresh insights capture",
@@ -3355,7 +3087,9 @@
             "Requests: 0",
             "Input tokens: 0",
             "Output tokens: 0",
-            "Total cost: $0.0000"
+            "Total cost: $0.0000",
+            "Tool usage:",
+            "- read_file: 1"
           ]
         },
         {
@@ -3373,220 +3107,6 @@
             "$REPO/insights-seed.txt",
             "seeded insights session"
           ]
-        }
-      ]
-    },
-    "install": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect local Koder development installation status, command paths, usage guidance, and backing project files.",
-      "acceptance_criteria": [
-        "/install reports runtime version, development installation type, invoked binary, Python path, uv path, koder path, project root, pyproject, and config path",
-        "/install lists the current local development commands",
-        "a shell proof verifies the reported project root has pyproject.toml and uv is executable",
-        "extra arguments return usage guidance instead of being silently ignored",
-        "/doctor reports the same development installation classification and invoked binary surface"
-      ],
-      "acceptance_artifacts": [
-        "/install capture",
-        "shell proof capture",
-        "invalid-argument capture",
-        "/doctor cross-check capture",
-        "install-proof.txt marker file"
-      ],
-      "turns": [
-        {
-          "send": "/install",
-          "expect_all": [
-            "install:",
-            "runtime_version:",
-            "installation_type: development",
-            "invoked_binary:",
-            "python:",
-            "uv:",
-            "koder_on_path:",
-            "project_root:",
-            "pyproject:",
-            "config_path:",
-            "local_commands:",
-            "- uv sync",
-            "- uv run koder",
-            "- uv run pytest"
-          ]
-        },
-        {
-          "send": "!test -f \"$PYTHONPATH/pyproject.toml\" && test -x \"$(command -v uv)\" && printf 'install-proof-ok\\n' > install-proof.txt && echo install-shell-proof",
-          "expect_all": [
-            "install-shell-proof"
-          ]
-        },
-        {
-          "send": "/install unexpected",
-          "expect_all": [
-            "Usage: /install"
-          ]
-        },
-        {
-          "send": "/doctor",
-          "expect_all": [
-            "installation_type: development",
-            "invoked_binary:",
-            "python:",
-            "config_path:"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/install-proof.txt",
-            "install-proof-ok"
-          ]
-        }
-      ]
-    },
-    "install-github-app": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect, plan, and apply Koder GitHub Actions setup through a deterministic gh fixture without pushing from git.",
-      "env": {
-        "PATH": "$REPO/bin:$PATH",
-        "KODER_API_KEY": "scenario-secret-token"
-      },
-      "acceptance_criteria": [
-        "a stub gh command is placed first on PATH and used by status, plan, and apply",
-        "status detects the current GitHub repository, gh version, auth scopes, and missing local workflows",
-        "plan reports selected workflows, secret env state, model/base-url variables, branch, no mutation, and a complete apply command",
-        "apply creates a setup branch through gh api, writes both workflow payloads through gh api PUT, sets the Koder secret via stdin, sets requested repository variables, and reports the compare URL",
-        "the fake gh log and captured remote workflow payloads prove no secret value was logged and no git push path was used"
-      ],
-      "acceptance_artifacts": [
-        "fake gh fixture setup capture",
-        "status capture",
-        "plan capture",
-        "apply capture",
-        "workflow payload proof capture",
-        "fake gh invocation log",
-        "captured remote workflow files"
-      ],
-      "turns": [
-        {
-          "send": "!mkdir -p bin \"$HOME/.koder\" && cp \"$PYTHONPATH/tests/fixtures/fake_gh_install_github_app.sh\" bin/gh && chmod +x bin/gh && git remote add origin https://github.com/acme/demo.git && { marker=\"install-github-app-gh-\"; marker=\"${marker}fixture\"; echo \"$marker\"; }",
-          "expect_all": [
-            "install-github-app-gh-fixture"
-          ]
-        },
-        {
-          "send": "/install-github-app",
-          "expect_all": [
-            "github_actions:",
-            "integration_scope: local gh CLI + GitHub Actions workflow",
-            "repo: acme/demo",
-            "gh: gh version 2.99.0 (scenario)",
-            "auth: ok",
-            "local_workflows:",
-            "- .github/workflows/koder.yml: missing",
-            "- .github/workflows/koder-review.yml: missing"
-          ]
-        },
-        {
-          "send": "/install-github-app plan acme/demo --secret-env KODER_API_KEY --model gpt-4.1 --base-url https://scenario-base.invalid/v1 --branch setup/koder",
-          "expect_all": [
-            "github_actions: plan",
-            "repo: acme/demo",
-            "auth: ok",
-            "workflows:",
-            "- assistant: .github/workflows/koder.yml",
-            "- review: .github/workflows/koder-review.yml",
-            "secret_env: KODER_API_KEY",
-            "secret_env_status: configured",
-            "model_variable: gpt-4.1",
-            "base_url_variable: https://scenario-base.invalid/v1",
-            "branch: setup/koder",
-            "mutation: none",
-            "apply_command: /install-github-app apply acme/demo",
-            "--secret-env KODER_API_KEY",
-            "--model gpt-4.1",
-            "--base-url https://scenario-base.invalid/v1",
-            "--branch",
-            "setup/koder"
-          ]
-        },
-        {
-          "send": "/install-github-app apply acme/demo --secret-env KODER_API_KEY --model gpt-4.1 --base-url https://scenario-base.invalid/v1 --branch setup/koder",
-          "expect_all": [
-            "github_actions: applied",
-            "repo: acme/demo",
-            "branch: setup/koder",
-            "default_branch: main",
-            "- .github/workflows/koder.yml: written",
-            "- .github/workflows/koder-review.yml: written",
-            "secret: KODER_API_KEY",
-            "variables:",
-            "- KODER_MODEL: set",
-            "- KODER_BASE_URL: set",
-            "compare_url:",
-            "https://github.com/acme/demo/compare/main...setup/koder",
-            "opened: no",
-            "next_step: open compare_url and create the pull request"
-          ]
-        },
-        {
-          "send": "!test -f \"$HOME/.koder/remote-workflows/.github/workflows/koder.yml\" && grep -F 'name: Koder Assistant' \"$HOME/.koder/remote-workflows/.github/workflows/koder.yml\" && grep -F 'KODER_API_KEY: ${{ secrets.KODER_API_KEY }}' \"$HOME/.koder/remote-workflows/.github/workflows/koder.yml\" && test -f \"$HOME/.koder/remote-workflows/.github/workflows/koder-review.yml\" && grep -F 'name: Koder Pull Request Review' \"$HOME/.koder/remote-workflows/.github/workflows/koder-review.yml\" && grep -F 'secret set KODER_API_KEY --repo acme/demo stdin-bytes=21 stdin-matches-env=yes' \"$HOME/.koder/install-github-app-gh.log\" && ! grep -F 'scenario-secret-token' \"$HOME/.koder/install-github-app-gh.log\" && ! grep -F 'git push' \"$HOME/.koder/install-github-app-gh.log\" && test ! -e .git/refs/remotes/origin/setup/koder && { marker=\"install-github-app-\"; marker=\"${marker}apply-proof\"; echo \"$marker\"; }",
-          "expect_all": [
-            "name: Koder Assistant",
-            "KODER_API_KEY: ${{ secrets.KODER_API_KEY }}",
-            "name: Koder Pull Request Review",
-            "secret set KODER_API_KEY --repo acme/demo stdin-bytes=21 stdin-matches-env=yes",
-            "install-github-app-apply-proof"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$HOME/.koder/install-github-app-gh.log",
-            [
-              "auth status -h github.com",
-              "api GET repos/acme/demo --jq .permissions.admin",
-              "api POST repos/acme/demo/git/refs ref=refs/heads/setup/koder sha=abc123",
-              "api PUT repos/acme/demo/contents/.github/workflows/koder.yml branch=setup/koder",
-              "api PUT repos/acme/demo/contents/.github/workflows/koder-review.yml branch=setup/koder",
-              "secret set KODER_API_KEY --repo acme/demo stdin-bytes=21 stdin-matches-env=yes",
-              "variable set KODER_MODEL --body gpt-4.1 --repo acme/demo",
-              "variable set KODER_BASE_URL --body https://scenario-base.invalid/v1 --repo acme/demo"
-            ]
-          ]
-        },
-        {
-          "file_not_contains": [
-            "$HOME/.koder/install-github-app-gh.log",
-            [
-              "scenario-secret-token",
-              "git push"
-            ]
-          ]
-        },
-        {
-          "file_contains": [
-            "$HOME/.koder/remote-workflows/.github/workflows/koder.yml",
-            [
-              "name: Koder Assistant",
-              "workflow_dispatch:",
-              "uvx --from koder koder --print"
-            ]
-          ]
-        },
-        {
-          "file_contains": [
-            "$HOME/.koder/remote-workflows/.github/workflows/koder-review.yml",
-            [
-              "name: Koder Pull Request Review",
-              "pull_request:",
-              "Review this pull request diff"
-            ]
-          ]
-        },
-        {
-          "path_not_exists": "$REPO/.git/refs/remotes/origin/setup/koder"
         }
       ]
     },
@@ -3858,79 +3378,6 @@
             "$REPO/docs/runtime-notes.md",
             "# MAGIC DOC:"
           ]
-        }
-      ]
-    },
-    "managed-settings": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect managed policy file details and prove sandbox policy lock reaches runtime sandbox status.",
-      "acceptance_criteria": [
-        "managed settings fixture can be created under Koder home",
-        "/managed-settings reports policy path, validity, checksum, and source",
-        "hook event and group counts are visible",
-        "sandbox lock and managed sandbox keys are visible",
-        "/sandbox reflects the managed sandbox values",
-        "lower-priority sandbox edits are rejected while managed policy is locked",
-        "backing policy file remains available"
-      ],
-      "acceptance_artifacts": [
-        "managed settings fixture capture",
-        "managed-settings command capture",
-        "sandbox command capture",
-        "locked sandbox capture",
-        "managed-settings policy file"
-      ],
-      "turns": [
-        {
-          "send": "!mkdir -p \"$HOME/.koder\" && printf '%s\\n' '{\"disableAllHooks\":false,\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"echo managed\"}]}]},\"sandbox\":{\"enabled\":true,\"backend\":\"unix-local\"}}' > \"$HOME/.koder/managed-settings.json\" && echo managed-settings-fixture",
-          "expect_all": [
-            "managed-settings-fixture"
-          ]
-        },
-        {
-          "send": "/managed-settings",
-          "expect_all": [
-            "managed_settings:",
-            "exists: true",
-            "valid: true",
-            "checksum: sha256:",
-            "hooks_events: 1",
-            "hooks_groups: 1",
-            "sandbox_policy_locked: true",
-            "sandbox_keys: backend, enabled",
-            "source: local managed policy file"
-          ]
-        },
-        {
-          "send": "/sandbox",
-          "expect_all": [
-            "sandbox_enabled: true",
-            "backend: unix-local",
-            "policy_locked: true"
-          ]
-        },
-        {
-          "send": "/sandbox enable docker",
-          "expect_all": [
-            "sandbox: settings locked by managed policy",
-            "sandbox_enabled: true",
-            "policy_locked: true"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$HOME/.koder/managed-settings.json",
-            [
-              "disableAllHooks",
-              "echo managed",
-              "unix-local"
-            ]
-          ]
-        },
-        {
-          "path_not_exists": "$REPO/.koder/settings.local.json"
         }
       ]
     },
@@ -4488,89 +3935,6 @@
         }
       ]
     },
-    "passes": {
-      "validation_level": "acceptance",
-      "purpose": "Show verification status from real pytest cache, including no-cache, passing, and failing test states.",
-      "acceptance_criteria": [
-        "/passes reports when no pytest cache is available",
-        "a real passing pytest run writes cache data that /passes reports as passed",
-        "/passes shows collected test count and zero failed tests after a passing run",
-        "a real failing pytest run updates lastfailed data",
-        "/passes reports failing status, failed count, and the failing node id",
-        "the pytest cache and test file remain available as durable evidence"
-      ],
-      "acceptance_artifacts": [
-        "no-cache /passes capture",
-        "passing pytest shell capture",
-        "passed /passes capture",
-        "failing pytest shell capture",
-        "failing /passes capture",
-        ".pytest_cache lastfailed file",
-        "test_passes_fixture.py"
-      ],
-      "turns": [
-        {
-          "send": "/passes",
-          "expect_all": [
-            "Verification Status:",
-            "pytest_cache: unavailable",
-            "Run tests with: uv run pytest"
-          ]
-        },
-        {
-          "send": "!mkdir -p tests && printf '%s\n' 'def test_passes_fixture():' '    assert True' > tests/test_passes_fixture.py && uv --project \"$PYTHONPATH\" run --no-sync pytest tests/test_passes_fixture.py -q && marker=\"passes-\"; marker=\"${marker}pytest-ok\"; echo \"$marker\"",
-          "expect_all": [
-            "1 passed",
-            "passes-pytest-ok"
-          ],
-          "timeout": 30
-        },
-        {
-          "send": "/passes",
-          "expect_all": [
-            "Verification Status:",
-            "pytest_cache:",
-            "collected_tests: 1",
-            "status: last run passed",
-            "failed_tests: 0",
-            "Run tests with: uv run pytest"
-          ]
-        },
-        {
-          "send": "!printf '%s\n' 'def test_passes_fixture():' '    assert False' > tests/test_passes_fixture.py && uv --project \"$PYTHONPATH\" run --no-sync pytest tests/test_passes_fixture.py -q || true; marker=\"passes-\"; marker=\"${marker}pytest-failed\"; echo \"$marker\"",
-          "expect_all": [
-            "1 failed",
-            "passes-pytest-failed"
-          ],
-          "timeout": 30
-        },
-        {
-          "send": "/passes",
-          "expect_all": [
-            "Verification Status:",
-            "pytest_cache:",
-            "status: failing",
-            "failed_tests: 1",
-            "tests/test_passes_fixture.py::test_passes_fixture",
-            "Run tests with: uv run pytest"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/.pytest_cache/v/cache/lastfailed",
-            "tests/test_passes_fixture.py::test_passes_fixture"
-          ]
-        },
-        {
-          "file_contains": [
-            "$REPO/tests/test_passes_fixture.py",
-            "assert False"
-          ]
-        }
-      ]
-    },
     "peers": {
       "validation_level": "acceptance",
       "purpose": "Create and inspect an agent team, consume mailbox work, record history, and complete a persisted team task.",
@@ -5094,160 +4458,6 @@
         }
       ]
     },
-    "privacy-settings": {
-      "validation_level": "acceptance",
-      "purpose": "Show local privacy paths, secret redaction policy, and local memory storage behavior.",
-      "env": {
-        "OPENAI_API_KEY": "privacy-secret-value"
-      },
-      "acceptance_criteria": [
-        "privacy settings render local data-storage paths",
-        "privacy settings identify session-history and memory locations",
-        "privacy settings describe external-service scope and secret handling",
-        "diagnostic env output reports secret presence without leaking the value",
-        "a local memory write lands under project .koder/memory",
-        "memory listing can read the local marker"
-      ],
-      "acceptance_artifacts": [
-        "privacy settings capture",
-        "env redaction capture",
-        "remember command capture",
-        "memory listing capture",
-        "project memory files"
-      ],
-      "turns": [
-        {
-          "send": "/privacy-settings",
-          "expect_all": [
-            "Privacy Settings:",
-            "privacy_settings:",
-            "telemetry: disabled",
-            "data_storage:",
-            "session_history:",
-            "project_memory:",
-            "user_memory:",
-            "external_services: configured LLM API only",
-            "secret_handling:"
-          ],
-          "expect_not": [
-            "privacy-secret-value"
-          ]
-        },
-        {
-          "send": "/env",
-          "expect_all": [
-            "OPENAI_API_KEY: set"
-          ],
-          "expect_not": [
-            "privacy-secret-value"
-          ]
-        },
-        {
-          "send": "/remember privacy local marker",
-          "expect_all": [
-            "remember: saved",
-            "path: .koder/memory/",
-            "privacy local marker"
-          ]
-        },
-        {
-          "send": "/memory",
-          "expect_all": [
-            "privacy local marker"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_glob_contains": [
-            "$REPO/.koder/memory/*.md",
-            "privacy local marker"
-          ]
-        },
-        {
-          "file_glob_not_contains": [
-            "$REPO/.koder/memory/*.md",
-            "privacy-secret-value"
-          ]
-        }
-      ]
-    },
-    "rate-limit-options": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect provider limit guidance, retryable error categories, live model/provider state, and zero-usage counter agreement.",
-      "acceptance_criteria": [
-        "initial output reports the active default provider/model",
-        "usage counters start at zero before provider calls",
-        "retryable error categories and local remediation options are visible",
-        "after /model changes the active provider/model, rate-limit-options reflects the new state",
-        "/usage agrees with the zero request/token/cost counters"
-      ],
-      "acceptance_artifacts": [
-        "initial rate-limit-options capture",
-        "model switch capture",
-        "updated rate-limit-options capture",
-        "usage cross-check capture"
-      ],
-      "turns": [
-        {
-          "send": "/rate-limit-options",
-          "expect_all": [
-            "rate-limit-options:",
-            "provider: openai",
-            "model: gpt-4.1",
-            "requests: 0",
-            "input_tokens: 0",
-            "output_tokens: 0",
-            "retryable_errors: rate_limit, overloaded, timeout, connection, server",
-            "local_options:",
-            "/usage to inspect current counters",
-            "/compact to reduce context before retrying",
-            "/model <model> to switch model labels for the session",
-            "/effort <low|medium|high|auto> to tune reasoning cost",
-            "KODER_BASE_URL can route to a different compatible endpoint"
-          ]
-        },
-        {
-          "send": "/model anthropic/claude-sonnet-4-6",
-          "expect_all": [
-            "model: claude-sonnet-4-6",
-            "provider: anthropic",
-            "agent_reloaded:"
-          ]
-        },
-        {
-          "send": "/rate-limit-options",
-          "expect_all": [
-            "rate-limit-options:",
-            "provider: anthropic",
-            "model: claude-sonnet-4-6",
-            "requests: 0",
-            "retryable_errors: rate_limit, overloaded, timeout, connection, server"
-          ]
-        },
-        {
-          "send": "/usage",
-          "expect_all": [
-            "requests: 0",
-            "input_tokens: 0",
-            "output_tokens: 0",
-            "cost: 0.0000",
-            "rate_limit_status: unknown"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$HOME/.koder/config.yaml",
-            [
-              "name: claude-sonnet-4-6",
-              "provider: anthropic"
-            ]
-          ]
-        }
-      ]
-    },
     "release-notes": {
       "validation_level": "acceptance",
       "purpose": "Seed cached changelog state before launch, render filtered release notes, persist last-seen version, and cross-check runtime version.",
@@ -5676,7 +4886,8 @@
         "help, non-numeric selection, and out-of-range selection return stable guidance",
         "selecting a target rewinds stored history and restores that prompt into the editable input",
         "typing after rewind appends to the restored input rather than starting from blank",
-        "database proof confirms the session was trimmed before the selected prompt"
+        "database proof confirms the session was trimmed before the selected prompt",
+        "listing shows how many newer transcript items each target removes"
       ],
       "acceptance_artifacts": [
         "session seed shell capture",
@@ -5697,8 +4908,8 @@
           "send": "/rewind",
           "expect_all": [
             "Rewind targets",
-            "1. second prompt",
-            "2. first prompt",
+            "1. second prompt (removes 2 newer transcript items)",
+            "2. first prompt (removes 4 newer transcript items)",
             "Use /rewind <number> to restore the conversation and place that prompt back into the input."
           ]
         },
@@ -5724,6 +4935,7 @@
           "send": "/rewind 1",
           "expect_all": [
             "Rewound conversation to prompt 1.",
+            "Removed transcript items: 2",
             "Restored input: second prompt"
           ]
         },
@@ -6128,17 +5340,16 @@
     },
     "session": {
       "validation_level": "acceptance",
-      "purpose": "Inspect active session identifiers and metadata before and after title/tag mutations.",
+      "purpose": "Inspect active session identifiers and metadata before and after a title rename.",
       "acceptance_criteria": [
         "initial session metadata renders session id and display name",
         "renaming the session updates title metadata",
-        "tagging the session updates tag metadata",
-        "/session shows title and tag together",
-        "SQLite session metadata persists both fields"
+        "/session shows the updated title",
+        "SQLite session metadata persists the title"
       ],
       "acceptance_artifacts": [
         "session command captures",
-        "rename/tag command captures",
+        "rename command captures",
         "SQLite session metadata row"
       ],
       "turns": [
@@ -6157,17 +5368,10 @@
           ]
         },
         {
-          "send": "/tag session-tag",
-          "expect_all": [
-            "Tag added: session-tag"
-          ]
-        },
-        {
           "send": "/session",
           "expect_all": [
             "display_name: session-check",
-            "title: session-check",
-            "tag: session-tag"
+            "title: session-check"
           ]
         }
       ],
@@ -6175,77 +5379,9 @@
         {
           "sqlite_contains": [
             "$HOME/.koder/koder.db",
-            "select title, tag from session_metadata where title = 'session-check'",
+            "select title from session_metadata where title = 'session-check'",
             [
-              "session-check",
-              "session-tag"
-            ]
-          ]
-        }
-      ]
-    },
-    "share": {
-      "validation_level": "acceptance",
-      "purpose": "Render share metadata after title, tag, and color changes without exporting transcript content.",
-      "acceptance_criteria": [
-        "renaming the session changes share display metadata",
-        "tagging the session appears in share metadata",
-        "session color appears in share metadata",
-        "share output includes stable session id and display name fields",
-        "share metadata is backed by SQLite session metadata"
-      ],
-      "acceptance_artifacts": [
-        "rename/tag/color command captures",
-        "share command capture",
-        "SQLite session metadata row"
-      ],
-      "turns": [
-        {
-          "send": "/rename share-title",
-          "expect_all": [
-            "Session renamed to: share-title"
-          ]
-        },
-        {
-          "send": "/tag share-tag",
-          "expect_all": [
-            "Tag added: share-tag"
-          ]
-        },
-        {
-          "send": "/color blue",
-          "expect_all": [
-            "Session color set to: blue"
-          ]
-        },
-        {
-          "send": "/share",
-          "expect_all": [
-            "share session_id:",
-            "display_name: share-title",
-            "title: share-title",
-            "tag: share-tag",
-            "color: blue"
-          ]
-        },
-        {
-          "send": "/session",
-          "expect_all": [
-            "title: share-title",
-            "tag: share-tag",
-            "color: blue"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select title, tag, color from session_metadata where title = 'share-title'",
-            [
-              "share-title",
-              "share-tag",
-              "blue"
+              "session-check"
             ]
           ]
         }
@@ -6374,110 +5510,6 @@
             [
               "\"demo-plugin\"",
               "\"enabled\": true"
-            ]
-          ]
-        }
-      ]
-    },
-    "stats": {
-      "validation_level": "acceptance",
-      "purpose": "Show local database and current-session statistics with exact fresh-DB, seeded-history, and zero-usage edges.",
-      "acceptance_criteria": [
-        "fresh scenario database reports only the active session metadata row and zero messages",
-        "current-session usage counters are rendered as zero before provider calls",
-        "deterministic seeded history increases session and message counts through the real TUI shell setup path",
-        "historical session dates drive first-session and peak-day fields",
-        "/usage agrees with the zero-cost no-provider state"
-      ],
-      "acceptance_artifacts": [
-        "fresh /stats command capture",
-        "stats fixture shell command capture",
-        "seeded /stats command capture",
-        "SQLite session and message row assertions",
-        "stats seed marker file"
-      ],
-      "turns": [
-        {
-          "send": "/stats",
-          "expect_all": [
-            "## Stats",
-            "Sessions: 1",
-            "Messages: 0",
-            "Active days: 1",
-            "### Current session",
-            "requests: 0",
-            "last_input_tokens: 0",
-            "last_output_tokens: 0",
-            "context_tokens: 0"
-          ]
-        },
-        {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python \"$PYTHONPATH/scripts/seed_tmux_stats_fixture.py\"",
-          "expect_all": [
-            "stats-fixture: sessions=2 messages=4",
-            "stats-fixture: marker="
-          ]
-        },
-        {
-          "send": "/stats",
-          "expect_all": [
-            "## Stats",
-            "Sessions: 3",
-            "Messages: 4",
-            "Active days: 3",
-            "First session: 1999-01-02",
-            "Peak day: 1999-01-02",
-            "### Current session",
-            "requests: 0",
-            "last_input_tokens: 0",
-            "last_output_tokens: 0",
-            "context_tokens: 0"
-          ],
-          "expect_regex": [
-            "Last session: [0-9]{4}-[0-9]{2}-[0-9]{2}"
-          ]
-        },
-        {
-          "send": "/usage",
-          "expect_all": [
-            "requests: 0",
-            "input_tokens: 0",
-            "output_tokens: 0",
-            "cost: 0.0000",
-            "rate_limit_status: unknown"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/stats-seed.txt",
-            "seeded stats session rows"
-          ]
-        },
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select count(*) from session_metadata",
-            "3"
-          ]
-        },
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select count(*) from agent_messages",
-            "4"
-          ]
-        },
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select session_id, created_at, updated_at from session_metadata where session_id like 'stats-seed-%' order by session_id",
-            [
-              "stats-seed-a",
-              "1999-01-02 10:00:00",
-              "stats-seed-b",
-              "1999-01-03 11:00:00"
             ]
           ]
         }
@@ -6760,65 +5792,6 @@
         }
       ]
     },
-    "tag": {
-      "validation_level": "acceptance",
-      "purpose": "Add, display, remove, and persistently clear a session tag.",
-      "acceptance_criteria": [
-        "missing tag argument returns usage guidance",
-        "adding a tag updates the active session",
-        "/session displays the active tag",
-        "running the same tag again removes it",
-        "the session metadata database stores the final cleared tag state"
-      ],
-      "acceptance_artifacts": [
-        "tag command captures",
-        "session command captures",
-        "SQLite session metadata row"
-      ],
-      "turns": [
-        {
-          "send": "/tag",
-          "expect_all": [
-            "Usage: /tag <label>"
-          ]
-        },
-        {
-          "send": "/tag scenario-tag",
-          "expect_all": [
-            "Tag added: scenario-tag"
-          ]
-        },
-        {
-          "send": "/session",
-          "expect_all": [
-            "session_id:",
-            "tag: scenario-tag"
-          ]
-        },
-        {
-          "send": "/tag scenario-tag",
-          "expect_all": [
-            "Tag removed: scenario-tag"
-          ]
-        },
-        {
-          "send": "/session",
-          "expect_all": [
-            "session_id:",
-            "display_name:"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select coalesce(tag, '<none>') from session_metadata order by updated_at desc limit 1",
-            "<none>"
-          ]
-        }
-      ]
-    },
     "tasks": {
       "validation_level": "acceptance",
       "purpose": "Inspect runtime task tracker empty state, persisted AutoDream task rows, and malformed task diagnostics.",
@@ -6873,222 +5846,6 @@
           "file_contains": [
             "$HOME/.koder/tasks/auto-dream/broken.json",
             "{not json"
-          ]
-        }
-      ]
-    },
-    "teleport": {
-      "validation_level": "acceptance",
-      "purpose": "Reject invalid teleport targets, change cwd to a fixture directory, and persist the new session cwd.",
-      "acceptance_criteria": [
-        "fixture directories can be created from the TUI",
-        "missing teleport targets are rejected without changing cwd",
-        "file targets are rejected as non-directories",
-        "valid teleport changes the working directory",
-        "/status shows the new working directory",
-        "/session shows the persisted cwd metadata",
-        "SQLite session metadata stores the new cwd"
-      ],
-      "acceptance_artifacts": [
-        "fixture shell capture",
-        "teleport command captures",
-        "status command capture",
-        "session command capture",
-        "SQLite session metadata row"
-      ],
-      "turns": [
-        {
-          "send": "!mkdir -p teleport-target && printf 'not a directory' > teleport-file && echo teleport-fixture",
-          "expect_all": [
-            "teleport-fixture"
-          ]
-        },
-        {
-          "send": "/teleport missing-target",
-          "expect_all": [
-            "teleport: path not found:",
-            "missing-target"
-          ]
-        },
-        {
-          "send": "/teleport teleport-file",
-          "expect_all": [
-            "teleport: not a directory:",
-            "teleport-file"
-          ]
-        },
-        {
-          "send": "/teleport teleport-target",
-          "expect_all": [
-            "cwd:",
-            "teleport-target"
-          ]
-        },
-        {
-          "send": "/status",
-          "expect_all": [
-            "Working directory:",
-            "teleport-target"
-          ]
-        },
-        {
-          "send": "/session",
-          "expect_all": [
-            "session_id:",
-            "cwd:",
-            "teleport-target"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select cwd from session_metadata where cwd like '%teleport-target'",
-            "teleport-target"
-          ]
-        }
-      ]
-    },
-    "terminal-setup": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect seeded terminal environment settings, visible related controls, status alias, and invalid argument handling.",
-      "env": {
-        "TERM": "xterm-256color",
-        "TERM_PROGRAM": "Apple_Terminal",
-        "SHELL": "/bin/zsh",
-        "COLORTERM": "truecolor",
-        "COLUMNS": "132",
-        "LINES": "40"
-      },
-      "acceptance_criteria": [
-        "terminal setup output renders canonical command and alias metadata",
-        "seeded terminal environment variables are reported exactly",
-        "related terminal controls are visible",
-        "status argument returns the same diagnostic shape",
-        "invalid arguments return usage without silently succeeding",
-        "seeded environment values are also captured in a durable project file"
-      ],
-      "acceptance_artifacts": [
-        "terminal setup capture",
-        "status argument capture",
-        "terminal env fixture file",
-        "invalid argument capture"
-      ],
-      "turns": [
-        {
-          "send": "/terminal-setup",
-          "expect_all": [
-            "Terminal Configuration:",
-            "terminal-setup:",
-            "canonical_command: /terminal-setup",
-            "aliases: /terminalSetup",
-            "TERM: xterm-256color",
-            "TERM_PROGRAM: Apple_Terminal",
-            "SHELL: /bin/zsh",
-            "COLORTERM: truecolor",
-            "COLUMNS: 132",
-            "LINES: 40",
-            "controls: /vim, /statusline, /output-style"
-          ]
-        },
-        {
-          "send": "/terminal-setup status",
-          "expect_all": [
-            "Terminal Configuration:",
-            "canonical_command: /terminal-setup",
-            "TERM: xterm-256color",
-            "controls: /vim, /statusline, /output-style"
-          ]
-        },
-        {
-          "send": "!printf 'TERM=%s\\nSHELL=%s\\nCOLUMNS=%s\\n' \"$TERM\" \"$SHELL\" \"$COLUMNS\" > terminal-setup-env.txt && echo terminal-setup-env-fixture",
-          "expect_all": [
-            "terminal-setup-env-fixture"
-          ]
-        },
-        {
-          "send": "/terminal-setup install",
-          "expect_all": [
-            "Usage: /terminal-setup [status]",
-            "aliases: /terminalSetup"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/terminal-setup-env.txt",
-            [
-              "TERM=xterm-256color",
-              "SHELL=/bin/zsh",
-              "COLUMNS=132"
-            ]
-          ]
-        }
-      ]
-    },
-    "terminalSetup": {
-      "validation_level": "acceptance",
-      "purpose": "Validate camelCase terminal setup alias returns canonical terminal setup diagnostics.",
-      "env": {
-        "TERM": "xterm-256color",
-        "TERM_PROGRAM": "Apple_Terminal",
-        "SHELL": "/bin/zsh",
-        "COLORTERM": "truecolor",
-        "COLUMNS": "132",
-        "LINES": "40"
-      },
-      "acceptance_criteria": [
-        "camelCase alias resolves to the terminal setup command",
-        "alias output includes canonical command metadata",
-        "alias output reports the same seeded environment fields as the canonical command",
-        "alias seeded environment values are captured in a durable project file"
-      ],
-      "acceptance_artifacts": [
-        "terminalSetup alias capture",
-        "canonical terminal-setup capture",
-        "alias env fixture file"
-      ],
-      "turns": [
-        {
-          "send": "/terminalSetup",
-          "expect_all": [
-            "Terminal Configuration:",
-            "terminal-setup:",
-            "canonical_command: /terminal-setup",
-            "aliases: /terminalSetup",
-            "TERM: xterm-256color",
-            "SHELL: /bin/zsh",
-            "controls: /vim, /statusline, /output-style"
-          ]
-        },
-        {
-          "send": "/terminal-setup",
-          "expect_all": [
-            "Terminal Configuration:",
-            "canonical_command: /terminal-setup",
-            "aliases: /terminalSetup",
-            "TERM: xterm-256color",
-            "SHELL: /bin/zsh"
-          ]
-        },
-        {
-          "send": "!printf 'alias=terminalSetup\\nTERM=%s\\nSHELL=%s\\n' \"$TERM\" \"$SHELL\" > terminal-setup-alias-env.txt && echo terminal-setup-alias-fixture",
-          "expect_all": [
-            "terminal-setup-alias-fixture"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/terminal-setup-alias-env.txt",
-            [
-              "alias=terminalSetup",
-              "TERM=xterm-256color",
-              "SHELL=/bin/zsh"
-            ]
           ]
         }
       ]
@@ -7497,82 +6254,6 @@
           "file_contains": [
             "$REPO/ultraplan-status-after.txt",
             "M sample.txt"
-          ]
-        }
-      ]
-    },
-    "upgrade": {
-      "validation_level": "acceptance",
-      "purpose": "Inspect local Koder update guidance, verify the helper script help path, and cover invalid usage.",
-      "acceptance_criteria": [
-        "/upgrade reports current version, development installation type, project root, upgrade script, local update commands, and account/model commands",
-        "the recommended helper-script help command runs without checking dependencies or mutating pyproject.toml",
-        "extra arguments return usage guidance instead of being silently ignored",
-        "/install cross-checks runtime version and installation metadata from the same TUI session",
-        "the helper-script help text remains available as a backing artifact"
-      ],
-      "acceptance_artifacts": [
-        "/upgrade capture",
-        "helper script help capture",
-        "invalid-argument capture",
-        "/install cross-check capture",
-        "upgrade-help.txt artifact"
-      ],
-      "turns": [
-        {
-          "send": "/upgrade",
-          "expect_all": [
-            "upgrade:",
-            "current_version:",
-            "installation_type: development",
-            "project_root:",
-            "upgrade_script:",
-            "scripts/upgrade_dependency.py",
-            "local_update_commands:",
-            "- uv sync --upgrade",
-            "- uv run scripts/upgrade_dependency.py --help",
-            "account_and_model_commands:",
-            "- /model <model>",
-            "- /config",
-            "- koder auth login <provider>"
-          ]
-        },
-        {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python \"$PYTHONPATH/scripts/upgrade_dependency.py\" --help > upgrade-help.txt && grep -F 'Usage: uv run scripts/upgrade_dependency.py [--help]' upgrade-help.txt && if grep -F 'Checking ' upgrade-help.txt; then exit 1; fi && echo upgrade-help-proof",
-          "expect_all": [
-            "Shell Mode",
-            "Usage: uv run scripts/upgrade_dependency.py [--help]",
-            "upgrade-help-proof"
-          ]
-        },
-        {
-          "send": "/upgrade unexpected",
-          "expect_all": [
-            "Usage: /upgrade"
-          ]
-        },
-        {
-          "send": "/install",
-          "expect_all": [
-            "install:",
-            "runtime_version:",
-            "installation_type: development",
-            "project_root:",
-            "pyproject:"
-          ]
-        }
-      ],
-      "post_assertions": [
-        {
-          "file_contains": [
-            "$REPO/upgrade-help.txt",
-            "Usage: uv run scripts/upgrade_dependency.py [--help]"
-          ]
-        },
-        {
-          "file_not_contains": [
-            "$REPO/upgrade-help.txt",
-            "Checking "
           ]
         }
       ]
@@ -9618,10 +8299,10 @@
     },
     "sandbox-network-policy": {
       "validation_level": "acceptance",
-      "purpose": "Show network policy state and the current enforcement status for the selected backend.",
+      "purpose": "Show network policy state as explicit unenforced metadata for the selected backend.",
       "acceptance_criteria": [
         "networkAccess is parsed from policy",
-        "domain allow and deny lists are visible",
+        "domain allow and deny lists are visible and labeled as unenforced policy metadata",
         "backend status names network enforcement as unsupported or provider-dependent"
       ],
       "acceptance_artifacts": [
@@ -9646,8 +8327,9 @@
           "timeout": 30,
           "expect_all": [
             "network_access: false",
-            "allowed_domains: example.com",
-            "denied_domains: metadata.google.internal"
+            "network_policy_enforcement: unsupported",
+            "allowed_domains: example.com (policy metadata, not enforced)",
+            "denied_domains: metadata.google.internal (policy metadata, not enforced)"
           ]
         }
       ],

@@ -229,3 +229,28 @@ class TestIntegration:
             assert calls[0]["stream_output"] is stream_output
 
         assert calls[0]["stop_event"].is_set()
+
+
+class TestStreamingCancellation:
+    """ESC-driven cancellation routed through the streaming output controller."""
+
+    def test_request_cancel_without_callback_is_noop(self):
+        controller = StreamingOutputController()
+        assert controller.request_cancel() is False
+
+    def test_request_cancel_invokes_registered_callback(self):
+        controller = StreamingOutputController()
+        calls = []
+        controller.set_cancel_callback(lambda: calls.append(True))
+
+        assert controller.request_cancel() is True
+        assert calls == [True]
+
+    def test_cancel_callback_can_be_cleared(self):
+        controller = StreamingOutputController()
+        calls = []
+        controller.set_cancel_callback(lambda: calls.append(True))
+        controller.set_cancel_callback(None)
+
+        assert controller.request_cancel() is False
+        assert calls == []

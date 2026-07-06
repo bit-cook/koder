@@ -49,6 +49,16 @@ GITHUB_COPILOT_HEADERS: dict[str, str] = {
     "x-vscode-user-agent-library-version": "electron-fetch",
 }
 
+_BRIEF_MODE_INSTRUCTION = (
+    "# Brief Mode\n"
+    "You are in brief mode. Be extremely concise:\n"
+    "- Give the shortest possible answer that is still correct and complete\n"
+    "- Skip preambles, summaries, and sign-offs\n"
+    "- No bullet lists when a single sentence suffices\n"
+    "- For code changes, just make the change with minimal explanation\n"
+    "- Only elaborate when the user explicitly asks for detail"
+)
+
 
 def _log_api_error_on_retry(details):
     """Log user-friendly error messages before retry attempts.
@@ -483,6 +493,24 @@ def _get_skills_metadata(config) -> str:
     return build_skills_metadata_prompt(all_skills)
 
 
+def _get_environment_info(model_name: str) -> str:
+    """Render environment facts for the {ENVIRONMENT_INFO} prompt placeholder."""
+    import platform
+    from datetime import date
+
+    cwd = Path.cwd()
+    lines = [
+        f"Working directory: {cwd}",
+        f"Is a git repository: {'true' if (cwd / '.git').exists() else 'false'}",
+        f"Platform: {platform.system().lower()} ({platform.release()})",
+        f"Today's date: {date.today().isoformat()}",
+        f"Model: {model_name}",
+        "When you need other model names or IDs (e.g. when building AI applications), "
+        "verify them against documentation instead of guessing.",
+    ]
+    return "\n".join(lines)
+
+
 def _get_agents_metadata() -> str:
     if os.environ.get("KODER_SIMPLE") == "1":
         return "Agents metadata is disabled in bare mode."
@@ -602,15 +630,27 @@ async def create_dev_agent(
     # Build system prompt with skills metadata (Progressive Disclosure Level 1)
     skills_metadata = _get_skills_metadata(config)
     agents_metadata = _get_agents_metadata()
+    environment_info = _get_environment_info(model_name_str)
     system_prompt = (
         instructions_override
         if instructions_override is not None
-        else KODER_SYSTEM_PROMPT.replace("{SKILLS_METADATA}", skills_metadata).replace(
-            "{AGENTS_METADATA}", agents_metadata
-        )
+        else KODER_SYSTEM_PROMPT.replace("{SKILLS_METADATA}", skills_metadata)
+        .replace("{AGENTS_METADATA}", agents_metadata)
+        .replace("{ENVIRONMENT_INFO}", environment_info)
     )
     if instructions_append:
         system_prompt = f"{system_prompt.rstrip()}\n\n{instructions_append.strip()}"
+
+    # Inject brief mode instruction when enabled
+    from koder_agent.harness.config.service import RuntimeConfigService
+
+    _harness_config = RuntimeConfigService().load().harness
+    brief_enabled = (
+        os.environ.get("KODER_BRIEF", "").lower() in ("1", "true")
+        or _harness_config.brief_mode_enabled
+    )
+    if brief_enabled:
+        system_prompt = f"{system_prompt.rstrip()}\n\n{_BRIEF_MODE_INSTRUCTION}"
 
     dev_agent = Agent(
         name=name,

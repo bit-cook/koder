@@ -312,7 +312,8 @@ class PermissionService:
             if state.enabled and not excluded_from_sandbox:
                 if tool_name == "run_powershell":
                     reason = (
-                        "sandbox is enabled, but PowerShell sandbox execution is not implemented"
+                        "sandbox is enabled, but PowerShell sandbox execution is not implemented; "
+                        "add a sandbox exclusion with /sandbox exclude, or run /sandbox disable"
                     )
                     self.denial_log.record(tool_name, reason)
                     return PermissionEvaluationResult.deny(
@@ -323,7 +324,8 @@ class PermissionService:
                 if bool(arguments.get("run_in_background")):
                     reason = (
                         "sandbox is enabled, but background sandbox execution is not implemented "
-                        "for model shell commands"
+                        "for model shell commands; run the command in the foreground, add a "
+                        "sandbox exclusion with /sandbox exclude, or run /sandbox disable"
                     )
                     self.denial_log.record(tool_name, reason)
                     return PermissionEvaluationResult.deny(

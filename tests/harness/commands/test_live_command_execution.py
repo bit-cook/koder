@@ -38,31 +38,6 @@ class _ResettableScheduler(SimpleNamespace):
         self._agent_initialized = False
 
 
-def test_live_tag_command_toggles_and_persists_session_tag(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    session = EnhancedSQLiteSession("tag-session")
-    scheduler = SimpleNamespace(session=session)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    assert (
-        _run_with_scheduler("/tag", handler=handler, scheduler=scheduler) == "Usage: /tag <label>"
-    )
-    assert (
-        _run_with_scheduler("/tag --help", handler=handler, scheduler=scheduler)
-        == "Usage: /tag <label>"
-    )
-
-    add_output = _run_with_scheduler("/tag demo", handler=handler, scheduler=scheduler)
-    assert add_output == "Tag added: demo"
-    assert asyncio.run(session.get_tag()) == "demo"
-    assert asyncio.run(EnhancedSQLiteSession("tag-session").get_tag()) == "demo"
-
-    remove_output = _run_with_scheduler("/tag demo", handler=handler, scheduler=scheduler)
-    assert remove_output == "Tag removed: demo"
-    assert asyncio.run(session.get_tag()) is None
-    assert asyncio.run(EnhancedSQLiteSession("tag-session").get_tag()) is None
-
-
 def test_live_color_command_sets_resets_and_persists_session_color(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     session = EnhancedSQLiteSession("color-session")
@@ -219,35 +194,6 @@ def test_output_style_resets_all_style_controls_and_persists_state(tmp_path, mon
     assert "vim_mode: false" in reloaded_output
 
 
-def test_terminal_setup_reports_seeded_environment_and_alias_usage(monkeypatch):
-    monkeypatch.setenv("TERM", "xterm-256color")
-    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
-    monkeypatch.setenv("SHELL", "/bin/zsh")
-    monkeypatch.setenv("COLORTERM", "truecolor")
-    monkeypatch.setenv("COLUMNS", "132")
-    monkeypatch.setenv("LINES", "40")
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    canonical_output = _run("/terminal-setup", handler=handler)
-    status_output = _run("/terminal-setup status", handler=handler)
-    alias_output = _run("/terminalSetup", handler=handler)
-    invalid_output = _run("/terminal-setup install", handler=handler)
-
-    assert canonical_output == status_output == alias_output
-    assert "Terminal Configuration:" in canonical_output
-    assert "terminal-setup:" in canonical_output
-    assert "canonical_command: /terminal-setup" in canonical_output
-    assert "aliases: /terminalSetup" in canonical_output
-    assert "TERM: xterm-256color" in canonical_output
-    assert "TERM_PROGRAM: Apple_Terminal" in canonical_output
-    assert "SHELL: /bin/zsh" in canonical_output
-    assert "COLORTERM: truecolor" in canonical_output
-    assert "COLUMNS: 132" in canonical_output
-    assert "LINES: 40" in canonical_output
-    assert "controls: /vim, /statusline, /output-style" in canonical_output
-    assert invalid_output == "Usage: /terminal-setup [status]\naliases: /terminalSetup"
-
-
 def test_version_command_reports_runtime_source_build_and_cli_banner(monkeypatch):
     monkeypatch.setenv("KODER_BUILD_TIME", "scenario-build")
     handler = HarnessInteractiveCommandHandler(emit_console=False)
@@ -261,62 +207,6 @@ def test_version_command_reports_runtime_source_build_and_cli_banner(monkeypatch
     assert "cli_banner: " in output
     assert "(Koder)" in output
     assert "python:" not in output
-
-
-def test_privacy_settings_reports_local_paths_and_does_not_leak_secrets(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("OPENAI_API_KEY", "privacy-secret-value")
-    project = tmp_path / "repo"
-    project.mkdir()
-    monkeypatch.chdir(project)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    privacy_output = _run("/privacy-settings", handler=handler)
-    env_output = _run("/env", handler=handler)
-
-    assert "privacy_settings:" in privacy_output
-    assert "telemetry: disabled" in privacy_output
-    assert f"data_storage: {tmp_path / 'home' / '.koder'} (local only)" in privacy_output
-    assert f"project_memory: {project / '.koder' / 'memory'}" in privacy_output
-    assert "external_services: configured LLM API only" in privacy_output
-    assert "secret_handling:" in privacy_output
-    assert "OPENAI_API_KEY: set" in env_output
-    assert "privacy-secret-value" not in privacy_output
-    assert "privacy-secret-value" not in env_output
-
-
-def test_live_teleport_records_session_cwd_and_rejects_invalid_paths(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    project = tmp_path / "project"
-    target = tmp_path / "target"
-    not_directory = tmp_path / "not-a-directory.txt"
-    project.mkdir()
-    target.mkdir()
-    not_directory.write_text("not a directory", encoding="utf-8")
-    monkeypatch.chdir(project)
-
-    session = EnhancedSQLiteSession("teleport-session")
-    scheduler = SimpleNamespace(session=session)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    missing_output = _run_with_scheduler(
-        f"/teleport {tmp_path / 'missing'}", handler=handler, scheduler=scheduler
-    )
-    file_output = _run_with_scheduler(
-        f"/teleport {not_directory}", handler=handler, scheduler=scheduler
-    )
-    teleport_output = _run_with_scheduler(
-        f"/teleport {target}", handler=handler, scheduler=scheduler
-    )
-    session_output = _run_with_scheduler("/session", handler=handler, scheduler=scheduler)
-
-    assert "teleport: path not found:" in missing_output
-    assert "teleport: not a directory:" in file_output
-    assert f"cwd: {target.resolve()}" == teleport_output
-    assert Path.cwd() == target.resolve()
-    assert asyncio.run(session.get_cwd()) == str(target.resolve())
-    assert asyncio.run(EnhancedSQLiteSession("teleport-session").get_cwd()) == str(target.resolve())
-    assert f"cwd: {target.resolve()}" in session_output
 
 
 def test_live_resume_resolves_existing_sessions_and_rejects_missing_targets(tmp_path, monkeypatch):
@@ -437,6 +327,44 @@ def test_live_rewind_help_is_available_without_history(tmp_path):
     )
 
 
+def test_live_rewind_lists_trim_counts_and_reports_removed_items(tmp_path):
+    session = EnhancedSQLiteSession("rewind-count-session", db_path=str(tmp_path / "koder.db"))
+    asyncio.run(
+        session.add_items(
+            [
+                {"role": "user", "content": "first prompt"},
+                {"role": "assistant", "content": "first reply"},
+                {"role": "user", "content": "second prompt"},
+                {"role": "assistant", "content": "second reply"},
+            ]
+        )
+    )
+    scheduler = SimpleNamespace(session=session)
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+
+    listing = _run_with_scheduler("/rewind", handler=handler, scheduler=scheduler)
+
+    assert "1. second prompt (removes 2 newer transcript items)" in listing
+    assert "2. first prompt (removes 4 newer transcript items)" in listing
+    # The unfinished-capability disclaimer must not be advertised.
+    assert "not yet available" not in listing
+
+    result = _run_with_scheduler("/rewind 1", handler=handler, scheduler=scheduler)
+
+    assert "Rewound conversation to prompt 1." in result
+    assert "Removed transcript items: 2" in result
+    assert "Restored input: second prompt" in result
+    remaining = asyncio.run(
+        EnhancedSQLiteSession(
+            "rewind-count-session", db_path=str(tmp_path / "koder.db")
+        ).get_items()
+    )
+    assert remaining == [
+        {"role": "user", "content": "first prompt"},
+        {"role": "assistant", "content": "first reply"},
+    ]
+
+
 def test_live_magic_docs_command_lists_and_refreshes_marker_docs(tmp_path, monkeypatch):
     project = tmp_path / "project"
     docs = project / "docs"
@@ -496,8 +424,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
         task_service=task_service,
         permission_service=permission_service,
     )
-    tag_session = EnhancedSQLiteSession("live-tag-session", db_path=str(tmp_path / "koder.db"))
-    tag_scheduler = SimpleNamespace(session=tag_session)
 
     plugin_output = _run("/plugin", handler=handler)
     tasks_output = _run("/tasks", handler=handler)
@@ -507,22 +433,17 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     files_output = _run("/files", handler=handler)
     diff_output = _run("/diff", handler=handler)
     branch_output = _run("/branch", handler=handler)
-    tag_output = _run_with_scheduler("/tag demo", handler=handler, scheduler=tag_scheduler)
     plan_output = _run("/plan", handler=handler)
     hooks_output = _run("/hooks", handler=handler)
-    privacy_output = _run("/privacy-settings", handler=handler)
     vim_output = _run("/vim", handler=handler)
     login_output = _run("/login", handler=handler)
     logout_output = _run("/logout", handler=handler)
-    share_output = _run("/share", handler=handler)
-    upgrade_output = _run("/upgrade", handler=handler)
     commit_output = _run("/commit", handler=handler)
     commit_push_pr_output = _run("/commit-push-pr", handler=handler)
     review_output = _run("/review", handler=handler)
     release_notes_output = _run("/release-notes", handler=handler)
     doctor_output = _run("/doctor", handler=handler)
     usage_output = _run("/usage", handler=handler)
-    stats_output = _run("/stats", handler=handler)
     effort_output = _run("/effort", handler=handler)
     version_output = _run("/version", handler=handler)
     env_output = _run("/env", handler=handler)
@@ -531,7 +452,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     fork_output = _run("/fork", handler=handler)
     issue_output = _run("/issue", handler=handler)
     pr_comments_output = _run("/pr_comments", handler=handler)
-    teleport_output = _run("/teleport", handler=handler)
     peers_output = _run("/peers", handler=handler)
     feedback_output = _run("/feedback", handler=handler)
     try:
@@ -580,9 +500,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
         scoped_monkeypatch.chdir(security_repo)
         security_review_output = _run("/security-review", handler=handler)
     summary_output = _run("/summary", handler=handler)
-    terminal_setup_output = _run("/terminalSetup", handler=handler)
-    ide_output = _run("/ide", handler=handler)
-    install_github_app_output = _run("/install-github-app", handler=handler)
 
     assert "demo-plugin" in plugin_output
     assert "demo task" in tasks_output
@@ -593,17 +510,11 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     assert "## Diff" in diff_output
     assert "### Uncommitted changes" in diff_output
     assert branch_output
-    assert "Tag added: demo" == tag_output
-    assert asyncio.run(tag_session.get_tag()) == "demo"
     assert "plan" in plan_output.lower()
     assert "hooks:" in hooks_output
-    assert "privacy" in privacy_output.lower()
     assert "vim:" in vim_output
     assert login_output  # /login was removed; returns unknown-command message
     assert logout_output  # /logout was removed; returns unknown-command message
-    assert "share:" in share_output
-    assert "upgrade:" in upgrade_output
-    assert "local_update_commands:" in upgrade_output
     assert "Branch:" in commit_output or "branch:" in commit_output
     assert "staged_diff:" in commit_push_pr_output
     assert "unstaged_diff:" in commit_push_pr_output
@@ -616,7 +527,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     assert "ripgrep_mode:" in doctor_output
     assert "ripgrep_path:" in doctor_output
     assert "requests:" in usage_output
-    assert "context_tokens:" in stats_output
     assert "effort level" in effort_output.lower()
     assert version_output.startswith("version: ")
     assert "package: koder" in version_output
@@ -628,7 +538,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     assert "fork:" in fork_output
     assert "issue" in issue_output.lower()
     assert "## Comments" in pr_comments_output
-    assert "teleport_root:" in teleport_output
     assert "peers:" in peers_output
     assert "feedback:" in feedback_output
     assert "repo:" in feedback_output
@@ -641,11 +550,6 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     assert "backend: unix-local" in sandbox_output
     assert "# Security Review" in security_review_output
     assert summary_output
-    assert "terminal" in terminal_setup_output.lower()
-    assert "ide:" in ide_output
-    assert "integration_scope: local launcher/status" in ide_output
-    assert "github_actions:" in install_github_app_output
-    assert "integration_scope: local gh CLI + GitHub Actions workflow" in install_github_app_output
 
 
 def test_plan_command_returns_harness_owned_response():
@@ -789,9 +693,6 @@ def test_local_semantic_gap_commands_are_runtime_backed(tmp_path, monkeypatch):
         "/debug-tool-call show 1", handler=handler, scheduler=scheduler
     )
     bughunter_output = _run("/bughunter sample", handler=handler)
-    rate_limit_output = _run_with_scheduler(
-        "/rate-limit-options", handler=handler, scheduler=scheduler
-    )
 
     assert "keybindings:" in keybindings_output
     assert "- submit:" in keybindings_output
@@ -811,8 +712,6 @@ def test_local_semantic_gap_commands_are_runtime_backed(tmp_path, monkeypatch):
     assert "focus: sample" in bughunter_output
     assert "working_tree:" in bughunter_output
     assert "diff_evidence:" in bughunter_output
-    assert "rate-limit-options:" in rate_limit_output
-    assert "requests: 2" in rate_limit_output
 
 
 def test_insights_command_reports_session_counts(tmp_path, monkeypatch):
@@ -868,6 +767,8 @@ def test_insights_command_reports_session_counts(tmp_path, monkeypatch):
     assert "Assistant messages: 1" in output
     assert "Tool results: 1" in output
     assert "Tool calls: 1" in output
+    assert "Tool usage:" in output
+    assert "- read_file: 1" in output
     assert "Files in context: 2" in output
     assert "- AGENTS.md" in output
     assert "- docs/runtime-notes.md" in output
@@ -1042,38 +943,6 @@ def test_command_list_prefers_runtime_command_over_shadowed_skill():
     assert command_names.count("loop") == 1
 
 
-def test_passes_command_reports_pytest_cache_status(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    monkeypatch.chdir(repo)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    empty_output = _run("/passes", handler=handler)
-    assert "Verification Status:" in empty_output
-    assert "pytest_cache: unavailable" in empty_output
-
-    cache_dir = repo / ".pytest_cache" / "v" / "cache"
-    cache_dir.mkdir(parents=True)
-    (cache_dir / "nodeids").write_text(
-        json.dumps(["tests/test_demo.py::test_ok"]), encoding="utf-8"
-    )
-
-    passed_output = _run("/passes", handler=handler)
-    assert "pytest_cache:" in passed_output
-    assert "collected_tests: 1" in passed_output
-    assert "status: last run passed" in passed_output
-    assert "failed_tests: 0" in passed_output
-
-    (cache_dir / "lastfailed").write_text(
-        json.dumps({"tests/test_demo.py::test_ok": True}), encoding="utf-8"
-    )
-    failing_output = _run("/passes", handler=handler)
-    assert "status: failing" in failing_output
-    assert "failed_tests: 1" in failing_output
-    assert "tests/test_demo.py::test_ok" in failing_output
-
-
 def test_bughunter_reports_diff_evidence_and_clean_edge(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"
@@ -1187,10 +1056,6 @@ def test_local_setup_and_diagnostic_gap_commands_are_runtime_backed(tmp_path, mo
     scheduler = SimpleNamespace(session=session)
     handler = HarnessInteractiveCommandHandler(emit_console=False)
 
-    install_output = _run("/install", handler=handler)
-    install_invalid_output = _run("/install now", handler=handler)
-    upgrade_output = _run("/upgrade", handler=handler)
-    upgrade_invalid_output = _run("/upgrade now", handler=handler)
     mcp_output = _run("/mcp", handler=handler)
     mcp_invalid_output = _run("/mcp now", handler=handler)
     assistant_output = _run_with_scheduler("/assistant", handler=handler, scheduler=scheduler)
@@ -1198,15 +1063,7 @@ def test_local_setup_and_diagnostic_gap_commands_are_runtime_backed(tmp_path, mo
     verifier_output = _run("/init-verifiers cli", handler=handler)
     skills_output = _run("/skills", handler=handler)
     verifier_exists_output = _run("/init-verifiers cli", handler=handler)
-    heapdump_output = _run("/heapdump", handler=handler)
 
-    assert "install:" in install_output
-    assert "installation_type:" in install_output
-    assert "local_commands:" in install_output
-    assert install_invalid_output == "Usage: /install"
-    assert "upgrade:" in upgrade_output
-    assert "local_update_commands:" in upgrade_output
-    assert upgrade_invalid_output == "Usage: /upgrade"
     assert mcp_output == "No MCP servers configured."
     assert mcp_invalid_output == "Usage: /mcp"
     assert "assistant:" in assistant_output
@@ -1220,21 +1077,12 @@ def test_local_setup_and_diagnostic_gap_commands_are_runtime_backed(tmp_path, mo
     assert "verifier-cli" in skills_output
     assert "Verify CLI and TUI behavior" in skills_output
     assert "init-verifiers: exists" in verifier_exists_output
-    assert "heapdump: written" in heapdump_output
-    assert "objects:" in heapdump_output
 
     skill_file = repo / ".koder" / "skills" / "verifier-cli" / "SKILL.md"
     assert skill_file.exists()
     skill_text = skill_file.read_text(encoding="utf-8")
     assert "allowed-tools:" in skill_text
     assert "run_shell:tmux *" in skill_text
-
-    diagnostic_dir = tmp_path / "home" / ".koder" / "diagnostics"
-    diagnostic_files = list(diagnostic_dir.glob("heapdump-*.json"))
-    assert len(diagnostic_files) == 1
-    payload = json.loads(diagnostic_files[0].read_text(encoding="utf-8"))
-    assert payload["gc"]["objects"] > 0
-    assert payload["tracemalloc"]["tracing"] is True
 
 
 def test_init_command_generates_local_agents_md_and_refuses_overwrite(tmp_path, monkeypatch):
@@ -1258,6 +1106,7 @@ def test_init_command_generates_local_agents_md_and_refuses_overwrite(tmp_path, 
     assert "commands_detected: 4" in output
     assert "Found 1 magic doc(s):" in output
     assert "docs/runtime-notes.md: Runtime Notes" in output
+    assert "tip: run /init-explore" in output
 
     agents_md = repo / "AGENTS.md"
     assert agents_md.exists()
@@ -1268,33 +1117,11 @@ def test_init_command_generates_local_agents_md_and_refuses_overwrite(tmp_path, 
     assert "`uv run pytest`" in content
     assert "## Working Guidelines" in content
 
-    assert _run("/init", handler=handler) == "AGENTS.md already exists."
+    assert (
+        _run("/init", handler=handler)
+        == "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
+    )
     assert agents_md.read_text(encoding="utf-8") == content
-
-
-def test_ide_command_routes_status_and_open(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    monkeypatch.setattr(
-        "koder_agent.harness.commands.interactive.render_ide_status",
-        lambda cwd=None: f"ide:\ntarget: {cwd}\nintegration_scope: local launcher/status",
-    )
-    monkeypatch.setattr(
-        "koder_agent.harness.commands.interactive.open_ide_target",
-        lambda launcher_selector=None, target=None: (
-            f"ide: open\nlauncher: {launcher_selector}\ntarget: {target}"
-        ),
-    )
-
-    status_output = _run("/ide", handler=handler)
-    open_output = _run("/ide open vscode .", handler=handler)
-    usage_output = _run("/ide connect", handler=handler)
-
-    assert "integration_scope: local launcher/status" in status_output
-    assert "launcher: vscode" in open_output
-    assert "target: ." in open_output
-    assert usage_output == "Usage: /ide [status|open <launcher> [path]]"
 
 
 def test_advisor_command_runs_local_review_with_current_session_and_repo(tmp_path, monkeypatch):
@@ -1405,6 +1232,12 @@ def test_ctx_viz_command_reports_session_snapshot_when_scheduler_present(tmp_pat
     assert "Working directory:" in output
     assert "Session messages: 2" in output
     assert "Investigate auth failures." in output
+    assert "Context usage (estimated):" in output
+    assert "project context:" in output
+    assert "user messages:" in output
+    assert "assistant messages:" in output
+    assert "free space:" in output
+    assert "tokens (" in output
 
 
 def test_sandbox_command_reports_and_updates_local_policy(tmp_path, monkeypatch):
@@ -1765,7 +1598,7 @@ def test_compact_command_rejects_extra_arguments():
     assert output == "Usage: /compact"
 
 
-def test_session_rename_and_share_commands_use_scheduler_state():
+def test_session_rename_commands_use_scheduler_state():
     class _Session:
         def __init__(self):
             self.session_id = "runtime-demo"
@@ -1794,17 +1627,11 @@ def test_session_rename_and_share_commands_use_scheduler_state():
     rename_output = _run_with_scheduler(
         "/rename Better Title", handler=handler, scheduler=scheduler
     )
-    share_output = _run_with_scheduler("/share", handler=handler, scheduler=scheduler)
 
     assert "session_id: runtime-demo" in session_output
     assert "display_name: Demo Session" in session_output
     assert "tag: demo" in session_output
     assert "Session renamed to: Better Title" == rename_output
-    assert "share session_id: runtime-demo" in share_output
-    assert "display_name: Better Title" in share_output
-    assert "title: Better Title" in share_output
-    assert "tag: demo" in share_output
-    assert "color: blue" in share_output
 
 
 def test_export_command_summarizes_and_writes_session_content(tmp_path, monkeypatch):
@@ -1871,44 +1698,6 @@ def test_export_command_summarizes_and_writes_session_content(tmp_path, monkeypa
     assert "session_id: export-demo" in exported_markdown
     assert "messages: 3" in exported_markdown
     assert "assistant: world" in exported_markdown
-
-
-def test_copy_command_selects_assistant_response_and_uses_clipboard_command(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv(
-        "KODER_CLIPBOARD_COMMAND",
-        "python -c \"import pathlib,sys; pathlib.Path('clipboard.txt').write_text(sys.stdin.read(), encoding='utf-8')\"",
-    )
-    session = EnhancedSQLiteSession("copy-demo")
-    asyncio.run(
-        session.add_items(
-            [
-                {"role": "user", "content": "question"},
-                {"role": "assistant", "content": "first answer"},
-                {"role": "assistant", "content": "latest answer"},
-            ]
-        )
-    )
-    scheduler = SimpleNamespace(session=session)
-    handler = HarnessInteractiveCommandHandler(emit_console=False)
-
-    latest_output = _run_with_scheduler("/copy", handler=handler, scheduler=scheduler)
-    first_output = _run_with_scheduler("/copy 2", handler=handler, scheduler=scheduler)
-    missing_output = _run_with_scheduler("/copy 3", handler=handler, scheduler=scheduler)
-    usage_output = _run_with_scheduler("/copy nope", handler=handler, scheduler=scheduler)
-
-    assert "copy: copied to clipboard" in latest_output
-    assert "copy_index: 1" in latest_output
-    assert "available_responses: 2" in latest_output
-    assert "clipboard: KODER_CLIPBOARD_COMMAND" in latest_output
-    assert "latest answer" in latest_output
-    assert (tmp_path / "clipboard.txt").read_text(encoding="utf-8") == "first answer"
-    assert "copy_index: 2" in first_output
-    assert "first answer" in first_output
-    assert "copy: requested response 3 is unavailable" in missing_output
-    assert "available_responses: 2" in missing_output
-    assert usage_output == "Usage: /copy [N]"
 
 
 def test_files_command_lists_files_already_in_session_context(tmp_path):

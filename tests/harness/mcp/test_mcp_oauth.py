@@ -365,3 +365,156 @@ def _make_resp(url: str, metadata: Dict[str, Any]) -> MagicMock:
     else:
         resp.status_code = 404
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Dynamic client registration redirect URI handling
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicRegistrationRedirectUri:
+    METADATA = {
+        "authorization_endpoint": "https://auth.example/authorize",
+        "token_endpoint": "https://auth.example/token",
+        "registration_endpoint": "https://auth.example/register",
+    }
+
+    @staticmethod
+    def _flow(name: str) -> MCPOAuthFlow:
+        # No client_id configured -> dynamic registration path
+        return MCPOAuthFlow(name, "https://example.com/mcp", MCPOAuthConfig(scopes=["read"]))
+
+    def test_registers_with_real_redirect_uri(self, tmp_path, monkeypatch):
+        """The registered redirect_uri must match the actual callback URI."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        flow = self._flow("dyn-reg-server")
+        captured: Dict[str, Any] = {}
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+
+            async def fake_post(url, json=None, **kw):
+                captured["url"] = url
+                captured["payload"] = json
+                resp = MagicMock()
+                resp.status_code = 201
+                resp.json.return_value = {"client_id": "dyn-client-id"}
+                resp.raise_for_status = MagicMock()
+                return resp
+
+            mock_client.post = fake_post
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            client_id, secret = asyncio.run(
+                flow._ensure_client(self.METADATA, "http://127.0.0.1:54321/callback")
+            )
+
+        assert client_id == "dyn-client-id"
+        assert secret is None
+        assert captured["payload"]["redirect_uris"] == ["http://127.0.0.1:54321/callback"]
+        # No placeholder port-0 URI may ever be registered.
+        assert "127.0.0.1:0" not in captured["payload"]["redirect_uris"][0]
+        cached = load_tokens("dyn-reg-server")
+        assert cached["client_id"] == "dyn-client-id"
+        assert cached["redirect_uri"] == "http://127.0.0.1:54321/callback"
+
+    def test_reuses_cached_registration_for_same_redirect_uri(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        save_tokens(
+            "dyn-cache-server",
+            {"client_id": "cached-id", "redirect_uri": "http://127.0.0.1:7777/callback"},
+        )
+        flow = self._flow("dyn-cache-server")
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            client_id, _ = asyncio.run(
+                flow._ensure_client(self.METADATA, "http://127.0.0.1:7777/callback")
+            )
+            mock_cls.assert_not_called()
+
+        assert client_id == "cached-id"
+
+    def test_re_registers_when_redirect_uri_changes(self, tmp_path, monkeypatch):
+        """A stale registration for another port must not be reused."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        save_tokens(
+            "dyn-stale-server",
+            {"client_id": "stale-id", "redirect_uri": "http://127.0.0.1:1111/callback"},
+        )
+        flow = self._flow("dyn-stale-server")
+
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+
+            async def fake_post(url, json=None, **kw):
+                resp = MagicMock()
+                resp.json.return_value = {"client_id": "fresh-id"}
+                resp.raise_for_status = MagicMock()
+                return resp
+
+            mock_client.post = fake_post
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            client_id, _ = asyncio.run(
+                flow._ensure_client(self.METADATA, "http://127.0.0.1:2222/callback")
+            )
+
+        assert client_id == "fresh-id"
+        cached = load_tokens("dyn-stale-server")
+        assert cached["redirect_uri"] == "http://127.0.0.1:2222/callback"
+
+    def test_missing_registration_endpoint_is_explicit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        flow = self._flow("dyn-no-endpoint")
+        metadata = {
+            "authorization_endpoint": "https://auth.example/authorize",
+            "token_endpoint": "https://auth.example/token",
+        }
+        try:
+            asyncio.run(flow._ensure_client(metadata, "http://127.0.0.1:3333/callback"))
+        except RuntimeError as exc:
+            assert "registration_endpoint" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for missing registration_endpoint")
+
+
+class TestAuthenticateUsesActualCallbackPort:
+    def test_full_flow_registers_actual_port(self, tmp_path, monkeypatch):
+        """authenticate() must start the callback server before registration
+        and use the same redirect URI for registration and authorization."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        flow = MCPOAuthFlow(
+            "full-flow-server", "https://example.com/mcp", MCPOAuthConfig(scopes=["read"])
+        )
+
+        metadata = {
+            "authorization_endpoint": "https://auth.example/authorize",
+            "token_endpoint": "https://auth.example/token",
+            "registration_endpoint": "https://auth.example/register",
+        }
+        seen: Dict[str, Any] = {}
+
+        async def fake_discover():
+            return metadata
+
+        async def fake_ensure(meta, redirect_uri):
+            seen["registration_redirect"] = redirect_uri
+            return "cid", None
+
+        async def fake_code_flow(meta, client_id, client_secret, *, server, redirect_uri):
+            seen["authorization_redirect"] = redirect_uri
+            assert server is not None
+            return {"access_token": "tok", "obtained_at": time.time()}
+
+        with (
+            patch.object(flow, "_discover_metadata", side_effect=fake_discover),
+            patch.object(flow, "_ensure_client", side_effect=fake_ensure),
+            patch.object(flow, "_authorization_code_flow", side_effect=fake_code_flow),
+        ):
+            headers = asyncio.run(flow.authenticate())
+
+        assert headers == {"Authorization": "Bearer tok"}
+        assert seen["registration_redirect"] == seen["authorization_redirect"]
+        assert "127.0.0.1:0" not in seen["registration_redirect"]

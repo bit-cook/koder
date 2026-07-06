@@ -182,3 +182,79 @@ def test_run_harness_session_flow_dispatches_session_end_when_cron_stop_fails(mo
 
     assert exit_code == 0
     assert "SessionEnd" in events
+
+
+def test_keyboard_interrupt_exit_skips_auto_dream_consolidation(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+    calls = []
+
+    class _InterruptPrompt(_FakeInteractivePrompt):
+        async def get_input(self) -> str:
+            raise KeyboardInterrupt
+
+    class _DreamManager:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def record_session(self) -> None:
+            calls.append("record_session")
+
+        def should_dream(self) -> bool:
+            return True
+
+        def save(self) -> None:
+            calls.append("save")
+
+    async def _run_auto_dream_from_messages(*_args, **_kwargs):
+        calls.append("run_auto_dream")
+        return SimpleNamespace(memories_written=0, saved_path=None, errors=[])
+
+    from koder_agent.harness.memory import auto_dream
+
+    monkeypatch.setattr("koder_agent.core.interactive.InteractivePrompt", _InterruptPrompt)
+    monkeypatch.setattr(auto_dream, "AutoDreamManager", _DreamManager)
+    monkeypatch.setattr(auto_dream, "run_auto_dream_from_messages", _run_auto_dream_from_messages)
+    monkeypatch.setattr(auto_dream, "default_auto_dream_task_storage", lambda: object())
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=[]))
+
+    assert exit_code == 0
+    assert calls == ["record_session", "save"]
+
+
+def test_eof_exit_allows_auto_dream_consolidation(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+    calls = []
+
+    class _EofPrompt(_FakeInteractivePrompt):
+        async def get_input(self) -> str:
+            raise EOFError
+
+    class _DreamManager:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def record_session(self) -> None:
+            calls.append("record_session")
+
+        def should_dream(self) -> bool:
+            return True
+
+        def save(self) -> None:
+            calls.append("save")
+
+    async def _run_auto_dream_from_messages(*_args, **_kwargs):
+        calls.append("run_auto_dream")
+        return SimpleNamespace(memories_written=0, saved_path=None, errors=[])
+
+    from koder_agent.harness.memory import auto_dream
+
+    monkeypatch.setattr("koder_agent.core.interactive.InteractivePrompt", _EofPrompt)
+    monkeypatch.setattr(auto_dream, "AutoDreamManager", _DreamManager)
+    monkeypatch.setattr(auto_dream, "run_auto_dream_from_messages", _run_auto_dream_from_messages)
+    monkeypatch.setattr(auto_dream, "default_auto_dream_task_storage", lambda: object())
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=[]))
+
+    assert exit_code == 0
+    assert calls == ["record_session", "run_auto_dream"]

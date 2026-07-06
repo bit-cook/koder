@@ -45,6 +45,39 @@ def _parse_session_switch(slash_response: str) -> tuple[str, bool] | None:
     return None
 
 
+async def restore_session_cwd(session_id: str) -> str | None:
+    """Restore the working directory recorded for *session_id*.
+
+    Returns the new cwd when the process directory actually changed, else
+    ``None``. A change dispatches ``CwdChanged`` hooks and registers any
+    watch paths they request, mirroring the payload contract used when the
+    cwd changes for any other reason.
+    """
+    from koder_agent.core.session import EnhancedSQLiteSession
+
+    recorded = await EnhancedSQLiteSession(session_id=session_id).get_cwd()
+    if not recorded:
+        return None
+    target = Path(recorded)
+    previous = Path.cwd()
+    if not target.is_dir() or target == previous:
+        return None
+
+    hook_result = dispatch_command_hooks(
+        cwd=previous,
+        event_name="CwdChanged",
+        match_value=None,
+        payload={
+            "event": "CwdChanged",
+            "old_cwd": str(previous),
+            "cwd": str(target),
+        },
+    )
+    update_watch_paths(hook_result.watch_paths)
+    os.chdir(target)
+    return str(target)
+
+
 def _clear_interactive_viewport() -> None:
     get_reflow_buffer().clear()
     console.file.write(CLEAR_VIEWPORT)
@@ -568,6 +601,15 @@ async def run_harness_session_flow(
             if not onboarding_state.completed:
                 missing_steps = get_onboarding_steps(onboarding_state)
                 if missing_steps:
+                    dispatch_command_hooks(
+                        cwd=Path.cwd(),
+                        event_name="Setup",
+                        match_value=None,
+                        payload={
+                            "event": "Setup",
+                            "missing_steps": missing_steps,
+                        },
+                    )
                     # Show onboarding panel to user
                     console.print(
                         Panel(
@@ -690,6 +732,7 @@ async def run_harness_session_flow(
         plugin_root=effective_plugin_root,
         teammate_mode=getattr(args, "teammate_mode", None),
         emit_console=getattr(args, "output_format", "text") == "text",
+        permission_service=permission_service,
     )
     if not bare_mode:
         session_start_source = "resume" if resume_value else "startup"
@@ -721,6 +764,7 @@ async def run_harness_session_flow(
         and not existing_session_items
         else None
     )
+    skip_exit_auto_dream = False
 
     try:
 
@@ -1068,7 +1112,10 @@ async def run_harness_session_flow(
                     user_input = await interactive_prompt.get_input()
                     if not user_input and not os.isatty(0):
                         break
-                except (EOFError, KeyboardInterrupt):
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    skip_exit_auto_dream = True
                     break
                 _pr_poller.touch()
                 poll_file_change_hooks(Path.cwd())
@@ -1102,6 +1149,12 @@ async def run_harness_session_flow(
                             if session_switch:
                                 new_session_id, clear_viewport = session_switch
                                 await scheduler.cleanup()
+                                restored_cwd = await restore_session_cwd(new_session_id)
+                                if restored_cwd:
+                                    print_reflowable(
+                                        console,
+                                        f"[dim]Working directory restored: {restored_cwd}[/dim]",
+                                    )
                                 scheduler = AgentScheduler(
                                     session_id=new_session_id,
                                     streaming=streaming,
@@ -1327,7 +1380,9 @@ async def run_harness_session_flow(
             dream_state_path = Path.home() / ".koder" / "auto_dream_state.json"
             dream_manager = AutoDreamManager(state_path=dream_state_path)
             dream_manager.record_session()
-            if dream_manager.should_dream() and "scheduler" in locals():
+            if skip_exit_auto_dream:
+                dream_manager.save()
+            elif dream_manager.should_dream() and "scheduler" in locals():
                 _logger = logging.getLogger(__name__)
                 result = await asyncio.wait_for(
                     run_auto_dream_from_messages(

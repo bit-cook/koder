@@ -71,15 +71,6 @@ class TestNotify:
             assert captured.out == ""
             assert captured.err == ""
 
-    def test_notify_with_sound_enabled(self, capsys):
-        """Test notification with sound enabled (currently no-op)."""
-        config = NotificationConfig(enabled=True, sound=True)
-        with patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}, clear=True):
-            notify("Test Title", "Test Message", config=config)
-            captured = capsys.readouterr()
-            # Sound config accepted but doesn't change output
-            assert "\033]9;Test Message\007" in captured.out
-
 
 class TestNotificationConfig:
     """Test NotificationConfig dataclass."""
@@ -88,10 +79,14 @@ class TestNotificationConfig:
         """Test default configuration values."""
         config = NotificationConfig()
         assert config.enabled is True
-        assert config.sound is False
+
+    def test_config_has_no_reserved_noop_fields(self):
+        """Every config field must change notify() behavior."""
+        from dataclasses import fields
+
+        assert [field.name for field in fields(NotificationConfig)] == ["enabled"]
 
     def test_config_custom_values(self):
         """Test custom configuration values."""
-        config = NotificationConfig(enabled=False, sound=True)
+        config = NotificationConfig(enabled=False)
         assert config.enabled is False
-        assert config.sound is True

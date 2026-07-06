@@ -322,64 +322,6 @@ def test_loop_scenario_is_acceptance_backed_by_cron_command_flow():
     ]
 
 
-def test_passes_scenario_is_acceptance_backed_by_pytest_cache_flow():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["passes"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0] == {
-        "send": "/passes",
-        "expect_all": [
-            "Verification Status:",
-            "pytest_cache: unavailable",
-            "Run tests with: uv run pytest",
-        ],
-    }
-    pass_turn = scenario["turns"][1]
-    assert "pytest tests/test_passes_fixture.py -q" in pass_turn["send"]
-    assert "passes-pytest-ok" not in pass_turn["send"]
-    assert pass_turn["expect_all"] == ["1 passed", "passes-pytest-ok"]
-    assert pass_turn["timeout"] == 30
-    assert scenario["turns"][2] == {
-        "send": "/passes",
-        "expect_all": [
-            "Verification Status:",
-            "pytest_cache:",
-            "collected_tests: 1",
-            "status: last run passed",
-            "failed_tests: 0",
-            "Run tests with: uv run pytest",
-        ],
-    }
-    fail_turn = scenario["turns"][3]
-    assert "assert False" in fail_turn["send"]
-    assert "passes-pytest-failed" not in fail_turn["send"]
-    assert fail_turn["expect_all"] == ["1 failed", "passes-pytest-failed"]
-    assert fail_turn["timeout"] == 30
-    assert scenario["turns"][4] == {
-        "send": "/passes",
-        "expect_all": [
-            "Verification Status:",
-            "pytest_cache:",
-            "status: failing",
-            "failed_tests: 1",
-            "tests/test_passes_fixture.py::test_passes_fixture",
-            "Run tests with: uv run pytest",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$REPO/.pytest_cache/v/cache/lastfailed",
-                "tests/test_passes_fixture.py::test_passes_fixture",
-            ]
-        },
-        {"file_contains": ["$REPO/tests/test_passes_fixture.py", "assert False"]},
-    ]
-
-
 def test_compact_scenario_is_acceptance_backed_by_persisted_session_rewrite():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["slash_commands"]["compact"]
@@ -501,7 +443,9 @@ def test_init_scenario_is_acceptance_backed_by_local_generation_flow():
     assert scenario["acceptance_artifacts"]
     assert scenario["turns"][0] == {
         "send": "/init",
-        "expect_all": ["AGENTS.md already exists."],
+        "expect_all": [
+            "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
+        ],
     }
     assert scenario["turns"][1] == {
         "send": "/init extra",
@@ -519,6 +463,7 @@ def test_init_scenario_is_acceptance_backed_by_local_generation_flow():
         "commands_detected: 0",
         "Found 1 magic doc(s):",
         "docs/runtime-notes.md: Runtime Notes",
+        "tip: run /init-explore",
     } <= set(generate_turn["expect_all"])
     grep_turn = scenario["turns"][4]
     assert "This file provides guidance to Koder" in grep_turn["send"]
@@ -532,7 +477,9 @@ def test_init_scenario_is_acceptance_backed_by_local_generation_flow():
     ]
     assert scenario["turns"][5] == {
         "send": "/init",
-        "expect_all": ["AGENTS.md already exists."],
+        "expect_all": [
+            "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
+        ],
     }
     assert scenario["post_assertions"] == [
         {
@@ -596,49 +543,6 @@ def test_init_verifiers_scenario_is_acceptance_backed_by_generated_skill_contrac
                 ],
             ]
         }
-    ]
-
-
-def test_heapdump_scenario_is_acceptance_backed_by_json_artifact_and_privacy_check():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["heapdump"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["env"] == {
-        "KODER_HEAPDUMP_MARKER": "heapdump-json-ok",
-        "KODER_HEAPDUMP_SECRET": "heapdump-secret-value",
-    }
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    heapdump_turn = scenario["turns"][0]
-    assert heapdump_turn["send"] == "/heapdump"
-    assert heapdump_turn["timeout"] == 40
-    assert {"path:", "pid:", "objects:", "top_types:", "tracemalloc_top_files:"} <= set(
-        heapdump_turn["expect_all"]
-    )
-    parser_turn = scenario["turns"][1]
-    assert parser_turn["send"].startswith('!uv --project "$PYTHONPATH" run --no-sync python')
-    assert "KODER_HEAPDUMP_MARKER" in parser_turn["send"]
-    assert "heapdump-json-ok" in parser_turn["expect_all"]
-    assert "heapdump-secret-value" in parser_turn["expect_not"]
-    assert scenario["turns"][2] == {
-        "send": "/doctor",
-        "expect_all": ["cwd:", "python:", "ripgrep_working:"],
-    }
-    assert scenario["post_assertions"] == [
-        {"path_glob_exists": "$HOME/.koder/diagnostics/heapdump-*.json"},
-        {
-            "file_glob_contains": [
-                "$HOME/.koder/diagnostics/heapdump-*.json",
-                ['"cwd"', '"gc"', '"top_types"', '"tracemalloc"'],
-            ]
-        },
-        {
-            "file_glob_not_contains": [
-                "$HOME/.koder/diagnostics/heapdump-*.json",
-                "heapdump-secret-value",
-            ]
-        },
     ]
 
 
@@ -732,110 +636,6 @@ def test_mcp_scenario_is_acceptance_backed_by_project_config_round_trip():
     }
     assert scenario["post_assertions"] == [
         {"file_contains": ["$REPO/.mcp.json", '"mcpServers": {}']}
-    ]
-
-
-def test_install_scenario_is_acceptance_backed_by_local_development_state():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["install"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    install_turn = scenario["turns"][0]
-    assert install_turn["send"] == "/install"
-    assert {
-        "install:",
-        "runtime_version:",
-        "installation_type: development",
-        "invoked_binary:",
-        "python:",
-        "uv:",
-        "koder_on_path:",
-        "project_root:",
-        "pyproject:",
-        "config_path:",
-        "local_commands:",
-        "- uv sync",
-        "- uv run koder",
-        "- uv run pytest",
-    } <= set(install_turn["expect_all"])
-    shell_turn = scenario["turns"][1]
-    assert shell_turn["send"].startswith('!test -f "$PYTHONPATH/pyproject.toml"')
-    assert shell_turn["expect_all"] == ["install-shell-proof"]
-    assert scenario["turns"][2] == {
-        "send": "/install unexpected",
-        "expect_all": ["Usage: /install"],
-    }
-    assert scenario["turns"][3] == {
-        "send": "/doctor",
-        "expect_all": [
-            "installation_type: development",
-            "invoked_binary:",
-            "python:",
-            "config_path:",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {"file_contains": ["$REPO/install-proof.txt", "install-proof-ok"]}
-    ]
-
-
-def test_upgrade_scenario_is_acceptance_backed_by_helper_script_help():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["upgrade"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    upgrade_turn = scenario["turns"][0]
-    assert upgrade_turn["send"] == "/upgrade"
-    assert {
-        "upgrade:",
-        "current_version:",
-        "installation_type: development",
-        "project_root:",
-        "upgrade_script:",
-        "scripts/upgrade_dependency.py",
-        "local_update_commands:",
-        "- uv sync --upgrade",
-        "- uv run scripts/upgrade_dependency.py --help",
-        "account_and_model_commands:",
-        "- /model <model>",
-        "- /config",
-        "- koder auth login <provider>",
-    } <= set(upgrade_turn["expect_all"])
-    help_turn = scenario["turns"][1]
-    assert help_turn["send"].startswith('!uv --project "$PYTHONPATH" run --no-sync python')
-    assert "upgrade-help.txt" in help_turn["send"]
-    assert "Checking " in help_turn["send"]
-    assert help_turn["expect_all"] == [
-        "Shell Mode",
-        "Usage: uv run scripts/upgrade_dependency.py [--help]",
-        "upgrade-help-proof",
-    ]
-    assert scenario["turns"][2] == {
-        "send": "/upgrade unexpected",
-        "expect_all": ["Usage: /upgrade"],
-    }
-    assert scenario["turns"][3] == {
-        "send": "/install",
-        "expect_all": [
-            "install:",
-            "runtime_version:",
-            "installation_type: development",
-            "project_root:",
-            "pyproject:",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$REPO/upgrade-help.txt",
-                "Usage: uv run scripts/upgrade_dependency.py [--help]",
-            ]
-        },
-        {"file_not_contains": ["$REPO/upgrade-help.txt", "Checking "]},
     ]
 
 
@@ -1548,102 +1348,6 @@ def test_onboarding_scenario_is_acceptance_backed_by_real_state_transitions():
     ]
 
 
-def test_ide_scenario_is_acceptance_backed_by_stub_launcher():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["ide"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["env"] == {
-        "PATH": "$REPO/bin:$PATH",
-        "TERM_PROGRAM": "ScenarioTerm",
-        "VSCODE_PID": "12345",
-        "KODER_IDE_VERIFY_MARKER": "ide-open-log-ok",
-    }
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    fixture_turn = scenario["turns"][0]
-    assert fixture_turn["send"].startswith("!mkdir -p bin ide-target")
-    assert "ide-fixture" in fixture_turn["expect_all"]
-    status_turn = scenario["turns"][1]
-    assert status_turn["send"] == "/ide"
-    assert "- vscode: Visual Studio Code (cli, code)" in status_turn["expect_all"]
-    assert "- TERM_PROGRAM: ScenarioTerm" in status_turn["expect_all"]
-    assert scenario["turns"][2]["send"] == "/ide open"
-    assert "usage: /ide open <launcher> [path]" in scenario["turns"][2]["expect_all"]
-    assert scenario["turns"][3]["send"] == "/ide open __missing_launcher__ ide-target"
-    assert scenario["turns"][4] == {
-        "send": "/ide nope",
-        "expect_all": ["Usage: /ide [status|open <launcher> [path]]"],
-    }
-    assert scenario["turns"][5]["send"] == "/ide open vscode ide-target"
-    assert "status: launched" in scenario["turns"][5]["expect_all"]
-    assert scenario["turns"][6]["send"].startswith("!grep -F 'stub-code:' ide-open.log")
-    assert scenario["turns"][6]["expect_all"] == ["ide-open-log-ok"]
-    assert scenario["post_assertions"] == [
-        {"file_contains": ["$REPO/ide-open.log", "ide-target"]},
-        {"file_contains": ["$REPO/bin/code", "stub-code"]},
-    ]
-
-
-def test_terminal_setup_scenarios_are_acceptance_backed_by_seeded_env_and_alias():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["terminal-setup"]
-    alias_scenario = manifest["slash_commands"]["terminalSetup"]
-    expected_env = {
-        "TERM": "xterm-256color",
-        "TERM_PROGRAM": "Apple_Terminal",
-        "SHELL": "/bin/zsh",
-        "COLORTERM": "truecolor",
-        "COLUMNS": "132",
-        "LINES": "40",
-    }
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["env"] == expected_env
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0]["send"] == "/terminal-setup"
-    assert "canonical_command: /terminal-setup" in scenario["turns"][0]["expect_all"]
-    assert "aliases: /terminalSetup" in scenario["turns"][0]["expect_all"]
-    assert "TERM: xterm-256color" in scenario["turns"][0]["expect_all"]
-    assert "SHELL: /bin/zsh" in scenario["turns"][0]["expect_all"]
-    assert scenario["turns"][1]["send"] == "/terminal-setup status"
-    assert any(
-        turn.get("send", "").startswith("!printf 'TERM=%s")
-        and "terminal-setup-env-fixture" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert scenario["turns"][-1] == {
-        "send": "/terminal-setup install",
-        "expect_all": ["Usage: /terminal-setup [status]", "aliases: /terminalSetup"],
-    }
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$REPO/terminal-setup-env.txt",
-                ["TERM=xterm-256color", "SHELL=/bin/zsh", "COLUMNS=132"],
-            ]
-        }
-    ]
-
-    assert alias_scenario["validation_level"] == "acceptance"
-    assert alias_scenario["env"] == expected_env
-    assert alias_scenario["acceptance_criteria"]
-    assert alias_scenario["acceptance_artifacts"]
-    assert alias_scenario["turns"][0]["send"] == "/terminalSetup"
-    assert "canonical_command: /terminal-setup" in alias_scenario["turns"][0]["expect_all"]
-    assert alias_scenario["turns"][1]["send"] == "/terminal-setup"
-    assert alias_scenario["turns"][-1]["send"].startswith("!printf 'alias=terminalSetup")
-    assert alias_scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$REPO/terminal-setup-alias-env.txt",
-                ["alias=terminalSetup", "TERM=xterm-256color", "SHELL=/bin/zsh"],
-            ]
-        }
-    ]
-
-
 def test_debug_tool_call_scenario_is_acceptance_backed_by_seeded_records_and_redaction():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["slash_commands"]["debug-tool-call"]
@@ -1747,52 +1451,6 @@ def test_export_scenario_is_acceptance_backed_by_json_markdown_files_and_edges()
                 ["# Koder Session Export: Export Scenario", "assistant: export ready"],
             ]
         },
-    ]
-
-
-def test_copy_scenario_is_acceptance_backed_by_clipboard_fixture_and_edges():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["copy"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert "KODER_CLIPBOARD_COMMAND" in scenario["env"]
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0] == {
-        "send": "/copy",
-        "expect_all": ["copy: no assistant responses available"],
-    }
-    assert any(
-        turn.get("send", "").startswith('!uv --project "$PYTHONPATH"')
-        and "copy-fixture" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/copy"
-        and "copy: copied to clipboard" in turn.get("expect_all", [])
-        and "copy_index: 1" in turn.get("expect_all", [])
-        and "latest copy answer" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/copy 2"
-        and "copy_index: 2" in turn.get("expect_all", [])
-        and "first copy answer" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "!cat clipboard.txt"
-        and "first copy answer" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert scenario["turns"][-2] == {
-        "send": "/copy 3",
-        "expect_all": ["copy: requested response 3 is unavailable", "available_responses: 2"],
-    }
-    assert scenario["turns"][-1] == {"send": "/copy nope", "expect_all": ["Usage: /copy [N]"]}
-    assert scenario["post_assertions"] == [
-        {"file_contains": ["$REPO/copy-seed.txt", "seeded copy session"]},
-        {"file_contains": ["$REPO/clipboard.txt", "first copy answer"]},
     ]
 
 
@@ -2111,81 +1769,6 @@ def test_usage_scenario_is_acceptance_backed_by_persisted_usage_and_clear_edge()
     ]
 
 
-def test_stats_scenario_is_acceptance_backed_by_seeded_database_and_usage_edges():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["stats"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0] == {
-        "send": "/stats",
-        "expect_all": [
-            "## Stats",
-            "Sessions: 1",
-            "Messages: 0",
-            "Active days: 1",
-            "### Current session",
-            "requests: 0",
-            "last_input_tokens: 0",
-            "last_output_tokens: 0",
-            "context_tokens: 0",
-        ],
-    }
-    assert any(
-        turn.get("send")
-        == '!uv --project "$PYTHONPATH" run --no-sync python "$PYTHONPATH/scripts/seed_tmux_stats_fixture.py"'
-        and "stats-fixture: sessions=2 messages=4" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    seeded_turn = scenario["turns"][2]
-    assert seeded_turn["send"] == "/stats"
-    assert "Sessions: 3" in seeded_turn["expect_all"]
-    assert "Messages: 4" in seeded_turn["expect_all"]
-    assert "First session: 1999-01-02" in seeded_turn["expect_all"]
-    assert "Peak day: 1999-01-02" in seeded_turn["expect_all"]
-    assert seeded_turn["expect_regex"] == ["Last session: [0-9]{4}-[0-9]{2}-[0-9]{2}"]
-    assert scenario["turns"][-1] == {
-        "send": "/usage",
-        "expect_all": [
-            "requests: 0",
-            "input_tokens: 0",
-            "output_tokens: 0",
-            "cost: 0.0000",
-            "rate_limit_status: unknown",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {"file_contains": ["$REPO/stats-seed.txt", "seeded stats session rows"]},
-        {
-            "sqlite_contains": [
-                "$HOME/.koder/koder.db",
-                "select count(*) from session_metadata",
-                "3",
-            ]
-        },
-        {
-            "sqlite_contains": [
-                "$HOME/.koder/koder.db",
-                "select count(*) from agent_messages",
-                "4",
-            ]
-        },
-        {
-            "sqlite_contains": [
-                "$HOME/.koder/koder.db",
-                "select session_id, created_at, updated_at from session_metadata where session_id like 'stats-seed-%' order by session_id",
-                [
-                    "stats-seed-a",
-                    "1999-01-02 10:00:00",
-                    "stats-seed-b",
-                    "1999-01-03 11:00:00",
-                ],
-            ]
-        },
-    ]
-
-
 def test_insights_scenario_is_acceptance_backed_by_seeded_session_analytics():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["slash_commands"]["insights"]
@@ -2403,80 +1986,6 @@ def test_version_scenario_is_acceptance_backed_by_cli_version_contract():
         "expect_all": ["(Koder)"],
     }
     assert "post_assertions" not in scenario
-
-
-def test_privacy_settings_scenario_is_acceptance_backed_by_local_storage_and_redaction():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["privacy-settings"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["env"] == {"OPENAI_API_KEY": "privacy-secret-value"}
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    privacy_turn = scenario["turns"][0]
-    assert privacy_turn["send"] == "/privacy-settings"
-    assert "privacy_settings:" in privacy_turn["expect_all"]
-    assert "project_memory:" in privacy_turn["expect_all"]
-    assert "secret_handling:" in privacy_turn["expect_all"]
-    assert "privacy-secret-value" in privacy_turn["expect_not"]
-    assert scenario["turns"][1] == {
-        "send": "/env",
-        "expect_all": ["OPENAI_API_KEY: set"],
-        "expect_not": ["privacy-secret-value"],
-    }
-    assert any(
-        turn.get("send") == "/remember privacy local marker"
-        and "remember: saved" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert scenario["post_assertions"] == [
-        {"file_glob_contains": ["$REPO/.koder/memory/*.md", "privacy local marker"]},
-        {"file_glob_not_contains": ["$REPO/.koder/memory/*.md", "privacy-secret-value"]},
-    ]
-
-
-def test_managed_settings_scenario_is_acceptance_backed_by_policy_lock():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["managed-settings"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    fixture_turn = scenario["turns"][0]
-    assert "$HOME/.koder/managed-settings.json" in fixture_turn["send"]
-    assert "managed-settings-fixture" in fixture_turn["expect_all"]
-
-    managed_turn = scenario["turns"][1]
-    assert managed_turn["send"] == "/managed-settings"
-    assert "checksum: sha256:" in managed_turn["expect_all"]
-    assert "hooks_events: 1" in managed_turn["expect_all"]
-    assert "hooks_groups: 1" in managed_turn["expect_all"]
-    assert "sandbox_policy_locked: true" in managed_turn["expect_all"]
-    assert "sandbox_keys: backend, enabled" in managed_turn["expect_all"]
-
-    sandbox_turn = scenario["turns"][2]
-    assert sandbox_turn == {
-        "send": "/sandbox",
-        "expect_all": ["sandbox_enabled: true", "backend: unix-local", "policy_locked: true"],
-    }
-    lock_turn = scenario["turns"][3]
-    assert lock_turn == {
-        "send": "/sandbox enable docker",
-        "expect_all": [
-            "sandbox: settings locked by managed policy",
-            "sandbox_enabled: true",
-            "policy_locked: true",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$HOME/.koder/managed-settings.json",
-                ["disableAllHooks", "echo managed", "unix-local"],
-            ]
-        },
-        {"path_not_exists": "$REPO/.koder/settings.local.json"},
-    ]
 
 
 def test_project_agent_detail_scenario_is_acceptance_backed_by_lifecycle_assertions():
@@ -3282,35 +2791,6 @@ def test_color_slash_scenario_is_acceptance_backed_by_visible_and_sqlite_state()
     } in scenario["post_assertions"]
 
 
-def test_tag_slash_scenario_is_acceptance_backed_by_visible_and_sqlite_state():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["tag"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0] == {
-        "send": "/tag",
-        "expect_all": ["Usage: /tag <label>"],
-    }
-    assert any(
-        turn.get("send") == "/session" and "tag: scenario-tag" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/tag scenario-tag"
-        and "Tag removed: scenario-tag" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert {
-        "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select coalesce(tag, '<none>') from session_metadata order by updated_at desc limit 1",
-            "<none>",
-        ]
-    } in scenario["post_assertions"]
-
-
 def test_session_slash_scenario_is_acceptance_backed_by_visible_and_sqlite_metadata():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["slash_commands"]["session"]
@@ -3321,18 +2801,15 @@ def test_session_slash_scenario_is_acceptance_backed_by_visible_and_sqlite_metad
     assert scenario["turns"][0]["send"] == "/session"
     assert "hint: use /resume to switch sessions" in scenario["turns"][0]["expect_all"]
     assert any(turn.get("send") == "/rename session-check" for turn in scenario["turns"])
-    assert any(turn.get("send") == "/tag session-tag" for turn in scenario["turns"])
     assert any(
-        turn.get("send") == "/session"
-        and "title: session-check" in turn.get("expect_all", [])
-        and "tag: session-tag" in turn.get("expect_all", [])
+        turn.get("send") == "/session" and "title: session-check" in turn.get("expect_all", [])
         for turn in scenario["turns"][1:]
     )
     assert {
         "sqlite_contains": [
             "$HOME/.koder/koder.db",
-            "select title, tag from session_metadata where title = 'session-check'",
-            ["session-check", "session-tag"],
+            "select title from session_metadata where title = 'session-check'",
+            ["session-check"],
         ]
     } in scenario["post_assertions"]
 
@@ -3410,71 +2887,6 @@ def test_backfill_sessions_scenario_is_acceptance_backed_by_legacy_migration():
             "$HOME/.koder/koder.db",
             "select migrated_sessions from migration_status",
             "1",
-        ]
-    } in scenario["post_assertions"]
-
-
-def test_share_slash_scenario_is_acceptance_backed_by_session_metadata():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["share"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert any(turn.get("send") == "/rename share-title" for turn in scenario["turns"])
-    assert any(turn.get("send") == "/tag share-tag" for turn in scenario["turns"])
-    assert any(turn.get("send") == "/color blue" for turn in scenario["turns"])
-    assert any(
-        turn.get("send") == "/share"
-        and "share session_id:" in turn.get("expect_all", [])
-        and "title: share-title" in turn.get("expect_all", [])
-        and "tag: share-tag" in turn.get("expect_all", [])
-        and "color: blue" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert {
-        "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select title, tag, color from session_metadata where title = 'share-title'",
-            ["share-title", "share-tag", "blue"],
-        ]
-    } in scenario["post_assertions"]
-
-
-def test_teleport_slash_scenario_is_acceptance_backed_by_cwd_metadata():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["teleport"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0]["send"].startswith("!mkdir -p teleport-target")
-    assert any(
-        turn.get("send") == "/teleport missing-target"
-        and "teleport: path not found:" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/teleport teleport-file"
-        and "teleport: not a directory:" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/teleport teleport-target"
-        and "teleport-target" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert any(
-        turn.get("send") == "/session"
-        and "cwd:" in turn.get("expect_all", [])
-        and "teleport-target" in turn.get("expect_all", [])
-        for turn in scenario["turns"]
-    )
-    assert {
-        "sqlite_contains": [
-            "$HOME/.koder/koder.db",
-            "select cwd from session_metadata where cwd like '%teleport-target'",
-            "teleport-target",
         ]
     } in scenario["post_assertions"]
 
@@ -4231,7 +3643,10 @@ def test_autofix_pr_scenario_is_acceptance_backed_by_fake_gh_fixture():
     assert "autofix-pr-gh-fixture" not in scenario["turns"][0]["send"]
     assert scenario["turns"][1] == {
         "send": "/autofix-pr",
-        "expect_all": ["Usage: /autofix-pr #<PR-number>", "Analyzes a PR and suggests fixes."],
+        "expect_all": [
+            "Usage: /autofix-pr #<PR-number>",
+            "Inspects the PR diff size and tells you how to request an automated fix.",
+        ],
     }
     assert scenario["turns"][2] == {
         "send": "/autofix-pr #123",
@@ -4253,107 +3668,6 @@ def test_autofix_pr_scenario_is_acceptance_backed_by_fake_gh_fixture():
             ]
         },
         {"path_not_exists": "$REPO/autofix-pr-output.patch"},
-    ]
-
-
-def test_install_github_app_scenario_is_acceptance_backed_by_fake_gh_fixture():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["install-github-app"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["env"] == {
-        "PATH": "$REPO/bin:$PATH",
-        "KODER_API_KEY": "scenario-secret-token",
-    }
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert "fake_gh_install_github_app.sh" in scenario["turns"][0]["send"]
-    assert "install-github-app-gh-fixture" not in scenario["turns"][0]["send"]
-    assert scenario["turns"][1] == {
-        "send": "/install-github-app",
-        "expect_all": [
-            "github_actions:",
-            "integration_scope: local gh CLI + GitHub Actions workflow",
-            "repo: acme/demo",
-            "gh: gh version 2.99.0 (scenario)",
-            "auth: ok",
-            "local_workflows:",
-            "- .github/workflows/koder.yml: missing",
-            "- .github/workflows/koder-review.yml: missing",
-        ],
-    }
-    assert scenario["turns"][2]["send"].startswith("/install-github-app plan acme/demo")
-    assert {
-        "github_actions: plan",
-        "repo: acme/demo",
-        "secret_env_status: configured",
-        "model_variable: gpt-4.1",
-        "base_url_variable: https://scenario-base.invalid/v1",
-        "branch: setup/koder",
-        "mutation: none",
-        "apply_command: /install-github-app apply acme/demo",
-        "--secret-env KODER_API_KEY",
-        "--model gpt-4.1",
-        "--base-url https://scenario-base.invalid/v1",
-        "--branch",
-        "setup/koder",
-    } <= set(scenario["turns"][2]["expect_all"])
-    assert scenario["turns"][3]["send"].startswith("/install-github-app apply acme/demo")
-    assert {
-        "github_actions: applied",
-        "branch: setup/koder",
-        "- .github/workflows/koder.yml: written",
-        "- .github/workflows/koder-review.yml: written",
-        "secret: KODER_API_KEY",
-        "- KODER_MODEL: set",
-        "- KODER_BASE_URL: set",
-        "compare_url:",
-        "https://github.com/acme/demo/compare/main...setup/koder",
-    } <= set(scenario["turns"][3]["expect_all"])
-    assert "install-github-app-apply-proof" not in scenario["turns"][4]["send"]
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$HOME/.koder/install-github-app-gh.log",
-                [
-                    "auth status -h github.com",
-                    "api GET repos/acme/demo --jq .permissions.admin",
-                    "api POST repos/acme/demo/git/refs ref=refs/heads/setup/koder sha=abc123",
-                    "api PUT repos/acme/demo/contents/.github/workflows/koder.yml branch=setup/koder",
-                    "api PUT repos/acme/demo/contents/.github/workflows/koder-review.yml branch=setup/koder",
-                    "secret set KODER_API_KEY --repo acme/demo stdin-bytes=21 stdin-matches-env=yes",
-                    "variable set KODER_MODEL --body gpt-4.1 --repo acme/demo",
-                    "variable set KODER_BASE_URL --body https://scenario-base.invalid/v1 --repo acme/demo",
-                ],
-            ]
-        },
-        {
-            "file_not_contains": [
-                "$HOME/.koder/install-github-app-gh.log",
-                ["scenario-secret-token", "git push"],
-            ]
-        },
-        {
-            "file_contains": [
-                "$HOME/.koder/remote-workflows/.github/workflows/koder.yml",
-                [
-                    "name: Koder Assistant",
-                    "workflow_dispatch:",
-                    "uvx --from koder koder --print",
-                ],
-            ]
-        },
-        {
-            "file_contains": [
-                "$HOME/.koder/remote-workflows/.github/workflows/koder-review.yml",
-                [
-                    "name: Koder Pull Request Review",
-                    "pull_request:",
-                    "Review this pull request diff",
-                ],
-            ]
-        },
-        {"path_not_exists": "$REPO/.git/refs/remotes/origin/setup/koder"},
     ]
 
 
@@ -4398,52 +3712,6 @@ def test_oauth_refresh_scenario_is_acceptance_backed_by_seeded_tokens():
         {"file_contains": ["$HOME/.koder/tokens/google.json", "google@example.invalid"]},
         {"file_contains": ["$HOME/.koder/tokens/claude.json", "claude@example.invalid"]},
         {"file_contains": ["$HOME/.koder/tokens/chatgpt.json", "{not json"]},
-    ]
-
-
-def test_rate_limit_options_scenario_is_acceptance_backed_by_runtime_state():
-    manifest = _load_manifest(DEFAULT_MANIFEST)
-    scenario = manifest["slash_commands"]["rate-limit-options"]
-
-    assert scenario["validation_level"] == "acceptance"
-    assert scenario["acceptance_criteria"]
-    assert scenario["acceptance_artifacts"]
-    assert scenario["turns"][0]["send"] == "/rate-limit-options"
-    assert {
-        "provider: openai",
-        "model: gpt-4.1",
-        "requests: 0",
-        "retryable_errors: rate_limit, overloaded, timeout, connection, server",
-        "/usage to inspect current counters",
-    } <= set(scenario["turns"][0]["expect_all"])
-    assert scenario["turns"][1]["send"] == "/model anthropic/claude-sonnet-4-6"
-    assert scenario["turns"][2] == {
-        "send": "/rate-limit-options",
-        "expect_all": [
-            "rate-limit-options:",
-            "provider: anthropic",
-            "model: claude-sonnet-4-6",
-            "requests: 0",
-            "retryable_errors: rate_limit, overloaded, timeout, connection, server",
-        ],
-    }
-    assert scenario["turns"][3] == {
-        "send": "/usage",
-        "expect_all": [
-            "requests: 0",
-            "input_tokens: 0",
-            "output_tokens: 0",
-            "cost: 0.0000",
-            "rate_limit_status: unknown",
-        ],
-    }
-    assert scenario["post_assertions"] == [
-        {
-            "file_contains": [
-                "$HOME/.koder/config.yaml",
-                ["name: claude-sonnet-4-6", "provider: anthropic"],
-            ]
-        }
     ]
 
 
@@ -4506,8 +3774,8 @@ def test_rewind_scenario_is_acceptance_backed_by_prompt_restore_and_db_trim():
         "send": "/rewind",
         "expect_all": [
             "Rewind targets",
-            "1. second prompt",
-            "2. first prompt",
+            "1. second prompt (removes 2 newer transcript items)",
+            "2. first prompt (removes 4 newer transcript items)",
             "Use /rewind <number> to restore the conversation and place that prompt back into the input.",
         ],
     }
@@ -4525,7 +3793,11 @@ def test_rewind_scenario_is_acceptance_backed_by_prompt_restore_and_db_trim():
     }
     assert scenario["turns"][5] == {
         "send": "/rewind 1",
-        "expect_all": ["Rewound conversation to prompt 1.", "Restored input: second prompt"],
+        "expect_all": [
+            "Rewound conversation to prompt 1.",
+            "Removed transcript items: 2",
+            "Restored input: second prompt",
+        ],
     }
     assert scenario["turns"][6] == {
         "type": " plus",

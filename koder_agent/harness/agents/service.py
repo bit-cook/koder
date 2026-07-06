@@ -374,6 +374,30 @@ class AgentService:
             Path(updated.output_path).write_text("Cancelled", encoding="utf-8")
         return updated
 
+    def _cleanup_clean_worktree(self, record: AgentRecord) -> bool:
+        """Remove a completed agent's isolation worktree when it has no changes.
+
+        Dispatches ``WorktreeRemove`` hooks via WorktreeService.exit(). Dirty
+        worktrees are kept so the user can inspect or merge the agent's work.
+        Returns True when the worktree was removed.
+        """
+        if not record.worktree_path:
+            return False
+        path = Path(record.worktree_path)
+        repo_root = None
+        # The worktree lives under <repo>/.koder/worktrees/<slug>; walk up to
+        # find the owning repository root.
+        for parent in path.parents:
+            if (parent / ".git").exists():
+                repo_root = parent
+                break
+        try:
+            service = WorktreeService(path.parent, repo_root=repo_root)
+            return service.remove_if_clean(path, branch=record.worktree_branch)
+        except Exception:
+            logger.debug("Worktree cleanup failed for %s", record.worktree_path, exc_info=True)
+            return False
+
     async def _run_background(
         self,
         *,
@@ -418,11 +442,13 @@ class AgentService:
                 state="completed",
             )
             timestamp = _utc_now_iso()
+            worktree_removed = self._cleanup_clean_worktree(record)
             updated = replace(
                 self.get(agent_id),
                 state="completed",
                 error=None,
                 updated_at=timestamp,
+                worktree_path=None if worktree_removed else record.worktree_path,
             )
             self._agents[agent_id] = self._with_summary(
                 updated,

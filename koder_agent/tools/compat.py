@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import Callable
 from functools import wraps
@@ -9,9 +11,12 @@ from typing import Any
 
 from agents import FunctionTool
 from agents import function_tool as _agents_function_tool
+from agents.tool import default_tool_error_function
 from agents.tool_context import ToolContext
 
 from .permission_context import enforce_tool_permission
+
+logger = logging.getLogger(__name__)
 
 # Default maximum number of characters for a tool's string result before it is
 # truncated to a head+tail window. Configurable via ``KODER_MAX_TOOL_OUTPUT_CHARS``.
@@ -89,9 +94,49 @@ def _wrap_none_context(tool: FunctionTool) -> FunctionTool:
     return tool
 
 
+def _dispatching_tool_error_function(ctx: Any, error: Exception) -> str:
+    """SDK ``failure_error_function`` that dispatches ``PostToolUseFailure`` hooks.
+
+    The SDK converts tool exceptions into a model-facing error string via this
+    callback; it is the one place on the main agent chain that observes every
+    tool failure, so the hook event is dispatched here. Hook problems never
+    mask the original tool error.
+    """
+    tool_name = getattr(ctx, "tool_name", None) or "unknown"
+    tool_input: dict[str, Any] = {}
+    raw_args = getattr(ctx, "tool_arguments", None)
+    if raw_args:
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                tool_input = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    try:
+        from pathlib import Path
+
+        from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+
+        dispatch_command_hooks(
+            cwd=Path.cwd(),
+            event_name="PostToolUseFailure",
+            match_value=tool_name,
+            payload={
+                "event": "PostToolUseFailure",
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "error": str(error),
+            },
+        )
+    except Exception:
+        logger.debug("PostToolUseFailure hook dispatch failed for %s", tool_name, exc_info=True)
+    return default_tool_error_function(ctx, error)
+
+
 def function_tool(func: Callable[..., Any] | None = None, **kwargs: Any) -> Any:
     """Wrap ``agents.function_tool`` while preserving legacy ``ctx=None`` invocations."""
 
+    kwargs.setdefault("failure_error_function", _dispatching_tool_error_function)
     decorated = _agents_function_tool(func, **kwargs)
     if isinstance(decorated, FunctionTool):
         return _wrap_none_context(decorated)

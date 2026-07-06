@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from koder_agent.harness.agents.teams.tmux_backend import (
     TmuxBackend,
     get_current_tmux_session_name,
@@ -29,10 +31,12 @@ def resolve_teammate_mode(
     config_service: RuntimeConfigService | None = None,
     cli_mode: str | None = None,
 ) -> str:
-    """Resolve teammate display mode using CLI override then persisted config."""
-
+    """Resolve teammate display mode: CLI > ENV > Config > Default."""
     if cli_mode in {"auto", "tmux", "in-process"}:
         return cli_mode
+    env_mode = os.environ.get("KODER_TEAMMATE_MODE")
+    if env_mode in {"auto", "tmux", "in-process"}:
+        return env_mode
     if config_service is None:
         return "auto"
     mode = config_service.load().harness.teammate_mode

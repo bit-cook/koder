@@ -1,13 +1,31 @@
-"""Bundled skills that ship with koder."""
+"""Bundled skills that ship with koder, loaded from markdown files.
+
+Each bundled skill lives in ``bundled_skills/<name>.md`` next to this module,
+with YAML frontmatter declaring ``name``, ``description``, and optionally
+``argument_hint`` and ``disable_model_invocation``. The markdown body is the
+skill prompt; ``$ARGUMENTS`` is substituted with user arguments at runtime.
+"""
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import yaml
 
 if TYPE_CHECKING:
     from koder_agent.tools.skill import Skill
+
+logger = logging.getLogger(__name__)
+
+BUNDLED_SKILLS_DIR = Path(__file__).parent / "bundled_skills"
+
+# Same frontmatter shape as SkillLoader.FRONTMATTER_RE in koder_agent.tools.skill
+# (duplicated here because tools.skill imports this module).
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(?P<yaml>.*?)\n---\s*\n?(?P<body>.*)$", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -22,113 +40,71 @@ class BundledSkillDefinition:
     agent: str | None = None
 
 
+def _meta_get(meta: dict[str, Any], key: str) -> Any:
+    """Read a frontmatter key, accepting underscore or hyphen spelling."""
+    if key in meta:
+        return meta[key]
+    return meta.get(key.replace("_", "-"))
+
+
+def _parse_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_skill_file(path: Path) -> BundledSkillDefinition | None:
+    """Parse one bundled skill markdown file, returning None if malformed."""
+    try:
+        text = path.read_text(encoding="utf-8").lstrip("\ufeff")
+    except OSError as exc:
+        logger.warning("Failed to read bundled skill %s: %s", path, exc)
+        return None
+
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        logger.warning("Bundled skill %s has no YAML frontmatter; skipping", path)
+        return None
+
+    try:
+        meta = yaml.safe_load(match.group("yaml")) or {}
+    except yaml.YAMLError as exc:
+        logger.warning("Invalid YAML frontmatter in bundled skill %s: %s", path, exc)
+        return None
+    if not isinstance(meta, dict):
+        logger.warning("Frontmatter in bundled skill %s must be a mapping; skipping", path)
+        return None
+
+    name = str(meta.get("name") or "").strip()
+    description = str(meta.get("description") or "").strip()
+    if not name or not description:
+        logger.warning("Bundled skill %s is missing name or description; skipping", path)
+        return None
+
+    argument_hint = _meta_get(meta, "argument_hint")
+    return BundledSkillDefinition(
+        name=name,
+        description=description,
+        content=match.group("body").lstrip("\n"),
+        argument_hint=str(argument_hint) if argument_hint is not None else None,
+        disable_model_invocation=_parse_bool(_meta_get(meta, "disable_model_invocation")),
+        user_invocable=_parse_bool(_meta_get(meta, "user_invocable"), default=True),
+    )
+
+
 def _definitions() -> list[BundledSkillDefinition]:
-    return [
-        BundledSkillDefinition(
-            name="batch",
-            description="Research and plan a large-scale change, then execute it in parallel across isolated worktree agents.",
-            argument_hint="<instruction>",
-            disable_model_invocation=True,
-            content=(
-                "Plan a large batch change for $ARGUMENTS.\n\n"
-                "1. Research the codebase and break the work into independent units.\n"
-                "2. Require one worktree-isolated background subagent per unit.\n"
-                "3. Give each worker a concrete verification recipe.\n"
-                "4. Track PR/status output for each worker."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="claude-api",
-            description="Load Claude API and SDK guidance for the current language or use case.",
-            content=(
-                "Help with Claude API or SDK usage for $ARGUMENTS.\n\n"
-                "Focus on the current project language, tool use, structured output, streaming, "
-                "batches, and common pitfalls."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="debug",
-            description="Enable debug logging for the session and diagnose issues from the debug log.",
-            argument_hint="[issue description]",
-            disable_model_invocation=True,
-            content=(
-                "Debug the current koder session for $ARGUMENTS.\n\n"
-                "1. Inspect the relevant debug and runtime state.\n"
-                "2. Summarize errors or warnings.\n"
-                "3. Suggest concrete next steps."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="loop",
-            description="Run a prompt or slash command on a recurring interval.",
-            argument_hint="[interval] <prompt>",
-            disable_model_invocation=True,
-            content=(
-                "Use the /loop runtime command for $ARGUMENTS.\n\n"
-                "Create, list, or delete durable scheduled prompts via /loop rather than invoking "
-                "this bundled skill through the model."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="simplify",
-            description="Review changed code for reuse, quality, and efficiency, then fix issues found.",
-            content=(
-                "Review the changed code and simplify it.\n\n"
-                "1. Look for reuse opportunities.\n"
-                "2. Look for quality issues.\n"
-                "3. Look for efficiency problems.\n"
-                "4. Apply fixes and summarize the cleanup."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="remember",
-            description="Save important context to persistent memory for future sessions.",
-            argument_hint="<what to remember>",
-            content=(
-                "Save the following to persistent memory: $ARGUMENTS\n\n"
-                "1. Determine the memory type (user, feedback, project, or reference).\n"
-                "2. Write a memory file to the project's .koder/memory/ directory.\n"
-                "3. Update MEMORY.md index with a one-line entry.\n"
-                "4. Confirm what was saved and why it will be useful."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="stuck",
-            description="Diagnose why you're stuck and try alternative approaches.",
-            content=(
-                "You appear to be stuck. Diagnose and recover.\n\n"
-                "1. Identify what you were trying to do and what went wrong.\n"
-                "2. List 3 alternative approaches you haven't tried.\n"
-                "3. Pick the most promising alternative and explain why.\n"
-                "4. Execute that approach immediately.\n"
-                "5. If still stuck after the alternative, escalate to the user with a clear description of the blocker."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="verify",
-            description="Verify that recent changes work correctly before declaring done.",
-            content=(
-                "Verify the recent changes are correct.\n\n"
-                "1. Identify what was just changed (check git diff or recent tool calls).\n"
-                "2. Run relevant tests (find test files, run them).\n"
-                "3. Check for lint/type errors (run the project's lint command).\n"
-                "4. Verify the change actually solves the original request.\n"
-                "5. Report: what was verified, what passed, what failed."
-            ),
-        ),
-        BundledSkillDefinition(
-            name="update-config",
-            description="Update koder settings and configuration via settings.json.",
-            argument_hint="<setting to change>",
-            content=(
-                "Update koder configuration for $ARGUMENTS.\n\n"
-                "1. Read the current settings from .koder/settings.json and ~/.koder/settings.json.\n"
-                "2. Identify the setting to change.\n"
-                "3. Apply the change to the appropriate scope (project or user).\n"
-                "4. Confirm what was changed and where."
-            ),
-        ),
-    ]
+    if not BUNDLED_SKILLS_DIR.is_dir():
+        logger.warning("Bundled skills directory not found: %s", BUNDLED_SKILLS_DIR)
+        return []
+
+    definitions: list[BundledSkillDefinition] = []
+    for path in sorted(BUNDLED_SKILLS_DIR.glob("*.md")):
+        definition = _parse_skill_file(path)
+        if definition is not None:
+            definitions.append(definition)
+    return definitions
 
 
 def get_bundled_skills() -> dict[str, Skill]:
@@ -146,6 +122,6 @@ def get_bundled_skills() -> dict[str, Skill]:
             argument_hint=definition.argument_hint,
             execution_context=definition.execution_context,
             agent=definition.agent,
-            base_dir=Path("<bundled>"),
+            base_dir=BUNDLED_SKILLS_DIR,
         )
     return bundled

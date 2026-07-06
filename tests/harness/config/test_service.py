@@ -19,12 +19,12 @@ def test_runtime_config_service_round_trips_schema(tmp_path):
     config_path = tmp_path / "config.yaml"
     service = RuntimeConfigService(config_path)
     config = service.load()
-    config.harness.interactive_shell = "legacy"
+    config.harness.permission_mode = "bypass"
     config.voice.provider = "google"
     config.voice.model = "gemini-2.5-flash"
     config.voice.api_version = "2025-04-01-preview"
     service.save(config)
-    assert service.load().harness.interactive_shell == "legacy"
+    assert service.load().harness.permission_mode == "bypass"
     assert service.load().voice.provider == "google"
     assert service.load().voice.model == "gemini-2.5-flash"
     assert service.load().voice.api_version == "2025-04-01-preview"
@@ -33,7 +33,7 @@ def test_runtime_config_service_round_trips_schema(tmp_path):
 def test_runtime_config_service_migrates_legacy_harness_voice_fields(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "harness:\n  interactive_shell: runtime\n  permission_mode: default\n  voice_enabled: true\n  voice_provider: google\n",
+        "harness:\n  permission_mode: default\n  voice_enabled: true\n  voice_provider: google\n",
         encoding="utf-8",
     )
     service = RuntimeConfigService(config_path)

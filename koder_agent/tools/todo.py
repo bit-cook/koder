@@ -71,7 +71,31 @@ def _format_todo_list(todos: List[dict], *, title: str = "Current Plan") -> str:
 
 @function_tool
 def todo_write(todos: List[TodoItem]) -> str:
-    """Write/update the todo list."""
+    """Write/update the todo list.
+
+    Replaces the entire list; pass an empty list to clear it.
+
+    When to use:
+      - Non-trivial work with 3+ distinct steps.
+      - The user gives multiple tasks or requests in one message.
+      - Multi-step work where the user benefits from visible progress.
+
+    When NOT to use:
+      - A single, trivial task - just do it.
+      - Purely conversational or informational requests.
+
+    Status discipline: mark exactly one item in_progress before starting
+    it, and mark it completed IMMEDIATELY after finishing - do not batch
+    several completions into one call at the end. NEVER mark an item
+    completed while tests are failing, the implementation is partial, or
+    errors remain unresolved; keep it in_progress and surface the blocker
+    (add a new item for it if needed).
+
+    Args:
+        todos: Full todo list; each item has content (task text), status
+            (pending, in_progress, or completed), priority (high, medium,
+            or low), and a stable string id
+    """
     # Convert TodoItem objects to dictionaries
     _store.todos = [todo.model_dump() for todo in todos]
 

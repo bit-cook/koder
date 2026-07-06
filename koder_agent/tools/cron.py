@@ -36,7 +36,13 @@ def _human_schedule(cron: str) -> str:
 
 
 def cron_create(cron: str, prompt: str, recurring: bool = True) -> str:
-    """Create a scheduled task that runs on a cron schedule."""
+    """Create a scheduled task that runs on a cron schedule.
+
+    Args:
+        cron: Standard 5-field cron expression in local time, e.g. "0 9 * * 1-5"
+        prompt: Prompt to run each time the schedule fires
+        recurring: True to fire on every match; False to fire once then auto-delete
+    """
     error = _validate_cron(cron)
     if error:
         return json.dumps({"error": f"Invalid cron expression: {error}"})
@@ -57,7 +63,11 @@ def cron_create(cron: str, prompt: str, recurring: bool = True) -> str:
 
 
 def cron_delete(id: str) -> str:
-    """Delete a scheduled cron job by its ID."""
+    """Delete a scheduled cron job by its ID.
+
+    Args:
+        id: Job ID as returned by cron_create or cron_list
+    """
     storage = _get_cron_storage()
     if storage.delete(id):
         return json.dumps({"id": id})

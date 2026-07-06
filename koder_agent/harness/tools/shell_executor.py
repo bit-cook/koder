@@ -179,7 +179,9 @@ async def execute_shell_command(
                 output=(
                     "sandboxed: false\n"
                     f"backend: {sandbox_state.backend}\n"
-                    "reason: background sandbox execution is not implemented"
+                    "reason: background sandbox execution is not implemented; run the "
+                    "command in the foreground, add a sandbox exclusion with "
+                    "/sandbox exclude, or run /sandbox disable"
                 ),
             )
         elif sandbox_state.policy is not None:

@@ -159,53 +159,6 @@ def test_tmux_session_start_hook_fires(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test: CwdChanged hook fires on /teleport
-# ---------------------------------------------------------------------------
-
-
-def test_tmux_cwd_changed_hook_fires_on_teleport(tmp_path):
-    """CwdChanged hook fires when user runs /teleport."""
-    _skip_no_tmux()
-
-    target = tmp_path / "target"
-    target.mkdir()
-    marker = tmp_path / "cwd-changed.txt"
-    _write_user_settings(
-        tmp_path,
-        {
-            "hooks": {
-                "CwdChanged": [
-                    {
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": f"python -c \"import pathlib; pathlib.Path(r'{marker}').write_text('changed')\"",
-                            }
-                        ]
-                    }
-                ]
-            }
-        },
-    )
-
-    session = f"koder-cwd-{uuid.uuid4().hex[:6]}"
-    try:
-        _launch(session, tmp_path)
-        _send(session, f"/teleport {target}")
-        _wait_for(session, str(target.resolve()), timeout=8.0)
-        time.sleep(1.0)
-
-        assert marker.exists(), "CwdChanged hook did not fire on /teleport"
-        assert marker.read_text(encoding="utf-8") == "changed"
-    finally:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session],
-            text=True,
-            capture_output=True,
-        )
-
-
-# ---------------------------------------------------------------------------
 # Test: once:true hook fires and marker proves execution
 # ---------------------------------------------------------------------------
 

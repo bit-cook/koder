@@ -6,7 +6,6 @@ SESSION_COMMAND_SPECS = {
     "rename": {"help_text": "Rename the active session"},
     "status": {"help_text": "Show runtime status"},
     "usage": {"help_text": "Show session usage totals"},
-    "stats": {"help_text": "Show session statistics"},
     "effort": {"help_text": "Show or change reasoning effort"},
     "reasoning": {"help_text": "Show or change reasoning display"},
 }

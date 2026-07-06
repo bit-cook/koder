@@ -10,7 +10,6 @@ class NotificationConfig:
     """Configuration for desktop notifications."""
 
     enabled: bool = True
-    sound: bool = False
 
 
 def detect_terminal() -> str:

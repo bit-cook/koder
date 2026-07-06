@@ -74,12 +74,15 @@ def test_tmux_buddy_runs_through_uv_interactive_session(tmp_path):
     launch = " ".join(
         [
             "cd",
-            shlex.quote(str(PROJECT_ROOT)),
+            shlex.quote(str(repo)),
             "&&",
             "HOME=" + shlex.quote(str(home)),
             "USER=tmux-buddy",
             "uv",
+            "--project",
+            shlex.quote(str(PROJECT_ROOT)),
             "run",
+            "--no-sync",
             "python",
             "-c",
             shlex.quote(script),
@@ -88,8 +91,6 @@ def test_tmux_buddy_runs_through_uv_interactive_session(tmp_path):
     try:
         _tmux("new-session", "-d", "-s", session, launch)
         _wait_for_prompt(session)
-        _send(session, f"/teleport {repo}")
-        _wait_for_output(session, "cwd:")
         _send(session, "/buddy")
         output = _wait_for_output(session, "buddy: hatched")
         assert "buddy: hatched" in output

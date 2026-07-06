@@ -543,7 +543,11 @@ class ClaudeOAuthLLM(CustomLLM):
         messages: List[Dict[str, Any]],
         **kwargs: Any,
     ) -> ModelResponse:
-        """Synchronous completion (not implemented - use async)."""
+        """Sync entry point of the litellm CustomLLM contract.
+
+        Koder's runtime invokes providers exclusively through the async
+        litellm paths, so the sync interface is intentionally async-only.
+        """
         raise NotImplementedError("Use acompletion for Claude OAuth")
 
     async def acompletion(
@@ -584,7 +588,11 @@ class ClaudeOAuthLLM(CustomLLM):
         messages: List[Dict[str, Any]],
         **kwargs: Any,
     ) -> Iterator[GenericStreamingChunk]:
-        """Synchronous streaming (not implemented - use async)."""
+        """Sync entry point of the litellm CustomLLM contract.
+
+        Koder's runtime invokes providers exclusively through the async
+        litellm paths, so the sync interface is intentionally async-only.
+        """
         raise NotImplementedError("Use astreaming for Claude OAuth")
 
     async def astreaming(

@@ -60,6 +60,8 @@ Koder shows environment variable names and dependency hints, not secret values.
 | `backend_available` | Whether that backend can run on this machine right now. |
 | `backend_reason` | Why the backend is available or unavailable. |
 | `mode` | The high-level filesystem mode. The default enabled mode is `workspace-write`. |
+| `network_policy_enforcement` | Whether the selected backend enforces network policy. `unsupported` means network settings are metadata only. |
+| `allowed_domains` / `denied_domains` | Domain lists from policy. Marked `(policy metadata, not enforced)` because no current backend enforces them. |
 | `protected_paths` | Metadata paths Koder blocks before sandbox execution. |
 | `settings_path` | The project-local settings file Koder writes when you run `/sandbox enable` or `/sandbox disable`. |
 | `backend_options` | The supported backend names. |
@@ -75,11 +77,13 @@ These surfaces are still protected by permissions, but are not currently routed 
 | Surface | Current behavior |
 |---|---|
 | File tools such as `read_file`, `write_file`, and `edit_file` | Permission and workspace-root checks. |
-| Background shell commands | Denied while sandbox is enabled because background sandbox execution is not implemented. |
-| PowerShell commands | Denied while sandbox is enabled because PowerShell sandbox execution is not implemented. |
-| MCP servers | Not sandboxed unless a future server launcher routes the process through a backend. |
+| Background shell commands | Denied while sandbox is enabled. The denial message suggests running in the foreground, adding a `/sandbox exclude` rule, or `/sandbox disable`. |
+| PowerShell commands | Denied while sandbox is enabled. The denial message suggests adding a `/sandbox exclude` rule or `/sandbox disable`. |
+| MCP servers | Deliberately permission-only. MCP server processes are not routed through sandbox backends. |
 | Skills | Skill metadata is read normally. Helper shell commands only inherit sandboxing when they go through foreground `run_shell`. |
-| Agents and teams | Not yet routed through sandbox backends. |
+| Agents and teams | Deliberately permission-only. Agent and teammate tool calls go through the same permission engine but are not routed through sandbox backends. |
+
+Note that commands matched by a `/sandbox exclude` rule bypass these sandbox denials entirely and fall back to the normal permission flow.
 
 ## Configuration
 
@@ -102,7 +106,7 @@ You can also set sandbox policy in these files:
 | `~/.koder/settings.json` | User default policy. |
 | `.koder/settings.json` | Shared project policy. |
 | `.koder/settings.local.json` | Local project override, usually not committed. |
-| `~/.koder/managed-settings.json` | High-priority local managed policy. |
+| `~/.koder/managed-settings.json` | High-priority local managed policy file. |
 
 Older backend aliases are normalized to the current backend names in status output.
 
@@ -131,7 +135,7 @@ Koder blocks direct write targets under those paths before starting a sandboxed 
 
 ## Network Policy
 
-Sandboxed shell network access defaults to disabled in policy. `allowedDomains` and `deniedDomains` are accepted in settings and shown in status, but they are policy-only for `unix-local`. Koder does not currently provide a domain proxy for local shell commands.
+Sandboxed shell network access defaults to disabled in policy. `allowedDomains` and `deniedDomains` are accepted in settings and shown in status, but no current backend enforces them: `/sandbox status` reports `network_policy_enforcement: unsupported` for `unix-local` and labels the domain lists as `(policy metadata, not enforced)`. The `networkAccess` flag itself is also not enforced by the `unix-local` backend. Koder does not currently provide a domain proxy for local shell commands.
 
 Shell network policy is separate from model-provider access and Koder's own web search or web fetch tools.
 

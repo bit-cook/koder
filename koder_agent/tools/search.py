@@ -23,7 +23,40 @@ class GrepModel(BaseModel):
 
 @function_tool
 def glob_search(pattern: str, path: Optional[str] = None) -> str:
-    """Search for files matching a glob pattern."""
+    """Find files by name or path using a glob pattern.
+
+    Matches file NAMES and paths only; it never looks inside files (use
+    grep_search for contents). Prefer this over `find` or `ls` via
+    run_shell: it is faster and skips noise directories automatically.
+
+    When to use:
+      - Locate files by name, extension, or path (e.g. "**/*test*.py").
+      - Discover a codebase's layout before diving in.
+      - Find the most recently modified files matching a pattern.
+
+    Routing: file names/paths -> glob_search; file contents -> grep_search.
+    grep_search accepts its own glob filter, so "search inside these file
+    types" usually needs a single grep_search call, not both. For broad,
+    open-ended exploration likely to take many searches, prefer
+    task_delegate with an exploration prompt.
+
+    Output: paths relative to the base directory, sorted by modification
+    time (newest first), capped at 100 entries. Directories appear as
+    [DIR] and files as [FILE] with size. Hidden directories (except
+    .github and .vscode) plus __pycache__, node_modules, .venv, venv, and
+    .git are skipped. Returns "No matches found" (not an error) when
+    nothing matches.
+
+    Tips: `*` does not cross directory separators, `**` does. Omit path
+    to search the working directory; do not pass "" or a placeholder.
+
+    Args:
+        pattern: Glob pattern matched against file names, e.g. "**/*test*" or "src/**/*.py"
+        path: Base directory to search in (defaults to cwd); a plain directory, not a pattern
+
+    Returns:
+        Matching files sorted by modification time (newest first)
+    """
     try:
         base_path = Path(path) if path else Path.cwd()
 
@@ -100,7 +133,25 @@ def grep_search(
     context_before: Optional[int] = None,
     line_numbers: Optional[bool] = None,
 ) -> str:
-    """Search for pattern in file contents using ripgrep.
+    """Search file CONTENTS for a regex pattern using ripgrep.
+
+    Use to find where a function, class, string, or pattern is defined or
+    used. Always prefer this over `grep`/`rg` via run_shell: it is
+    purpose-built, respects .gitignore, and returns clean relative paths.
+    (To find files by NAME, use glob_search instead.)
+
+    Output modes: "files_with_matches" (default) lists matching files
+    sorted by modification time, newest first; "content" returns the
+    matching lines (supports line numbers and context flags); "count"
+    returns per-file match counts plus a total. Results are capped at
+    head_limit (default 250); use offset to paginate. Searches time out
+    after 30 seconds and lines are clipped at 500 columns.
+
+    Tips: pattern is a regex, not a literal string - escape ., (, [, etc.
+    Filter early with glob or type instead of searching everything; that
+    replaces a separate glob_search + grep_search chain. Patterns match
+    per line unless multiline=True. When context is set it overrides
+    context_after/context_before.
 
     Args:
         pattern: Regex pattern to search for

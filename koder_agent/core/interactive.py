@@ -13,7 +13,12 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition, control_is_searchable, is_searching
+from prompt_toolkit.filters import (
+    Condition,
+    control_is_searchable,
+    is_searching,
+    vi_insert_mode,
+)
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
@@ -36,6 +41,7 @@ from ..utils.terminal_theme import get_adaptive_console, get_adaptive_prompt_sty
 from .keybindings import KeybindingManager
 from .terminal_reflow import attach_prompt_resize_reflow, print_reflowable
 from .vim_mode import VimModeManager
+from .working_indicator import working_indicator
 
 if TYPE_CHECKING:
     from .file_index import ProjectFileIndex
@@ -225,14 +231,34 @@ class StreamingOutputController:
     """Prompt-toolkit owned output pane for interactive streaming turns."""
 
     def __init__(self) -> None:
-        self._text = "thinking..."
+        # Empty until the first stream event; the working-indicator line above
+        # the input box carries the "esc to interrupt" affordance meanwhile.
+        self._text = ""
         self._app: Application | None = None
         self._final_content: Any = None
         self._final_text: str | None = None
+        self._cancel_callback: Optional[Callable[[], None]] = None
 
     def attach_app(self, app: Application) -> None:
         self._app = app
         app.invalidate()
+
+    def set_cancel_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Register (or clear) the scheduler's turn-cancellation hook.
+
+        While the fixed-bottom input box is active, prompt_toolkit owns stdin,
+        so the raw-terminal ESC listener cannot run; the ESC keybinding routes
+        through this callback instead.
+        """
+        self._cancel_callback = callback
+
+    def request_cancel(self) -> bool:
+        """Dispatch a user cancellation (ESC) to the active streaming turn."""
+        callback = self._cancel_callback
+        if callback is None:
+            return False
+        callback()
+        return True
 
     def set_message(self, text: str) -> None:
         self._text = text
@@ -616,6 +642,17 @@ class InteractivePrompt:
         kb = KeyBindings()
         self._apply_keybinding_overrides(kb)
 
+        if stream_output is not None:
+            # While streaming, prompt_toolkit owns stdin, so the raw-terminal
+            # ESC listener in the scheduler cannot see key presses. Route a
+            # standalone ESC through the streaming controller to cancel the
+            # in-flight turn. Non-eager so escape-prefixed sequences (arrow
+            # keys, Alt+Enter) keep working; excluded in vi insert mode so ESC
+            # still exits to normal mode first (press ESC again to cancel).
+            @kb.add("escape", filter=~is_searching & ~vi_insert_mode)
+            def cancel_streaming_turn(event):
+                stream_output.request_cancel()
+
         # Create buffer control with "> " prefix and ghost text
         search_toolbar = SearchToolbar(search_buffer=Buffer(accept_handler=submit_search_buffer))
         search_toolbar.control.key_bindings = search_key_bindings
@@ -713,6 +750,22 @@ class InteractivePrompt:
 
         tip_line_window = Window(
             content=FormattedTextControl(_tip_line_text),
+            height=Dimension.exact(1),
+            wrap_lines=False,
+            dont_extend_height=True,
+        )
+
+        def _working_line_text():
+            if stream_output is None or not working_indicator.is_active:
+                return []
+            head, detail = working_indicator.status_parts()
+            return [
+                ("class:working-indicator", f"{head} "),
+                ("class:working-indicator-detail", detail),
+            ]
+
+        working_line_window = Window(
+            content=FormattedTextControl(_working_line_text),
             height=Dimension.exact(1),
             wrap_lines=False,
             dont_extend_height=True,
@@ -984,6 +1037,16 @@ class InteractivePrompt:
                 Window(
                     height=_get_idle_prompt_spacer_height(),
                     dont_extend_height=False,
+                )
+            )
+        if stream_output is not None:
+            # Working indicator sits between the stream pane and the queued
+            # lines; refresh_interval re-evaluates the filter and text, so the
+            # animation ticks without explicit invalidation.
+            components.append(
+                ConditionalContainer(
+                    working_line_window,
+                    filter=Condition(lambda: working_indicator.is_active),
                 )
             )
         if queue_manager is not None:

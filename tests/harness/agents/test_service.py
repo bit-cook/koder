@@ -289,9 +289,11 @@ def test_agent_service_launches_isolated_worktree_agent_in_worktree_cwd(tmp_path
     _init_git_repo(repo_root)
 
     seen_cwds: list[str] = []
+    seen_git_dirs: list[bool] = []
 
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
         seen_cwds.append(cwd)
+        seen_git_dirs.append((Path(cwd) / ".git").exists())
         return "isolated result"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -315,10 +317,52 @@ def test_agent_service_launches_isolated_worktree_agent_in_worktree_cwd(tmp_path
         await service.wait(record.id)
         assert seen_cwds
         assert seen_cwds[0] != str(repo_root)
-        assert Path(seen_cwds[0]).exists()
-        assert (Path(seen_cwds[0]) / ".git").exists()
+        # The agent ran inside a real git worktree...
+        assert seen_git_dirs == [True]
+        # ...and because the run left no changes, the clean worktree was
+        # removed after completion and the record no longer points at it.
+        updated = service.get(record.id)
+        assert updated.worktree_path is None
+        assert not Path(seen_cwds[0]).exists()
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_keeps_dirty_worktree_after_completion(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _init_git_repo(repo_root)
+
+    seen_cwds: list[str] = []
+
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+        seen_cwds.append(cwd)
+        (Path(cwd) / "result.txt").write_text("agent output\n", encoding="utf-8")
+        return "isolated result"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+        isolation="worktree",
+    )
+
+    async def run_case():
+        record = await service.launch_background(
+            agent_definition=definition,
+            prompt="Produce a file in the worktree",
+            description="Worktree task",
+            cwd=repo_root,
+        )
+        await service.wait(record.id)
         updated = service.get(record.id)
         assert updated.worktree_path == seen_cwds[0]
+        assert Path(seen_cwds[0]).exists()
+        assert (Path(seen_cwds[0]) / "result.txt").exists()
 
     asyncio.run(run_case())
 

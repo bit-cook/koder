@@ -7,7 +7,6 @@ WORKFLOW_STATE_COMMAND_SPECS = {
     "thinkback": {"help_text": "Review recent local session context"},
     "thinkback-play": {"help_text": "Replay recent local session turns"},
     "tasks": {"help_text": "Inspect active runtime tasks"},
-    "tag": {"help_text": "Tag the active session"},
     "clear": {"help_text": "Clear current workflow state"},
     "exit": {"help_text": "Exit the active workflow"},
 }

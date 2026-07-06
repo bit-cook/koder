@@ -95,7 +95,7 @@ def test_tmux_security_review_short_circuits_for_clean_repo(tmp_path):
     launch = " ".join(
         [
             "cd",
-            shlex.quote(str(PROJECT_ROOT)),
+            shlex.quote(str(repo)),
             "&&",
             "HOME=" + shlex.quote(str(home)),
             "uv",
@@ -106,8 +106,6 @@ def test_tmux_security_review_short_circuits_for_clean_repo(tmp_path):
     try:
         _tmux("new-session", "-d", "-s", session, launch)
         _wait_for_prompt(session)
-        _send(session, f"/teleport {repo}")
-        _wait_for_output(session, "cwd:")
         _send(session, "/security-review")
         output = _wait_for_output(session, "security-review: no pending changes to review.")
         assert "security-review: no pending changes to review." in output

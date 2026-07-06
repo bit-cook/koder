@@ -207,7 +207,11 @@ def task_update(
 
 
 def task_get(task_id: str) -> str:
-    """Get a single task's details by ID."""
+    """Get a single task's details by ID.
+
+    Args:
+        task_id: ID of the task to fetch (as returned by task_create/task_list)
+    """
     storage = _get_task_storage()
     task = storage.get(task_id)
     if task is None:

@@ -5,6 +5,4 @@ WORKFLOW_REVIEW_COMMAND_SPECS = {
     "compact": {"help_text": "Compact the active conversation state"},
     "branch": {"help_text": "Inspect or create working branches"},
     "rewind": {"help_text": "Rewind recent workflow state"},
-    "passes": {"help_text": "Show verification passes"},
-    "install-github-app": {"help_text": "Set up Koder GitHub Actions workflows"},
 }

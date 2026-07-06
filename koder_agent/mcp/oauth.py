@@ -217,11 +217,24 @@ class MCPOAuthFlow:
         # 2. Discover metadata
         metadata = await self._discover_metadata()
 
-        # 3. Dynamic client registration if needed
-        client_id, client_secret = await self._ensure_client(metadata)
+        # 3. Start the local callback server first so dynamic client
+        #    registration can use the real redirect URI. Servers that
+        #    enforce exact redirect_uri matching (RFC 8252) reject
+        #    authorization requests whose URI differs from registration.
+        callback_port = self._resolve_callback_port()
+        server, actual_port = _start_callback_server(callback_port)
+        redirect_uri = f"http://127.0.0.1:{actual_port}/callback"
 
-        # 4. Authorization code exchange
-        tokens = await self._authorization_code_flow(metadata, client_id, client_secret)
+        try:
+            # 4. Dynamic client registration if needed
+            client_id, client_secret = await self._ensure_client(metadata, redirect_uri)
+
+            # 5. Authorization code exchange
+            tokens = await self._authorization_code_flow(
+                metadata, client_id, client_secret, server=server, redirect_uri=redirect_uri
+            )
+        finally:
+            server.shutdown()
         save_tokens(self.server_name, tokens)
         return {"Authorization": f"Bearer {tokens['access_token']}"}
 
@@ -323,15 +336,30 @@ class MCPOAuthFlow:
             f"Tried: {', '.join(urls_to_try)}"
         )
 
-    async def _ensure_client(self, metadata: Dict[str, Any]) -> tuple[str, str | None]:
-        """Return ``(client_id, client_secret)``.
+    def _resolve_callback_port(self) -> int | None:
+        return (
+            self.config.callback_port or int(os.environ.get("MCP_OAUTH_CALLBACK_PORT", "0")) or None
+        )
 
-        Uses pre-configured values when available, otherwise performs dynamic
-        client registration (RFC 7591).
+    async def _ensure_client(
+        self, metadata: Dict[str, Any], redirect_uri: str
+    ) -> tuple[str, str | None]:
+        """Return ``(client_id, client_secret)`` valid for *redirect_uri*.
+
+        Uses pre-configured values when available. Otherwise reuses a cached
+        dynamic registration when it was made for the same redirect URI, and
+        performs dynamic client registration (RFC 7591) when not.
         """
         client_secret = self.config.client_secret or os.environ.get("MCP_CLIENT_SECRET")
         if self.config.client_id:
             return self.config.client_id, client_secret
+
+        # Reuse a cached registration only when its redirect URI still
+        # matches; a registration made for another port would be rejected by
+        # servers that enforce exact redirect_uri matching.
+        cached = load_tokens(self.server_name) or {}
+        if cached.get("client_id") and cached.get("redirect_uri") == redirect_uri:
+            return cached["client_id"], cached.get("client_secret")
 
         registration_endpoint = metadata.get("registration_endpoint")
         if not registration_endpoint:
@@ -339,16 +367,6 @@ class MCPOAuthFlow:
                 "No client_id configured and server does not advertise a "
                 "registration_endpoint for dynamic client registration."
             )
-
-        callback_port = (
-            self.config.callback_port or int(os.environ.get("MCP_OAUTH_CALLBACK_PORT", "0")) or None
-        )
-        redirect_uri = f"http://127.0.0.1:{callback_port or 0}/callback"
-        # We don't know the actual port yet for dynamic registration when
-        # callback_port is 0.  Best effort: register with a placeholder and
-        # re-register later, or require callback_port to be set.
-        if callback_port:
-            redirect_uri = f"http://127.0.0.1:{callback_port}/callback"
 
         reg_payload: Dict[str, Any] = {
             "client_name": f"koder-mcp-{self.server_name}",
@@ -372,9 +390,10 @@ class MCPOAuthFlow:
         registered_id = reg_data["client_id"]
         registered_secret = reg_data.get("client_secret")
 
-        # Persist registration alongside tokens so we can reuse it
-        cached = load_tokens(self.server_name) or {}
+        # Persist registration (and its redirect URI) alongside tokens so a
+        # fixed-port setup can reuse it on the next flow.
         cached["client_id"] = registered_id
+        cached["redirect_uri"] = redirect_uri
         if registered_secret:
             cached["client_secret"] = registered_secret
         save_tokens(self.server_name, cached)
@@ -386,76 +405,72 @@ class MCPOAuthFlow:
         metadata: Dict[str, Any],
         client_id: str,
         client_secret: str | None,
+        *,
+        server: HTTPServer,
+        redirect_uri: str,
     ) -> Dict[str, Any]:
-        """Run the authorization code grant with PKCE."""
+        """Run the authorization code grant with PKCE.
+
+        The callback *server* is already listening on the port embedded in
+        *redirect_uri*; the caller owns its shutdown.
+        """
         authorization_endpoint = metadata.get("authorization_endpoint")
         token_endpoint = metadata.get("token_endpoint")
         if not authorization_endpoint or not token_endpoint:
             raise RuntimeError("OAuth metadata missing authorization_endpoint or token_endpoint")
 
-        callback_port = (
-            self.config.callback_port or int(os.environ.get("MCP_OAUTH_CALLBACK_PORT", "0")) or None
-        )
+        # PKCE
+        code_verifier, code_challenge = _generate_pkce()
+        state = secrets.token_urlsafe(32)
 
-        # Start local callback server
-        server, actual_port = _start_callback_server(callback_port)
-        redirect_uri = f"http://127.0.0.1:{actual_port}/callback"
+        # Reset handler state
+        _OAuthCallbackHandler.auth_code = None
+        _OAuthCallbackHandler.error = None
 
-        try:
-            # PKCE
-            code_verifier, code_challenge = _generate_pkce()
-            state = secrets.token_urlsafe(32)
+        # Build authorization URL
+        auth_params: Dict[str, str] = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        scopes = self.config.scopes or metadata.get("scopes_supported", [])
+        if scopes:
+            auth_params["scope"] = " ".join(scopes)
 
-            # Reset handler state
-            _OAuthCallbackHandler.auth_code = None
-            _OAuthCallbackHandler.error = None
+        auth_url = f"{authorization_endpoint}?{urlencode(auth_params)}"
 
-            # Build authorization URL
-            auth_params: Dict[str, str] = {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "state": state,
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-            }
-            scopes = self.config.scopes or metadata.get("scopes_supported", [])
-            if scopes:
-                auth_params["scope"] = " ".join(scopes)
+        # Open browser
+        logger.info("Opening browser for OAuth authorization...")
+        webbrowser.open(auth_url)
 
-            auth_url = f"{authorization_endpoint}?{urlencode(auth_params)}"
+        # Wait for callback
+        code = await self._wait_for_code(timeout=300)
 
-            # Open browser
-            logger.info("Opening browser for OAuth authorization...")
-            webbrowser.open(auth_url)
+        # Exchange code for tokens
+        token_payload: Dict[str, str] = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        }
+        if client_secret:
+            token_payload["client_secret"] = client_secret
 
-            # Wait for callback
-            code = await self._wait_for_code(timeout=300)
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(token_endpoint, data=token_payload, timeout=15)
+            resp.raise_for_status()
+            token_data = resp.json()
 
-            # Exchange code for tokens
-            token_payload: Dict[str, str] = {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": client_id,
-                "code_verifier": code_verifier,
-            }
-            if client_secret:
-                token_payload["client_secret"] = client_secret
-
-            async with httpx.AsyncClient() as http_client:
-                resp = await http_client.post(token_endpoint, data=token_payload, timeout=15)
-                resp.raise_for_status()
-                token_data = resp.json()
-
-            token_data["obtained_at"] = time.time()
-            token_data["client_id"] = client_id
-            if client_secret:
-                token_data["client_secret"] = client_secret
-            return token_data
-
-        finally:
-            server.shutdown()
+        token_data["obtained_at"] = time.time()
+        token_data["client_id"] = client_id
+        token_data["redirect_uri"] = redirect_uri
+        if client_secret:
+            token_data["client_secret"] = client_secret
+        return token_data
 
     @staticmethod
     async def _wait_for_code(timeout: float = 300) -> str:

@@ -108,3 +108,66 @@ class WorktreeService:
             },
         )
         return WorktreeTransitionResult(ok=True, path=path)
+
+    def is_clean(self, path: Path) -> bool:
+        """Return True when the worktree has no uncommitted changes.
+
+        Non-git worktrees (plain directories) count as clean when empty.
+        Errors count as dirty so we never remove work we cannot assess.
+        """
+        if not path.exists():
+            return False
+        if self.repo_root and (self.repo_root / ".git").exists():
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except Exception:
+                return False
+            return not status.stdout.strip()
+        try:
+            return not any(path.iterdir())
+        except OSError:
+            return False
+
+    def remove_if_clean(self, path: Path, *, branch: str | None = None) -> bool:
+        """Remove *path* when it has no changes; dispatch ``WorktreeRemove``.
+
+        Returns True when the worktree was removed. Dirty or unassessable
+        worktrees are always kept.
+        """
+        if not self.is_clean(path):
+            return False
+        if self.repo_root and (self.repo_root / ".git").exists():
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(path)],
+                    cwd=self.repo_root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if branch:
+                    subprocess.run(
+                        ["git", "branch", "-D", branch],
+                        cwd=self.repo_root,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+            except Exception:
+                return False
+        else:
+            try:
+                path.rmdir()
+            except OSError:
+                return False
+        self.exit(path)
+        return True

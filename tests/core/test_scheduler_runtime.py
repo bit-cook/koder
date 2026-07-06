@@ -807,3 +807,166 @@ class TestCaptureUsageIntegration:
             await scheduler._capture_usage(mock_result)
 
             scheduler._run_session_memory_extraction.assert_called_once_with(11_000, 5)
+
+
+@pytest.mark.asyncio
+async def test_streaming_ui_esc_callback_registered_and_cleared(monkeypatch):
+    """Fixed-bottom streaming must wire ESC cancellation through the TUI."""
+    from agents import RawResponsesStreamEvent
+    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+
+    class FakeResult:
+        final_output = "Answer."
+
+        def cancel(self, mode="immediate"):
+            self.cancelled_mode = mode
+
+        async def stream_events(self):
+            yield RawResponsesStreamEvent(
+                data=ResponseTextDeltaEvent(
+                    content_index=0,
+                    delta="Answer.",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                    sequence_number=1,
+                    type="response.output_text.delta",
+                )
+            )
+
+    class FakeStreamingUI:
+        def __init__(self):
+            self.cancel_callbacks = []
+            self.final_content = None
+
+        def update_output(self, renderable):
+            pass
+
+        def set_final_content(self, renderable):
+            self.final_content = renderable
+
+        def set_final_text(self, text):
+            pass
+
+        def set_cancel_callback(self, callback):
+            self.cancel_callbacks.append(callback)
+
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run_streamed", return_value=FakeResult()),
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.get_items = AsyncMock(return_value=[])
+        mock_session.db_path = ":memory:"
+        mock_session_cls.return_value = mock_session
+
+        from koder_agent.core.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(session_id="test-session", streaming=True)
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+
+        streaming_ui = FakeStreamingUI()
+        await scheduler._handle_streaming("hello", streaming_ui=streaming_ui)
+
+    # Registered a real callback during streaming, cleared it afterwards.
+    assert len(streaming_ui.cancel_callbacks) == 2
+    assert callable(streaming_ui.cancel_callbacks[0])
+    assert streaming_ui.cancel_callbacks[1] is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_ui_esc_callback_cancels_turn(monkeypatch):
+    """Invoking the registered ESC callback must cancel the in-flight stream."""
+    import asyncio
+
+    from agents import RawResponsesStreamEvent
+    from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+
+    first_event_seen = asyncio.Event()
+
+    class FakeResult:
+        final_output = "Never finished."
+        cancelled_mode = None
+
+        def cancel(self, mode="immediate"):
+            self.cancelled_mode = mode
+
+        async def stream_events(self):
+            yield RawResponsesStreamEvent(
+                data=ResponseTextDeltaEvent(
+                    content_index=0,
+                    delta="partial ",
+                    item_id="msg_1",
+                    logprobs=[],
+                    output_index=0,
+                    sequence_number=1,
+                    type="response.output_text.delta",
+                )
+            )
+            first_event_seen.set()
+            await asyncio.sleep(30)  # Simulate a stalled stream
+
+    class FakeStreamingUI:
+        def __init__(self):
+            self.cancel_callback = None
+            self.final_texts = []
+
+        def update_output(self, renderable):
+            pass
+
+        def set_final_content(self, renderable):
+            pass
+
+        def set_final_text(self, text):
+            self.final_texts.append(text)
+
+        def set_cancel_callback(self, callback):
+            if callback is not None:
+                self.cancel_callback = callback
+
+    fake_result = FakeResult()
+    with (
+        patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+        patch("koder_agent.core.scheduler.get_display_hooks"),
+        patch("koder_agent.core.scheduler.ApprovalHooks"),
+        patch("koder_agent.core.scheduler.EnhancedSQLiteSession") as mock_session_cls,
+        patch("koder_agent.core.scheduler.Runner.run_streamed", return_value=fake_result),
+    ):
+        mock_session = AsyncMock()
+        mock_session.session_id = "test-session"
+        mock_session.get_items = AsyncMock(return_value=[])
+        mock_session.db_path = ":memory:"
+        mock_session_cls.return_value = mock_session
+
+        from koder_agent.core.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(session_id="test-session", streaming=True)
+        scheduler.dev_agent = object()
+        scheduler._agent_initialized = True
+        scheduler._migration_done = True
+        scheduler._capture_usage = AsyncMock()
+
+        streaming_ui = FakeStreamingUI()
+
+        async def press_escape():
+            await asyncio.wait_for(first_event_seen.wait(), timeout=5)
+            assert streaming_ui.cancel_callback is not None
+            streaming_ui.cancel_callback()
+
+        stream_task = asyncio.create_task(
+            scheduler._handle_streaming("hello", streaming_ui=streaming_ui)
+        )
+        esc_task = asyncio.create_task(press_escape())
+        response = await asyncio.wait_for(stream_task, timeout=10)
+        await esc_task
+
+    assert fake_result.cancelled_mode == "immediate"
+    assert scheduler._last_turn_cancelled is True
+    assert "partial" in response or "cancelled" in response.lower()

@@ -73,11 +73,14 @@ def test_tmux_brief_runs_through_uv_interactive_session(tmp_path):
     launch = " ".join(
         [
             "cd",
-            shlex.quote(str(PROJECT_ROOT)),
+            shlex.quote(str(repo)),
             "&&",
             "HOME=" + shlex.quote(str(home)),
             "uv",
+            "--project",
+            shlex.quote(str(PROJECT_ROOT)),
             "run",
+            "--no-sync",
             "python",
             "-c",
             shlex.quote(script),
@@ -86,8 +89,6 @@ def test_tmux_brief_runs_through_uv_interactive_session(tmp_path):
     try:
         _tmux("new-session", "-d", "-s", session, launch)
         _wait_for_prompt(session)
-        _send(session, f"/teleport {repo}")
-        _wait_for_output(session, "cwd:")
         _send(session, "/brief")
         output = _wait_for_output(session, "Brief-only mode enabled")
         assert "Brief-only mode enabled" in output

@@ -77,7 +77,9 @@ def test_compact_hooks_fire(tmp_path, monkeypatch):
     assert json.loads(post.read_text(encoding="utf-8"))["event"] == "PostCompact"
 
 
-def test_cwd_changed_hook_fires_on_teleport(tmp_path, monkeypatch):
+def test_cwd_changed_hook_fires_on_dispatch(tmp_path, monkeypatch):
+    from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"
     target = tmp_path / "target"
@@ -104,16 +106,24 @@ def test_cwd_changed_hook_fires_on_teleport(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.chdir(project)
-    handler = HarnessInteractiveCommandHandler()
 
-    output = _run(f"/teleport {target}", handler=handler)
+    result = dispatch_command_hooks(
+        cwd=project,
+        event_name="CwdChanged",
+        match_value=None,
+        payload={"event": "CwdChanged", "cwd": str(target)},
+    )
 
-    assert str(target.resolve()) in output
+    assert not result.blocked
     assert json.loads(marker.read_text(encoding="utf-8"))["event"] == "CwdChanged"
 
 
 def test_cwd_changed_hook_can_register_watch_paths(tmp_path, monkeypatch):
-    from koder_agent.harness.hooks.runtime import poll_file_change_hooks
+    from koder_agent.harness.hooks.runtime import (
+        dispatch_command_hooks,
+        poll_file_change_hooks,
+        update_watch_paths,
+    )
 
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"
@@ -154,9 +164,14 @@ def test_cwd_changed_hook_can_register_watch_paths(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.chdir(project)
-    handler = HarnessInteractiveCommandHandler()
 
-    _run(f"/teleport {target}", handler=handler)
+    result = dispatch_command_hooks(
+        cwd=project,
+        event_name="CwdChanged",
+        match_value=None,
+        payload={"event": "CwdChanged", "cwd": str(target)},
+    )
+    update_watch_paths(result.watch_paths)
     watched.write_text("two", encoding="utf-8")
     fired = poll_file_change_hooks(project)
 

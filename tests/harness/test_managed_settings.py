@@ -1,9 +1,6 @@
 import json
 
-from koder_agent.harness.managed_settings import (
-    load_managed_settings,
-    render_managed_settings_status,
-)
+from koder_agent.harness.managed_settings import load_managed_settings
 from koder_agent.harness.sandbox_settings import resolve_sandbox_settings
 
 
@@ -21,17 +18,11 @@ def test_managed_settings_status_reports_local_policy_file(tmp_path):
     )
 
     state = load_managed_settings(policy)
-    output = render_managed_settings_status(policy)
 
     assert state.exists is True
     assert state.valid is True
     assert state.checksum is not None
-    assert "exists: true" in output
-    assert "valid: true" in output
-    assert "hooks_events: 1" in output
-    assert "hooks_groups: 1" in output
-    assert "sandbox_policy_locked: true" in output
-    assert "sandbox_keys: backend, enabled" in output
+    assert state.data.get("sandbox", {}).get("enabled") is True
 
 
 def test_managed_settings_status_reports_invalid_file(tmp_path):
@@ -39,12 +30,10 @@ def test_managed_settings_status_reports_invalid_file(tmp_path):
     policy.write_text("[", encoding="utf-8")
 
     state = load_managed_settings(policy)
-    output = render_managed_settings_status(policy)
 
     assert state.exists is True
     assert state.valid is False
-    assert "valid: false" in output
-    assert "error:" in output
+    assert state.error
 
 
 def test_managed_settings_lock_sandbox_policy(tmp_path, monkeypatch):

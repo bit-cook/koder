@@ -64,7 +64,13 @@ def _coerce_value(value: str, target_type: type) -> Any:
 
 
 def config_tool(setting: str, value: Optional[Union[str, bool, int]] = None) -> str:
-    """Get or set a koder configuration setting."""
+    """Get or set a koder configuration setting.
+
+    Args:
+        setting: Dotted setting key, e.g. "model.name", "cli.stream",
+            "skills.enabled", "harness.reasoning_display"
+        value: New value to set; omit to read the current value
+    """
     if setting not in _SUPPORTED_SETTINGS:
         return json.dumps(
             {

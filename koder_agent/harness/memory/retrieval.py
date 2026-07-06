@@ -31,7 +31,8 @@ def _scan_memory_files(memory_dirs: list[Path]) -> list[Path]:
     for memory_dir in memory_dirs:
         if not memory_dir.exists():
             continue
-        files.extend(sorted(memory_dir.rglob("*.md")))
+        # MEMORY.md is the index over memories, not a memory itself
+        files.extend(path for path in sorted(memory_dir.rglob("*.md")) if path.name != "MEMORY.md")
     return files
 
 

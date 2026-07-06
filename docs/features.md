@@ -50,7 +50,7 @@ Koder is organized around a few everyday jobs:
 | Understand the terminal UI | [Interactive TUI](interactive-tui.md), then `/help`, `/keybindings`, `/theme`, `/voice status`, and shell mode. |
 | Configure a model or endpoint | [Configuration Guide](configuration.md), then `/model`, `/effort`, `/reasoning`, and `koder config show`. |
 | Keep project context across sessions | [Sessions and Memory](sessions-and-memory.md), then `/session`, `/goal`, `/resume`, `/compact`, `/memory`, and `/thinkback`. |
-| Review or prepare a branch | [Workflows](workflows.md), then `/diff`, `/review`, `/security-review`, `/passes`, and `/commit`. |
+| Review or prepare a branch | [Workflows](workflows.md), then `/diff`, `/review`, `/security-review`, and `/commit`. |
 | Run recurring checks | [Sessions and Memory](sessions-and-memory.md), then `/loop`, `/schedule`, and `/tasks`. |
 | Add local domain knowledge | [Skills, Plugins, and MCP](extensions.md), then `/skills`, `/init-verifiers`, `/plugin`, and `/mcp`. |
 | Run parallel investigations | [Agents and Teams](agents-and-teams.md), then `/fork`, `/agents`, `/peers`, and `/tasks`. |

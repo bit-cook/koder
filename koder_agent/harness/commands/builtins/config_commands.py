@@ -2,8 +2,6 @@
 
 CONFIG_COMMAND_SPECS = {
     "config": {"help_text": "Inspect and update runtime configuration"},
-    "install": {"help_text": "Inspect local Koder installation status"},
-    "upgrade": {"help_text": "Inspect local Koder upgrade options"},
     "model": {"help_text": "Show or change the active model"},
     "theme": {"help_text": "Change terminal theme settings"},
     "keybindings": {"help_text": "Inspect and update interactive keybindings"},

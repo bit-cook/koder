@@ -34,7 +34,6 @@ Inside the TUI:
 ```bash
 /session
 /rename api-migration
-/tag backend
 /resume api-migration
 /clear
 ```
@@ -48,7 +47,6 @@ Use these commands to understand what the active session contains:
 ```bash
 /status
 /summary
-/stats
 /insights
 /usage
 /cost
@@ -103,19 +101,15 @@ Use rewind when a recent turn sent the session down the wrong path:
 /rewind
 ```
 
-`/rewind` lists recent prompt targets, restores the selected prompt into input, and trims later session history.
+`/rewind` lists recent prompt targets with the number of newer transcript items each restore would remove, restores the selected prompt into input, and trims later session history.
 
-## Exporting And Copying
+## Exporting
 
 Use local export commands when you want a durable artifact from a session:
 
 ```bash
 /export
-/copy
-/share
 ```
-
-`/share` prints share metadata for the active session. It does not upload transcript content.
 
 ## Memory Commands
 

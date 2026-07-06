@@ -172,8 +172,19 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
     """Read file contents from the filesystem.
 
     Output always includes line numbers in format 'LINE_NUMBER|LINE_CONTENT' (1-indexed).
+    These line-number prefixes are display-only: never copy them into edit_file's
+    old_string/new_string or into write_file content.
     Supports reading partial content by specifying line offset and limit for large files.
     You can call this tool multiple times in parallel to read different files simultaneously.
+
+    Do NOT re-read a file right after editing it just to verify the change:
+    edit_file and write_file return an error if the change failed, so a successful
+    result means the file already matches what you wrote.
+
+    Args:
+        path: Path to the file to read (absolute or relative to cwd)
+        offset: 1-indexed line number to start reading from (for large files)
+        limit: Maximum number of lines to read (for large files)
     """
     try:
         p = Path(path).resolve()
@@ -288,9 +299,16 @@ def _generate_diff_output(
 def write_file(path: str, content: str) -> str:
     """Write content to a file.
 
-    Will overwrite existing files completely. For existing files, you should read the file
-    first using read_file. Prefer editing existing files over creating new ones unless
-    explicitly needed.
+    OVERWRITES the target file completely: any existing content is replaced with
+    `content`. Use this for creating new files or full-file rewrites only.
+    For changes to an existing file, prefer edit_file (targeted string replacement)
+    over rewriting the whole file. Before overwriting an existing file you must
+    read it with read_file first; the write is rejected otherwise. Do not include
+    read_file's 'LINE_NUMBER|' prefixes in the content.
+
+    Args:
+        path: Path to the file to write (parent directories are created as needed)
+        content: Full file content to write (replaces any existing content)
     """
     try:
         p = Path(path).resolve()
@@ -337,7 +355,12 @@ def write_file(path: str, content: str) -> str:
 
 @function_tool
 def append_file(path: str, content: str) -> str:
-    """Append content to a file."""
+    """Append content to a file.
+
+    Args:
+        path: Path to the file to append to (created if it does not exist)
+        content: Text to append at the end of the file
+    """
     try:
         p = Path(path).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +422,15 @@ def edit_file_by_replacement(
     if not p.exists():
         return f"File not found: {path}"
 
+    # Enforce read-before-edit, matching write_file and the diff-mode path
+    if not _file_state.has_been_read(str(p)):
+        return "File has not been read yet. Read it first before editing it."
+    if _file_state.is_stale(str(p)):
+        return (
+            "File has been modified since it was last read. "
+            "Read it again before attempting to edit it."
+        )
+
     content = p.read_text(encoding="utf-8")
 
     # Find with quote normalization
@@ -446,12 +478,29 @@ def edit_file(
 ) -> str:
     """Edit a file using string replacement or unified diff.
 
+    You must read the file with read_file earlier in the conversation before editing it.
+
     Two modes:
     1. String replacement (preferred): Provide old_string and new_string.
-       The old_string must be unique in the file unless replace_all is true.
-    2. Unified diff: Provide a diff parameter with a unified diff patch.
+       - old_string must match the file contents EXACTLY, including indentation
+         and whitespace (curly/straight quote differences are tolerated).
+       - old_string must be unique in the file, or the edit fails. To fix a
+         non-unique match, either expand old_string with surrounding context to
+         make it unique, or set replace_all=true to change every occurrence.
+       - NEVER include the 'LINE_NUMBER|' prefixes from read_file output in
+         old_string or new_string; they are not part of the file.
+    2. Unified diff: Provide a diff parameter with a unified diff patch. Use only
+       when string replacement is impractical; string replacement is preferred.
 
-    You must read the file first before editing.
+    A successful result means the edit was applied; no need to re-read the file
+    to verify. If the edit failed, the tool returns an error explaining why.
+
+    Args:
+        path: Path to the file to edit
+        old_string: Exact text to find in the file (string replacement mode)
+        new_string: Replacement text (string replacement mode)
+        replace_all: Replace every occurrence of old_string instead of requiring uniqueness
+        diff: Unified diff patch to apply (diff mode; mutually exclusive with old/new_string)
     """
     if old_string is not None and new_string is not None:
         return edit_file_by_replacement(path, old_string, new_string, replace_all)
@@ -491,7 +540,12 @@ def edit_file(
 
 @function_tool
 def list_directory(path: str, ignore: Optional[List[str]] = None) -> str:
-    """List contents of a directory."""
+    """List contents of a directory.
+
+    Args:
+        path: Directory to list
+        ignore: Glob patterns for entries to skip (e.g. ["*.pyc", "node_modules"])
+    """
     try:
         p = Path(path).resolve()
         if not p.exists():

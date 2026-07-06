@@ -85,6 +85,58 @@ def test_load_permission_hierarchy_user_only(temp_workspace, temp_home):
     assert "/etc/*" in rules["write_file"]["deny"]
 
 
+def test_load_permission_hierarchy_local_settings(temp_workspace, temp_home):
+    """Test loading hierarchy from gitignored .koder/settings.local.json."""
+    settings = {
+        "permissions": {
+            "allow": ["run_shell(git log *)"],
+            "deny": ["run_shell(git push *)"],
+        }
+    }
+    local_settings_file = Path.cwd() / ".koder" / "settings.local.json"
+    local_settings_file.write_text(json.dumps(settings), encoding="utf-8")
+
+    hierarchy = _load_permission_hierarchy()
+    rules = hierarchy.get_effective_rules()
+
+    assert "run_shell" in rules
+    assert "git log *" in rules["run_shell"]["allow"]
+    assert "git push *" in rules["run_shell"]["deny"]
+
+
+def test_load_permission_hierarchy_local_merges_with_project(temp_workspace, temp_home):
+    """Local settings rules merge with project settings rules."""
+    project_settings = {"permissions": {"allow": ["run_shell(git status *)"]}}
+    local_settings = {"permissions": {"allow": ["run_shell(rg *)"]}}
+
+    (Path.cwd() / ".koder" / "settings.json").write_text(
+        json.dumps(project_settings), encoding="utf-8"
+    )
+    (Path.cwd() / ".koder" / "settings.local.json").write_text(
+        json.dumps(local_settings), encoding="utf-8"
+    )
+
+    hierarchy = _load_permission_hierarchy()
+    rules = hierarchy.get_effective_rules()
+
+    assert "git status *" in rules["run_shell"]["allow"]
+    assert "rg *" in rules["run_shell"]["allow"]
+
+
+def test_load_permission_hierarchy_malformed_local_json(temp_workspace, temp_home):
+    """Malformed settings.local.json is ignored without breaking other sources."""
+    project_settings = {"permissions": {"allow": ["run_shell(git status *)"]}}
+    (Path.cwd() / ".koder" / "settings.json").write_text(
+        json.dumps(project_settings), encoding="utf-8"
+    )
+    (Path.cwd() / ".koder" / "settings.local.json").write_text("{invalid json", encoding="utf-8")
+
+    hierarchy = _load_permission_hierarchy()
+    rules = hierarchy.get_effective_rules()
+
+    assert "git status *" in rules["run_shell"]["allow"]
+
+
 def test_load_permission_hierarchy_project_overrides_user(temp_workspace, temp_home):
     """Test that project settings are merged with user settings."""
     user_settings = {

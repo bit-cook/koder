@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 
 from ..hooks.runtime import dispatch_command_hooks
-from .definitions import AgentDefinition, load_agent_settings
+from .definitions import AgentDefinition
 
 if TYPE_CHECKING:
     from ..permissions.service import PermissionService
@@ -67,14 +67,6 @@ def _run_command_hooks(rules: list[dict], payload: dict[str, Any], cwd: str | Pa
             )
 
 
-def load_project_hook_config(cwd: str | Path) -> dict[str, Any]:
-    """Load project hook configuration from koder settings."""
-
-    settings = load_agent_settings(cwd)
-    hooks = settings.get("hooks")
-    return hooks if isinstance(hooks, dict) else {}
-
-
 def dispatch_project_hook_event(
     *,
     cwd: str | Path,
@@ -107,17 +99,20 @@ class SubagentLifecycleHooks(RunHooks):
         self.cwd = Path(cwd)
         self.wrapped_hooks = wrapped_hooks
         self._permission_service = permission_service
-        self.project_hooks = load_project_hook_config(self.cwd)
         self.frontmatter_hooks = agent_definition.hooks or {}
 
     async def on_agent_start(self, context: RunContextWrapper, agent: Agent) -> None:
         if self.wrapped_hooks:
             await self.wrapped_hooks.on_agent_start(context, agent)
         payload = {"event": "SubagentStart", "agent_type": self.agent_definition.agent_type}
-        rules = _matching_rules(
-            self.project_hooks, "SubagentStart", self.agent_definition.agent_type
+        # Full hook runner: picks up project, local, user, and managed settings
+        # (not just the project scope the old mini-runner read).
+        dispatch_command_hooks(
+            cwd=self.cwd,
+            event_name="SubagentStart",
+            match_value=self.agent_definition.agent_type,
+            payload=payload,
         )
-        _run_command_hooks(rules, payload, self.cwd)
 
     async def on_agent_end(self, context: RunContextWrapper, agent: Agent, output: Any) -> None:
         if self.wrapped_hooks:
@@ -128,10 +123,14 @@ class SubagentLifecycleHooks(RunHooks):
             "output": str(output),
             "stop_hook_active": getattr(self, "_stop_hook_active", False),
         }
-        project_rules = _matching_rules(
-            self.project_hooks, "SubagentStop", self.agent_definition.agent_type
+        dispatch_command_hooks(
+            cwd=self.cwd,
+            event_name="SubagentStop",
+            match_value=self.agent_definition.agent_type,
+            payload=payload,
         )
-        _run_command_hooks(project_rules, payload, self.cwd)
+        # Agent frontmatter "Stop" rules remain a per-definition concern and
+        # keep using the local mini-runner (they are not settings-backed).
         stop_rules = _matching_rules(
             self.frontmatter_hooks, "Stop", self.agent_definition.agent_type
         )

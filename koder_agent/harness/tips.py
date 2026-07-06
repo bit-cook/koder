@@ -107,10 +107,6 @@ TIPS = [
         id="export_session",
         message="Tip: Export your conversation with /export for documentation or sharing.",
     ),
-    TIP(
-        id="copy_response",
-        message="Tip: Use /copy to copy the last response to clipboard.",
-    ),
     # --- Agent tips ---
     TIP(
         id="agent_delegation",

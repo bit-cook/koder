@@ -51,9 +51,42 @@ class ElicitationHandler:
         # Try hook-based auto-response first.
         hook_result = self._try_hook_auto_response(params)
         if hook_result is not None:
-            return hook_result
+            result = hook_result
+            source = "hook"
+        else:
+            result = self._handle_form(params)
+            source = "user"
+        self._dispatch_result_hook(params, result, source)
+        return result
 
-        return self._handle_form(params)
+    @staticmethod
+    def _dispatch_result_hook(
+        params: ElicitRequestParams,
+        result: ElicitResult,
+        source: str,
+    ) -> None:
+        """Dispatch ``ElicitationResult`` after an elicitation resolves."""
+
+        try:
+            import os
+
+            from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+
+            dispatch_command_hooks(
+                cwd=os.getcwd(),
+                event_name="ElicitationResult",
+                payload={
+                    "event": "ElicitationResult",
+                    "message": params.message,
+                    "action": result.action,
+                    "source": source,
+                    "field_names": sorted(result.content) if result.content else [],
+                },
+            )
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("ElicitationResult hook dispatch failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Form mode

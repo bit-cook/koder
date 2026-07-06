@@ -45,15 +45,15 @@ Command families:
 
 | Family | Examples |
 |---|---|
-| Session | `/session`, `/resume`, `/rename`, `/clear`, `/tag`, `/export`, `/share` |
+| Session | `/session`, `/resume`, `/rename`, `/clear`, `/export` |
 | Model and UI | `/model`, `/effort`, `/theme`, `/color`, `/vim`, `/statusline`, `/output-style` |
 | Context | `/files`, `/context`, `/ctx_viz`, `/summary`, `/insights`, `/doctor` |
-| Workflows | `/review`, `/security-review`, `/advisor`, `/brief`, `/branch`, `/passes` |
+| Workflows | `/review`, `/security-review`, `/advisor`, `/brief`, `/branch` |
 | Memory and goals | `/memory`, `/remember`, `/thinkback`, `/thinkback-play`, `/compact`, `/rewind`, `/goal` |
-| Agents and loops | `/agents`, `/fork`, `/peers`, `/tasks`, `/teleport`, `/loop`, `/schedule` |
+| Agents and loops | `/agents`, `/fork`, `/peers`, `/tasks`, `/loop`, `/schedule` |
 | Extensions | `/skills`, `/plugin`, `/reload-plugins`, `/mcp`, `/channels`, `/magic-docs` |
-| Permissions | `/permissions`, `/sandbox`, `/managed-settings`, `/privacy-settings`, `/add-dir` |
-| GitHub | `/pr-comments`, `/install-github-app`, `/release-notes`, `/subscribe-pr`, `/autofix-pr` |
+| Permissions | `/permissions`, `/sandbox`, `/add-dir` |
+| GitHub | `/pr-comments`, `/release-notes`, `/subscribe-pr`, `/autofix-pr` |
 
 See [Command Reference](commands.md) for the complete catalog.
 
@@ -97,8 +97,6 @@ The status line can show model, session, usage, and workspace details. These com
 /status
 /usage
 /cost
-/stats
-/rate-limit-options
 ```
 
 You can customize terminal style with:

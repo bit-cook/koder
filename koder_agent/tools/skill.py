@@ -757,6 +757,14 @@ def _apply_skill_restrictions(skill: Skill) -> None:
 
 @function_tool
 def get_skill(skill_name: str) -> str:
+    """Load the full instructions of a skill by name.
+
+    Skills are listed with their descriptions in the system prompt; call this
+    to expand one before performing its task.
+
+    Args:
+        skill_name: Exact name of the skill to load (as listed in the system prompt)
+    """
     if not skill_name:
         return "Invalid skill name: skill_name cannot be empty"
 

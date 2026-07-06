@@ -48,30 +48,10 @@ Use these commands around commits and branches:
 /branch
 /commit
 /commit-push-pr
-/passes
 /release-notes
 ```
 
-`/commit` inspects staged, unstaged, and untracked state. `/commit-push-pr` checks branch, remote, diff, and PR readiness without silently publishing changes. `/passes` reports local test-cache status so you can see whether the current branch has recent proof.
-
-## GitHub Actions Setup
-
-`/install-github-app` creates local GitHub Actions workflow files for Koder usage. It is `gh`-backed and prints a plan before mutation.
-
-```bash
-koder /install-github-app
-koder /install-github-app plan owner/repo
-KODER_API_KEY="sk-..." koder /install-github-app apply owner/repo --secret-env KODER_API_KEY
-```
-
-The apply path creates or updates:
-
-```text
-.github/workflows/koder.yml
-.github/workflows/koder-review.yml
-```
-
-It reads the Actions secret from an explicit local environment variable and streams it to `gh secret set` through stdin.
+`/commit` inspects staged, unstaged, and untracked state. `/commit-push-pr` checks branch, remote, diff, and PR readiness without silently publishing changes.
 
 ## Issue And PR Helpers
 
@@ -98,7 +78,7 @@ uv run pytest
 
 For focused work, run the narrowest meaningful test first, then broaden when the affected surface is shared.
 
-Use `/passes`, `/status`, and `/summary` to see what the active session believes about the branch before you claim work is done.
+Use `/status` and `/summary` to see what the active session believes about the branch before you claim work is done.
 
 ## Useful Workflow Combos
 
@@ -117,7 +97,6 @@ Security-sensitive change:
 /security-review
 /permissions
 !uv run pytest tests/security
-/passes
 ```
 
 Large refactor:
@@ -127,5 +106,4 @@ Large refactor:
 /fork "inspect the test impact of this refactor"
 /diff
 /review
-/passes
 ```

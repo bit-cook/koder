@@ -125,4 +125,30 @@ Return your findings or results directly without unnecessary explanation."""
 
 @function_tool
 async def task_delegate(tasks: Union[List[TaskModel], TaskModel]) -> str:
+    """Delegate one or more tasks to autonomous sub-agents and return their results.
+
+    Multiple tasks run in parallel. Each task needs a short description and a
+    self-contained prompt: the sub-agent cannot see this conversation, so
+    include every file path, constraint, and expected output format it needs.
+
+    Never delegate understanding. The prompt must prove you already understand
+    the problem - name the exact files, line numbers, and what to change or
+    find. Brief the agent like a smart colleague who just walked in: for
+    lookups, hand over the exact command to run; for investigations, hand over
+    the precise question to answer.
+
+    When to use: explorations likely to take more than 3 search/read queries,
+    or independent subtasks that can run in parallel. For anything smaller,
+    use glob_search/grep_search/read_file directly - delegation costs a full
+    agent run.
+
+    Results are reports, not ground truth: verify key claims (spot-check the
+    cited files or rerun a decisive command) before building on them. Once
+    delegated, do not redo the same work yourself.
+
+    Args:
+        tasks: Task or list of tasks; each has description (short label),
+            prompt (full self-contained instructions), and optional agent_type
+            (a named agent definition to use instead of the default)
+    """
     return await _task_delegate_impl(tasks)

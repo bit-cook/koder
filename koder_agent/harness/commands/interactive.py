@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import gc
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
-import tracemalloc
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,29 +59,23 @@ from koder_agent.harness.commands.workflow_helpers import (
     status_short,
 )
 from koder_agent.harness.config.service import RuntimeConfigService
-from koder_agent.harness.github_actions import render_github_actions_command
 from koder_agent.harness.hooks.runtime import (
     active_skill_hooks,
     dispatch_command_hooks,
     list_configured_hooks,
-    update_watch_paths,
 )
-from koder_agent.harness.ide import open_ide_target, render_ide_status
-from koder_agent.harness.managed_settings import render_managed_settings_status
 from koder_agent.harness.memory.budget import estimate_messages_tokens, estimate_text_tokens
 from koder_agent.harness.memory.compact import compactable_session_items, llm_compact_messages
 from koder_agent.harness.paths import (
     harness_home_dir,
     project_agents_dir,
     user_agents_dir,
-    worktrees_dir,
 )
 from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.service import PermissionService
 from koder_agent.harness.plan.mode import PlanModeService
 from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
 from koder_agent.harness.plugins.registry import PluginRegistry
-from koder_agent.harness.policy_limits import render_policy_limit_options
 from koder_agent.harness.reasoning_display import (
     VALID_REASONING_DISPLAY_MODES,
     normalize_reasoning_display_mode,
@@ -121,7 +112,6 @@ from koder_agent.harness.voice.service import (
     resolve_voice_credentials,
     resolve_voice_provider,
 )
-from koder_agent.harness.worktree.service import WorktreeService
 from koder_agent.mcp.server_manager import MCPServerManager
 from koder_agent.tools.skill import SKILL_ADDITIONAL_DIRS_ENV, Skill, discover_merged_skills
 from koder_agent.utils import parse_session_dt
@@ -212,35 +202,6 @@ def _redact_sensitive_debug_text(text: object) -> str:
         redacted,
     )
     return redacted
-
-
-def _copy_text_to_clipboard(text: str) -> tuple[str, str | None]:
-    configured = os.environ.get("KODER_CLIPBOARD_COMMAND")
-    if configured and configured.strip():
-        try:
-            command = shlex.split(configured)
-        except ValueError as exc:
-            return "KODER_CLIPBOARD_COMMAND", f"invalid command: {exc}"
-        if not command:
-            return "KODER_CLIPBOARD_COMMAND", "empty command"
-        label = "KODER_CLIPBOARD_COMMAND"
-    elif shutil.which("pbcopy"):
-        command = ["pbcopy"]
-        label = "pbcopy"
-    elif shutil.which("wl-copy"):
-        command = ["wl-copy"]
-        label = "wl-copy"
-    elif shutil.which("xclip"):
-        command = ["xclip", "-selection", "clipboard"]
-        label = "xclip"
-    else:
-        return "unavailable", "no clipboard command found"
-
-    try:
-        subprocess.run(command, input=text, text=True, check=True, capture_output=True, timeout=5)
-    except Exception as exc:
-        return label, str(exc)
-    return label, None
 
 
 InteractiveCommand = Callable[[object, list[str]], Awaitable[str]]
@@ -343,7 +304,6 @@ class HarnessInteractiveCommandHandler:
             "continue": "resume",
             "checkpoint": "rewind",
             "pr_comments": "pr-comments",
-            "terminalSetup": "terminal-setup",
             "magic_docs": "magic-docs",
         }
         self.current_color = "default"
@@ -361,8 +321,6 @@ class HarnessInteractiveCommandHandler:
             "clear": self._execute_clear,
             "status": self._execute_status,
             "config": self._execute_config,
-            "install": self._execute_install,
-            "upgrade": self._execute_upgrade,
             "model": self._execute_model,
             "channels": self._execute_channels,
             "mcp": self._execute_mcp,
@@ -379,7 +337,6 @@ class HarnessInteractiveCommandHandler:
             "context": self._execute_context,
             "cost": self._execute_cost,
             "doctor": self._execute_doctor,
-            "heapdump": self._execute_heapdump,
             "memory": self._execute_memory,
             "assistant": self._execute_assistant,
             "init-verifiers": self._execute_init_verifiers,
@@ -391,10 +348,8 @@ class HarnessInteractiveCommandHandler:
             "keybindings": self._execute_keybindings,
             "output-style": self._execute_output_style,
             "usage": self._execute_usage,
-            "stats": self._execute_stats,
             "effort": self._execute_effort,
             "reasoning": self._execute_reasoning,
-            "copy": self._execute_copy,
             "export": self._execute_export,
             "commit": self._execute_commit,
             "commit-push-pr": self._execute_commit_push_pr,
@@ -405,15 +360,10 @@ class HarnessInteractiveCommandHandler:
             "compact": self._execute_compact,
             "branch": self._execute_branch,
             "rewind": self._execute_rewind,
-            "passes": self._execute_passes,
-            "tag": self._execute_tag,
             "exit": self._execute_exit,
             "plan": self._execute_plan,
             "hooks": self._execute_hooks,
-            "managed-settings": self._execute_managed_settings,
-            "privacy-settings": self._execute_privacy_settings,
             "vim": self._execute_vim,
-            "share": self._execute_share,
             "release-notes": self._execute_release_notes,
             "version": self._execute_version,
             "env": self._execute_env,
@@ -430,15 +380,10 @@ class HarnessInteractiveCommandHandler:
             "schedule": self._execute_schedule,
             "torch": self._execute_torch,
             "ultraplan": self._execute_ultraplan,
-            "terminalSetup": self._execute_terminal_setup,
-            "terminal-setup": self._execute_terminal_setup,
-            "ide": self._execute_ide,
-            "install-github-app": self._execute_install_github_app,
             "fork": self._execute_fork,
             "issue": self._execute_issue,
             "pr_comments": self._execute_pr_comments,
             "pr-comments": self._execute_pr_comments,
-            "teleport": self._execute_teleport,
             "voice": self._execute_voice,
             "ctx_viz": self._execute_ctx_viz,
             "security-review": self._execute_security_review,
@@ -450,7 +395,6 @@ class HarnessInteractiveCommandHandler:
             "backfill-sessions": self._execute_backfill_sessions,
             "bughunter": self._execute_bughunter,
             "debug-tool-call": self._execute_debug_tool_call,
-            "rate-limit-options": self._execute_rate_limit_options,
         }
         self._register_static_command_messages(
             {
@@ -761,7 +705,7 @@ Koder understands your codebase, edits files with your permission, and runs loca
 
         koder_md_path = Path(os.getcwd()) / "AGENTS.md"
         if koder_md_path.exists():
-            return "AGENTS.md already exists."
+            return "AGENTS.md already exists. Run /init-explore to improve it from the codebase."
 
         content, command_count = self._render_default_agents_md(Path.cwd())
         koder_md_path.write_text(content, encoding="utf-8")
@@ -784,6 +728,9 @@ Koder understands your codebase, edits files with your permission, and runs loca
         except Exception:
             pass  # Don't fail init if magic doc scanning fails
 
+        lines.append(
+            "tip: run /init-explore to have Koder explore the codebase and enrich AGENTS.md."
+        )
         return "\n".join(lines)
 
     async def _execute_magic_docs(self, _scheduler, args: list[str]) -> str:
@@ -866,52 +813,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
             except Exception:
                 return False
         return False
-
-    async def _execute_install(self, _scheduler, _args: list[str]) -> str:
-        if _args:
-            return "Usage: /install"
-        repo_root = Path(__file__).resolve().parents[3]
-        config_path = get_config_manager().config_path
-        koder_binary = shutil.which("koder") or "not found"
-        uv_binary = shutil.which("uv") or "not found"
-        pyproject = repo_root / "pyproject.toml"
-        return (
-            "install:\n"
-            f"runtime_version: {resolve_runtime_version()}\n"
-            f"installation_type: {self._detect_installation_type()}\n"
-            f"invoked_binary: {self._detect_invoked_binary()}\n"
-            f"python: {sys.executable}\n"
-            f"uv: {uv_binary}\n"
-            f"koder_on_path: {koder_binary}\n"
-            f"project_root: {repo_root}\n"
-            f"pyproject: {pyproject if pyproject.exists() else 'missing'}\n"
-            f"config_path: {config_path}\n"
-            "local_commands:\n"
-            "- uv sync\n"
-            "- uv run koder\n"
-            "- uv run pytest"
-        )
-
-    async def _execute_upgrade(self, _scheduler, _args: list[str]) -> str:
-        if _args:
-            return "Usage: /upgrade"
-        repo_root = Path(__file__).resolve().parents[3]
-        upgrade_script = repo_root / "scripts" / "upgrade_dependency.py"
-        script_state = str(upgrade_script) if upgrade_script.exists() else "missing"
-        return (
-            "upgrade:\n"
-            f"current_version: {resolve_runtime_version()}\n"
-            f"installation_type: {self._detect_installation_type()}\n"
-            f"project_root: {repo_root}\n"
-            f"upgrade_script: {script_state}\n"
-            "local_update_commands:\n"
-            "- uv sync --upgrade\n"
-            "- uv run scripts/upgrade_dependency.py --help\n"
-            "account_and_model_commands:\n"
-            "- /model <model>\n"
-            "- /config\n"
-            "- koder auth login <provider>"
-        )
 
     async def _execute_model(self, _scheduler, _args: list[str]) -> str:
         manager = get_config_manager()
@@ -1988,60 +1889,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
             f"ripgrep_path: {rg_path}"
         )
 
-    async def _execute_heapdump(self, _scheduler, _args: list[str]) -> str:
-        diagnostics_dir = Path.home() / ".koder" / "diagnostics"
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        filename_stamp = created_at.replace(":", "").replace("+00:00", "Z")
-        output_path = diagnostics_dir / f"heapdump-{filename_stamp}-{os.getpid()}.json"
-
-        top_files: list[dict[str, object]] = []
-        if not tracemalloc.is_tracing():
-            tracemalloc.start(25)
-        else:
-            snapshot = tracemalloc.take_snapshot()
-            top_files = [
-                {
-                    "file": str(stat.traceback[0].filename),
-                    "size_kib": round(stat.size / 1024, 2),
-                    "count": stat.count,
-                }
-                for stat in snapshot.statistics("filename")[:15]
-            ]
-        objects = gc.get_objects()
-        type_counts = Counter(
-            f"{getattr(type(obj), '__module__', 'unknown')}."
-            f"{getattr(type(obj), '__qualname__', getattr(type(obj), '__name__', 'unknown'))}"
-            for obj in objects
-        )
-        payload = {
-            "created_at": created_at,
-            "pid": os.getpid(),
-            "cwd": os.getcwd(),
-            "python": sys.version,
-            "gc": {
-                "counts": list(gc.get_count()),
-                "objects": len(objects),
-                "garbage": len(gc.garbage),
-            },
-            "top_types": [
-                {"type": name, "count": count} for name, count in type_counts.most_common(25)
-            ],
-            "tracemalloc": {
-                "tracing": tracemalloc.is_tracing(),
-                "top_files": top_files,
-            },
-        }
-        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        return (
-            "heapdump: written\n"
-            f"path: {output_path}\n"
-            f"pid: {payload['pid']}\n"
-            f"objects: {payload['gc']['objects']}\n"
-            f"top_types: {len(payload['top_types'])}\n"
-            f"tracemalloc_top_files: {len(top_files)}"
-        )
-
     async def _execute_memory(self, _scheduler, _args: list[str]) -> str:
         from pathlib import Path
 
@@ -2680,37 +2527,6 @@ If verification fails because this skill's instructions are stale, ask before ed
             "rate_limit_status: unknown"
         )
 
-    async def _execute_stats(self, scheduler, _args: list[str]) -> str:
-        from koder_agent.core.session import EnhancedSQLiteSession
-
-        local_stats = await EnhancedSQLiteSession.collect_local_stats()
-        usage = scheduler.usage_tracker.session_usage if scheduler else None
-        if usage is None:
-            requests = 0
-            last_input = 0
-            last_output = 0
-            context_tokens = 0
-        else:
-            requests = usage.request_count
-            last_input = usage.last_input_tokens
-            last_output = usage.last_output_tokens
-            context_tokens = usage.current_context_tokens
-
-        return (
-            "## Stats\n\n"
-            f"Sessions: {local_stats['total_sessions']}\n"
-            f"Messages: {local_stats['total_messages']}\n"
-            f"Active days: {local_stats['active_days']}\n"
-            f"First session: {local_stats['first_session_date'] or 'N/A'}\n"
-            f"Last session: {local_stats['last_session_date'] or 'N/A'}\n"
-            f"Peak day: {local_stats['peak_day'] or 'N/A'}\n\n"
-            "### Current session\n\n"
-            f"requests: {requests}\n"
-            f"last_input_tokens: {last_input}\n"
-            f"last_output_tokens: {last_output}\n"
-            f"context_tokens: {context_tokens}"
-        )
-
     async def _execute_effort(self, _scheduler, _args: list[str]) -> str:
         manager = get_config_manager()
         config = manager.load()
@@ -2789,51 +2605,6 @@ If verification fails because this skill's instructions are stale, ask before ed
             f"settings_path: {manager.config_path}\n"
             f"agent_reloaded: {agent_reloaded}"
         )
-
-    async def _execute_copy(self, _scheduler, _args: list[str]) -> str:
-        if _scheduler is None or not hasattr(_scheduler, "session"):
-            return "copy: no active session content available"
-        if not hasattr(_scheduler.session, "get_items"):
-            return "copy: no active session content available"
-
-        items = await _scheduler.session.get_items()
-        assistant_messages = [
-            item.get("content", "")
-            for item in items
-            if isinstance(item, dict) and item.get("role") == "assistant"
-        ]
-        if not assistant_messages:
-            return "copy: no assistant responses available"
-
-        requested_index = 1
-        if _args:
-            if len(_args) != 1:
-                return "Usage: /copy [N]"
-            try:
-                requested_index = int(_args[0])
-            except ValueError:
-                return "Usage: /copy [N]"
-            if requested_index < 1:
-                return "Usage: /copy [N]"
-        if requested_index > len(assistant_messages):
-            return (
-                f"copy: requested response {requested_index} is unavailable\n"
-                f"available_responses: {len(assistant_messages)}"
-            )
-
-        selected = assistant_messages[-requested_index]
-        clipboard, error = _copy_text_to_clipboard(selected)
-        status = "copy: copied to clipboard" if error is None else "copy: clipboard unavailable"
-        lines = [
-            status,
-            f"copy_index: {requested_index}",
-            f"available_responses: {len(assistant_messages)}",
-            f"clipboard: {clipboard}",
-        ]
-        if error is not None:
-            lines.append(f"clipboard_error: {error}")
-        lines.extend(["content:", selected])
-        return "\n".join(lines)
 
     async def _execute_export(self, scheduler, _args: list[str]) -> str:
         if scheduler is None or not hasattr(scheduler, "session"):
@@ -3221,11 +2992,12 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                 "Choose a previous user prompt to restore the conversation before that point.",
                 "Use /rewind <number> to restore the conversation and place that prompt back into the input.",
             ]
-            for number, (_item_index, prompt_text) in enumerate(newest_first, start=1):
-                lines.append(f"{number}. {self._truncate_prompt_preview(prompt_text)}")
-            lines.append(
-                "Code restore and summarize are not yet available in the current CLI-only runtime."
-            )
+            for number, (item_index, prompt_text) in enumerate(newest_first, start=1):
+                trimmed = len(items) - item_index
+                lines.append(
+                    f"{number}. {self._truncate_prompt_preview(prompt_text)}"
+                    f" (removes {trimmed} newer transcript item{'s' if trimmed != 1 else ''})"
+                )
             return "\n".join(lines)
 
         try:
@@ -3238,120 +3010,17 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
 
         selected_index, selected_prompt = newest_first[selection - 1]
         kept_items = items[:selected_index]
+        removed_count = len(items) - selected_index
         await session.clear_session()
         if kept_items:
             await session.add_items(kept_items)
         self._pending_input_text = selected_prompt
 
-        return f"Rewound conversation to prompt {selection}.\nRestored input: {selected_prompt}"
-
-    async def _execute_passes(self, _scheduler, _args: list[str]) -> str:
-        """Show verification status."""
-        import subprocess
-
-        lines = ["Verification Status:"]
-        # Check if tests exist and their last result
-        try:
-            result = subprocess.run(
-                ["git", "log", "--oneline", "-5", "--grep=test\\|fix\\|feat"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.stdout.strip():
-                lines.append("\nRecent changes:")
-                lines.append(result.stdout.strip())
-        except Exception:
-            pass
-        # Check for uncommitted test files
-        try:
-            status = subprocess.run(
-                ["git", "diff", "--name-only"], capture_output=True, text=True, timeout=5
-            )
-            test_files = [f for f in status.stdout.strip().split("\n") if "test" in f.lower() and f]
-            if test_files:
-                lines.append(f"\nModified test files: {len(test_files)}")
-                for f in test_files[:5]:
-                    lines.append(f"  {f}")
-        except Exception:
-            pass
-        lines.extend(self._render_pytest_cache_status(Path.cwd()))
-        lines.append("\nRun tests with: uv run pytest")
-        return "\n".join(lines)
-
-    def _render_pytest_cache_status(self, cwd: Path) -> list[str]:
-        cache_dir = cwd / ".pytest_cache" / "v" / "cache"
-        nodeids_path = cache_dir / "nodeids"
-        lastfailed_path = cache_dir / "lastfailed"
-        if not cache_dir.exists():
-            return ["\npytest_cache: unavailable"]
-
-        lines = ["\npytest_cache:"]
-        nodeids: list[str] = []
-        if nodeids_path.exists():
-            try:
-                nodeids = json.loads(nodeids_path.read_text(encoding="utf-8"))
-            except Exception:
-                nodeids = []
-            if isinstance(nodeids, list):
-                lines.append(f"  collected_tests: {len(nodeids)}")
-
-        if not lastfailed_path.exists():
-            if isinstance(nodeids, list) and nodeids:
-                lines.append("  status: last run passed")
-                lines.append("  failed_tests: 0")
-                return lines
-            lines.append("  status: no lastfailed data")
-            return lines
-
-        try:
-            lastfailed = json.loads(lastfailed_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            lines.append(f"  status: unreadable lastfailed ({exc})")
-            return lines
-
-        failed = sorted(lastfailed) if isinstance(lastfailed, dict) else []
-        if failed:
-            lines.append("  status: failing")
-            lines.append(f"  failed_tests: {len(failed)}")
-            for nodeid in failed[:5]:
-                lines.append(f"  - {nodeid}")
-            return lines
-
-        lines.append("  status: last run passed")
-        lines.append("  failed_tests: 0")
-        return lines
-
-    async def _execute_tag(self, _scheduler, args: list[str]) -> str:
-        if not args or args[0] in {"help", "-h", "--help"}:
-            return "Usage: /tag <label>"
-        label = " ".join(args).strip()
-        if not label:
-            return "Usage: /tag <label>"
-
-        session = getattr(_scheduler, "session", None)
-        if session is None:
-            return "Tag support requires an active session."
-
-        current_tag: Optional[str] = None
-        if hasattr(session, "get_tag"):
-            current_tag = await session.get_tag()
-        else:
-            current_session_id = getattr(session, "session_id", None)
-            if current_session_id is None:
-                return "Tag support requires an active session."
-            fallback_session = EnhancedSQLiteSession(session_id=str(current_session_id))
-            current_tag = await fallback_session.get_tag()
-            session = fallback_session
-
-        if current_tag == label:
-            if hasattr(session, "set_tag"):
-                await session.set_tag(None)
-            return f"Tag removed: {label}"
-
-        if hasattr(session, "set_tag"):
-            await session.set_tag(label)
-        return f"Tag added: {label}"
+        return (
+            f"Rewound conversation to prompt {selection}.\n"
+            f"Removed transcript items: {removed_count}\n"
+            f"Restored input: {selected_prompt}"
+        )
 
     async def _execute_exit(self, _scheduler, _args: list[str]) -> str:
         return "__EXIT__"
@@ -3409,27 +3078,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             )
         return "\n".join(lines)
 
-    async def _execute_managed_settings(self, _scheduler, _args: list[str]) -> str:
-        return render_managed_settings_status()
-
-    async def _execute_privacy_settings(self, _scheduler, _args: list[str]) -> str:
-        """Show privacy-related configuration."""
-        home_dir = harness_home_dir()
-        cwd = Path.cwd()
-        return "\n".join(
-            [
-                "Privacy Settings:",
-                "privacy_settings:",
-                "telemetry: disabled",
-                f"data_storage: {home_dir} (local only)",
-                f"session_history: {home_dir / 'koder.db'}",
-                f"project_memory: {cwd / '.koder' / 'memory'}",
-                f"user_memory: {home_dir / 'memory'}",
-                "external_services: configured LLM API only",
-                "secret_handling: diagnostic commands show set/unset state, not secret values",
-            ]
-        )
-
     async def _execute_vim(self, _scheduler, _args: list[str]) -> str:
         state_path = _vim_state_path()
         vim_manager = None
@@ -3461,28 +3109,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                 vim_manager.save()
                 self.vim_enabled = vim_manager.enabled
         return f"vim: {'enabled' if self.vim_enabled else 'disabled'}\nsettings_path: {state_path}"
-
-    async def _execute_share(self, scheduler, _args: list[str]) -> str:
-        if scheduler is None:
-            return "share: unavailable"
-        session = scheduler.session
-        display_name = await session.get_display_name()
-        lines = [f"share session_id: {session.session_id}", f"display_name: {display_name}"]
-        if hasattr(session, "get_title"):
-            title = await session.get_title()
-            if title:
-                lines.append(f"title: {title}")
-        current_tag = None
-        if hasattr(session, "get_tag"):
-            current_tag = await session.get_tag()
-        elif getattr(session, "session_id", None) is not None:
-            current_tag = await EnhancedSQLiteSession(session_id=str(session.session_id)).get_tag()
-        if current_tag:
-            lines.append(f"tag: {current_tag}")
-        current_color = await self._get_session_color(scheduler)
-        if current_color:
-            lines.append(f"color: {current_color}")
-        return "\n".join(lines)
 
     async def _execute_commit(self, _scheduler, _args: list[str]) -> str:
         cwd = os.getcwd()
@@ -4462,6 +4088,9 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         tool_records = self._collect_tool_call_records(items)
         tool_call_count = sum(1 for record in tool_records if record["kind"] == "call")
         tool_result_count = sum(1 for record in tool_records if record["kind"] == "output")
+        tool_name_counts = Counter(
+            record["name"] for record in tool_records if record["kind"] == "call"
+        )
         context_files = self._collect_context_file_paths(items)
 
         lines = [
@@ -4474,6 +4103,10 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             f"  Tool calls: {tool_call_count}",
             f"  Files in context: {len(context_files)}",
         ]
+        if tool_name_counts:
+            lines.append("  Tool usage:")
+            for name, count in tool_name_counts.most_common(10):
+                lines.append(f"    - {name}: {count}")
         if context_files:
             lines.append("  Context files:")
             lines.extend(f"    - {path}" for path in context_files)
@@ -4547,10 +4180,21 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                     f"mode: {state.policy_mode}",
                     f"auto_allow_bash_if_sandboxed: {str(state.auto_allow_bash_if_sandboxed).lower()}",
                     f"network_access: {str(state.network_access).lower()}",
+                    "network_policy_enforcement: "
+                    + next(
+                        (
+                            status.capabilities.supports_network_policy
+                            for status in state.backend_statuses
+                            if status.backend_id == state.backend
+                        ),
+                        "unknown",
+                    ),
                     "allowed_domains: "
-                    + (", ".join(state.allowed_domains) if state.allowed_domains else "none"),
+                    + (", ".join(state.allowed_domains) if state.allowed_domains else "none")
+                    + (" (policy metadata, not enforced)" if state.allowed_domains else ""),
                     "denied_domains: "
-                    + (", ".join(state.denied_domains) if state.denied_domains else "none"),
+                    + (", ".join(state.denied_domains) if state.denied_domains else "none")
+                    + (" (policy metadata, not enforced)" if state.denied_domains else ""),
                     "protected_paths: "
                     + (", ".join(state.protected_paths) if state.protected_paths else "none"),
                     f"excluded_commands: {len(state.excluded_commands)}",
@@ -4802,40 +4446,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         except Exception as e:
             return f"Planning failed: {e}"
 
-    async def _execute_terminal_setup(self, _scheduler, _args: list[str]) -> str:
-        import os
-
-        if _args and _args[0].strip().lower() not in {"status", "show"}:
-            return "Usage: /terminal-setup [status]\naliases: /terminalSetup"
-
-        lines = [
-            "Terminal Configuration:",
-            "terminal-setup:",
-            "canonical_command: /terminal-setup",
-            "aliases: /terminalSetup",
-            f"TERM: {os.environ.get('TERM', 'unknown')}",
-            f"TERM_PROGRAM: {os.environ.get('TERM_PROGRAM', 'unknown')}",
-            f"SHELL: {os.environ.get('SHELL', 'unknown')}",
-            f"COLORTERM: {os.environ.get('COLORTERM', 'unknown')}",
-            f"COLUMNS: {os.environ.get('COLUMNS', 'unknown')}",
-            f"LINES: {os.environ.get('LINES', 'unknown')}",
-            "controls: /vim, /statusline, /output-style",
-        ]
-        return "\n".join(lines)
-
-    async def _execute_ide(self, _scheduler, args: list[str]) -> str:
-        if not args or args[0] == "status":
-            return render_ide_status(cwd=Path.cwd())
-        if args[0] != "open":
-            return "Usage: /ide [status|open <launcher> [path]]"
-
-        launcher_selector = args[1] if len(args) >= 2 else None
-        target = Path(args[2]).expanduser() if len(args) >= 3 else Path.cwd()
-        return open_ide_target(launcher_selector=launcher_selector, target=target)
-
-    async def _execute_install_github_app(self, _scheduler, args: list[str]) -> str:
-        return render_github_actions_command(args, cwd=Path.cwd())
-
     async def _execute_fork(self, _scheduler, _args: list[str]) -> str:
         args = list(_args)
 
@@ -5037,7 +4647,10 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
         import subprocess
 
         if not _args:
-            return "Usage: /autofix-pr #<PR-number>\nAnalyzes a PR and suggests fixes."
+            return (
+                "Usage: /autofix-pr #<PR-number>\n"
+                "Inspects the PR diff size and tells you how to request an automated fix."
+            )
         pr_num = _args[0].lstrip("#")
         try:
             diff = subprocess.run(
@@ -5266,9 +4879,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             )
         return "\n".join(lines)
 
-    async def _execute_rate_limit_options(self, scheduler, _args: list[str]) -> str:
-        return render_policy_limit_options(scheduler=scheduler)
-
     async def _execute_backfill_sessions(self, scheduler, _args: list[str]) -> str:
         try:
             session = getattr(scheduler, "session", None) if scheduler is not None else None
@@ -5290,33 +4900,6 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             return "\n".join(lines)
         except Exception as e:
             return f"Session listing failed: {e}"
-
-    async def _execute_teleport(self, scheduler, _args: list[str]) -> str:
-        if _args:
-            previous_cwd = Path.cwd()
-            target = Path(_args[0]).expanduser().resolve()
-            if not target.exists():
-                return f"teleport: path not found: {target}"
-            if not target.is_dir():
-                return f"teleport: not a directory: {target}"
-            hook_result = dispatch_command_hooks(
-                cwd=previous_cwd,
-                event_name="CwdChanged",
-                match_value=None,
-                payload={
-                    "event": "CwdChanged",
-                    "cwd": str(target),
-                },
-            )
-            update_watch_paths(hook_result.watch_paths)
-            os.chdir(target)
-            session = getattr(scheduler, "session", None) if scheduler is not None else None
-            session_id = getattr(session, "session_id", None)
-            if session_id is not None:
-                await EnhancedSQLiteSession.record_session_cwd(str(session_id), str(target))
-            return f"cwd: {target}"
-        worktree = WorktreeService(worktrees_dir(os.getcwd()))
-        return f"teleport_root: {worktree.root}"
 
     async def _execute_voice(self, _scheduler, _args: list[str]) -> str:
         if _args and _args[0] == "status":
@@ -5390,6 +4973,11 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
             "shortcut: double-space to record, Space or Enter to stop, auto-send on completion"
         )
 
+    @staticmethod
+    def _ctx_viz_bar(percentage: float, width: int = 20) -> str:
+        filled = max(0, min(width, round(width * percentage / 100)))
+        return "[" + "#" * filled + "." * (width - filled) + "]"
+
     async def _execute_ctx_viz(self, _scheduler, _args: list[str]) -> str:
         from koder_agent.harness.session_flow import load_context
 
@@ -5407,6 +4995,54 @@ Be specific — reference file names and line numbers. Prioritize issues by seve
                 items = []
             transcript, message_count = session_transcript_from_items(items)
             sections.append(f"Session messages: {message_count}")
+
+            # Token usage breakdown by category, mirroring the injected
+            # context (project context + transcript roles + free space).
+            window_size = get_context_window_size(get_model_name())
+            base_tokens = estimate_text_tokens(base)
+            dict_items = [item for item in items if isinstance(item, dict)]
+            user_tokens = estimate_messages_tokens(
+                [item for item in dict_items if item.get("role") == "user"]
+            )
+            assistant_tokens = estimate_messages_tokens(
+                [item for item in dict_items if item.get("role") == "assistant"]
+            )
+            tool_tokens = estimate_messages_tokens(
+                [item for item in dict_items if item.get("role") == "tool"]
+            )
+            other_tokens = estimate_messages_tokens(
+                [
+                    item
+                    for item in dict_items
+                    if item.get("role") not in {"user", "assistant", "tool"}
+                ]
+            )
+            total_tokens = base_tokens + user_tokens + assistant_tokens + tool_tokens + other_tokens
+            free_tokens = max(0, window_size - total_tokens)
+            used_percentage = (total_tokens / window_size * 100) if window_size else 0.0
+
+            breakdown = [
+                ("project context", base_tokens),
+                ("user messages", user_tokens),
+                ("assistant messages", assistant_tokens),
+                ("tool results", tool_tokens),
+            ]
+            if other_tokens:
+                breakdown.append(("other items", other_tokens))
+            breakdown.append(("free space", free_tokens))
+
+            usage_lines = [
+                "Context usage (estimated):",
+                f"total: {total_tokens:,} / {window_size:,} tokens ({used_percentage:.1f}%)",
+            ]
+            for label, tokens in breakdown:
+                pct = (tokens / window_size * 100) if window_size else 0.0
+                usage_lines.append(f"{label}: {tokens:,} ({pct:.1f}%) {self._ctx_viz_bar(pct)}")
+            if used_percentage >= 80:
+                usage_lines.append(
+                    "warning: context is over 80% full; consider /compact to free space"
+                )
+            sections.append("\n".join(usage_lines))
 
             context_files = self._collect_context_file_paths(items)
             if context_files:

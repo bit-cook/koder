@@ -118,12 +118,43 @@ def _denial_message(tool_name: str, reason: str) -> str:
     return f"{base}: {reason}" if reason else base
 
 
+def _dispatch_permission_hooks(event_name: str, tool_name: str, payload: dict) -> object | None:
+    """Best-effort hook dispatch for permission events on the main tool chain.
+
+    Returns the hook result (for ``PermissionRequest`` decision inspection) or
+    ``None`` when dispatch is unavailable or fails — hooks must never break a
+    tool call.
+    """
+    try:
+        from pathlib import Path
+
+        from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+
+        return dispatch_command_hooks(
+            cwd=Path.cwd(),
+            event_name=event_name,
+            match_value=tool_name,
+            payload=payload,
+        )
+    except Exception:
+        logger.debug("%s hook dispatch failed for %s", event_name, tool_name, exc_info=True)
+        return None
+
+
 async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[str]:
     """Return a denial message if the call is blocked, else ``None`` to allow.
 
     No-op (returns ``None``) when the tool is not guarded, when no permission
     context is active, or when arguments can't be parsed (the tool's own
     validation will then handle the malformed input).
+
+    Dispatches the permission hook events on this path:
+
+    - ``PermissionRequest`` + ``Notification`` when a call needs approval; a
+      hook may resolve the request via ``permissionRequestResult`` with
+      behavior ``allow`` (optionally ``updatedInput`` is ignored here since
+      arguments are already bound) or ``deny``.
+    - ``PermissionDenied`` when the final outcome is a denial.
     """
     if tool_name not in GUARDED_TOOLS:
         return None
@@ -147,17 +178,57 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
         logger.debug("Permission evaluation failed for %s", tool_name, exc_info=True)
         return None
 
+    def _deny(reason: str) -> str:
+        _dispatch_permission_hooks(
+            "PermissionDenied",
+            tool_name,
+            {
+                "event": "PermissionDenied",
+                "tool_name": tool_name,
+                "tool_input": arguments,
+                "reason": reason,
+            },
+        )
+        return _denial_message(tool_name, reason)
+
     if decision.requires_approval:
+        request_result = _dispatch_permission_hooks(
+            "PermissionRequest",
+            tool_name,
+            {
+                "event": "PermissionRequest",
+                "tool_name": tool_name,
+                "tool_input": arguments,
+                "reason": decision.reason,
+            },
+        )
+        _dispatch_permission_hooks(
+            "Notification",
+            "permission_prompt",
+            {
+                "event": "Notification",
+                "notification_type": "permission_prompt",
+                "tool_name": tool_name,
+                "reason": decision.reason,
+            },
+        )
+        hook_decision = getattr(request_result, "permission_request_result", None)
+        if isinstance(hook_decision, dict):
+            behavior = hook_decision.get("behavior")
+            if behavior == "allow":
+                return None
+            if behavior == "deny":
+                return _deny(hook_decision.get("message") or decision.reason)
         if ctx.approver is not None:
             try:
                 approved = await ctx.approver(tool_name, arguments, decision)
             except Exception:
                 logger.debug("Tool approver raised for %s", tool_name, exc_info=True)
                 approved = False
-            return None if approved else _denial_message(tool_name, decision.reason)
+            return None if approved else _deny(decision.reason)
         # No interactive approver available.
         if _enforce_approval_when_unattended():
-            return _denial_message(tool_name, decision.reason)
+            return _deny(decision.reason)
         logger.debug(
             "Tool %s requires approval but no approver is wired; allowing (%s)",
             tool_name,
@@ -166,6 +237,6 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
         return None
 
     if not decision.allowed:
-        return _denial_message(tool_name, decision.reason)
+        return _deny(decision.reason)
 
     return None

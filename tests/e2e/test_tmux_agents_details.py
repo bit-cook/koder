@@ -90,19 +90,20 @@ def test_tmux_agents_show_displays_custom_agent_metadata(tmp_path):
     launch = " ".join(
         [
             "cd",
-            shlex.quote(str(PROJECT_ROOT)),
+            shlex.quote(str(repo)),
             "&&",
             "HOME=" + shlex.quote(str(home)),
             shlex.quote(UV),
+            "--project",
+            shlex.quote(str(PROJECT_ROOT)),
             "run",
+            "--no-sync",
             "koder",
         ]
     )
     try:
         _tmux("new-session", "-d", "-s", session, launch)
         _wait_for_prompt(session)
-        _send(session, f"/teleport {repo}")
-        _wait_for_output(session, "cwd:")
         _send(session, "/agents show reviewer")
         output = _wait_for_output(session, "description: Reviews code carefully")
         assert "tools: Read, Bash" in output

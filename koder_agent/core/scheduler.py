@@ -35,6 +35,7 @@ from ..core.session import EnhancedSQLiteSession, migrate_legacy_sessions
 from ..core.streaming_display import StreamingDisplayManager
 from ..core.terminal_reflow import print_reflowable
 from ..core.usage_tracker import UsageTracker, usage_snapshot_path
+from ..core.working_indicator import working_indicator
 from ..harness.agents.definitions import (
     AgentDefinition,
     build_agent_system_prompt,
@@ -452,6 +453,26 @@ class AgentScheduler:
         streaming_ui: StreamingOutputUI | None = None,
     ) -> str:
         """Handle a single turn after the turn lock has been acquired."""
+        # Start before agent init/memory retrieval so the indicator covers the
+        # whole pre-stream setup gap, not just the model call.
+        working_indicator.begin()
+        try:
+            return await self._run_turn_unlocked(
+                user_input,
+                render_output=render_output,
+                streaming_ui=streaming_ui,
+            )
+        finally:
+            working_indicator.finish()
+
+    async def _run_turn_unlocked(
+        self,
+        user_input: str,
+        *,
+        render_output: bool = True,
+        streaming_ui: StreamingOutputUI | None = None,
+    ) -> str:
+        """Execute one turn; the caller owns the working-indicator lifecycle."""
         turn_user_input = user_input
 
         # Ensure agent is initialized with MCP servers and migration complete
@@ -781,14 +802,31 @@ class AgentScheduler:
 
         # Create the streaming display manager
         display_manager = StreamingDisplayManager(console)
+
+        # The raw-terminal ESC listener only works when we own stdin (Unix TTY,
+        # no fixed-bottom TUI). In interactive fixed-bottom mode, prompt_toolkit
+        # owns stdin, so cancellation is routed via the streaming UI's ESC
+        # keybinding instead (set_cancel_callback below).
+        esc_enabled = streaming_ui is None and sys.platform != "win32" and sys.stdin.isatty()
+
+        def _body_with_indicator():
+            # Rich Live refreshes on its own timer thread, so the indicator
+            # animates during silent gaps. Interactive mode renders the
+            # indicator in its own prompt_toolkit window instead.
+            body = display_manager.get_display_content()
+            if not working_indicator.is_active:
+                return body
+            status = working_indicator.status_text(esc_hint=esc_enabled)
+            return Group(body, Text(status, style="dim"))
+
         live_renderable = BuddyLiveLayout(
-            body_getter=display_manager.get_display_content,
+            body_getter=(
+                display_manager.get_display_content
+                if streaming_ui is not None
+                else _body_with_indicator
+            ),
             config_getter=self._runtime_config_service.load,
         )
-
-        # Check if ESC listener should be enabled (Unix TTY only). In interactive
-        # fixed-bottom mode, prompt_toolkit owns stdin while the model streams.
-        esc_enabled = streaming_ui is None and sys.platform != "win32" and sys.stdin.isatty()
 
         # Add space before streaming starts
         if streaming_ui is None:
@@ -823,21 +861,19 @@ class AgentScheduler:
             cancel_token.cancel()  # Signal to break out of iterator immediately
             result.cancel(mode="immediate")  # Also cancel the underlying stream
 
-        # Show ESC hint if enabled (will be cleared after streaming)
-        esc_hint_shown = False
-        if esc_enabled:
-            console.print("[dim]Press ESC to cancel[/dim]")
-            esc_hint_shown = True
+        def handle_escape_sync():
+            """Synchronous ESC hook for the prompt_toolkit streaming UI."""
+            nonlocal cancelled
+            cancelled = True
+            cancel_token.cancel()
+            result.cancel(mode="immediate")
 
-        def clear_esc_hint():
-            nonlocal esc_hint_shown
-            if esc_hint_shown and sys.stdout.isatty():
-                try:
-                    sys.stdout.write("\033[A\033[2K")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-                esc_hint_shown = False
+        # In fixed-bottom mode, register cancellation with the TUI's ESC binding.
+        ui_set_cancel = (
+            getattr(streaming_ui, "set_cancel_callback", None) if streaming_ui is not None else None
+        )
+        if callable(ui_set_cancel):
+            ui_set_cancel(handle_escape_sync)
 
         async def consume_stream_events(on_update) -> None:
             nonlocal execution_error
@@ -892,6 +928,7 @@ class AgentScheduler:
                                         )
                                     ):
                                         buddy_runtime.mark_tool_call(event.item.raw_item.name)
+                                        working_indicator.set_activity(event.item.raw_item.name)
                                         should_update = display_manager.handle_tool_called(
                                             event.item
                                         )
@@ -901,6 +938,8 @@ class AgentScheduler:
                                         event.item, ToolCallOutputItem
                                     ):
                                         self._tool_call_count += 1
+                                        # Only advertise a tool while it is running.
+                                        working_indicator.set_activity(None)
                                         should_update = display_manager.handle_tool_output(
                                             event.item
                                         )
@@ -909,10 +948,12 @@ class AgentScheduler:
                                     pass
                                 elif event.name == "handoff_requested":
                                     buddy_runtime.mark_tool_call("agent_handoff")
+                                    working_indicator.set_activity("agent_handoff")
                                     should_update = display_manager.handle_tool_called(
                                         _HandoffToolItem()
                                     )
                                 elif event.name == "handoff_occured":
+                                    working_indicator.set_activity(None)
                                     should_update = display_manager.handle_tool_output(
                                         _HandoffOutputItem()
                                     )
@@ -935,26 +976,29 @@ class AgentScheduler:
             except Exception as e:
                 execution_error = e
 
-        if streaming_ui is None:
-            # Use Rich Live for proper formatting during streaming.
-            with Live(
-                live_renderable,
-                console=console,
-                refresh_per_second=8,
-                transient=True,
-                vertical_overflow="crop",
-            ) as live:
-                await consume_stream_events(live.refresh)
-        else:
-            await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))
+        try:
+            if streaming_ui is None:
+                # Use Rich Live for proper formatting during streaming.
+                with Live(
+                    live_renderable,
+                    console=console,
+                    refresh_per_second=8,
+                    transient=True,
+                    vertical_overflow="crop",
+                ) as live:
+                    await consume_stream_events(live.refresh)
+            else:
+                await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))
+        finally:
+            # Detach the ESC hook so a stale callback can't cancel a later turn.
+            if callable(ui_set_cancel):
+                ui_set_cancel(None)
 
         # After Rich Live context ends, perform intelligent cleanup
+        working_indicator.set_activity(None)
         display_manager.finalize_text_sections()
         if streaming_ui is not None:
             streaming_ui.update_output(live_renderable)
-
-        # Clear the ESC hint line (now outside Live context)
-        clear_esc_hint()
 
         # Handle execution error after Live context has properly closed
         if execution_error is not None:
@@ -996,6 +1040,8 @@ class AgentScheduler:
                     streaming_ui.set_final_content(partial_content)
                 elif partial_text and partial_text.strip():
                     streaming_ui.set_final_text(partial_text)
+                else:
+                    streaming_ui.set_final_text("[yellow]Operation cancelled by user[/yellow]")
 
             # Capture any usage data we can
             await self._capture_usage(result)
@@ -1336,6 +1382,15 @@ class AgentScheduler:
             context_before = await self.refresh_context_usage_from_session(
                 [item for item in items if isinstance(item, dict)]
             )
+            self._dispatch_compact_hooks(
+                "PreCompact",
+                {
+                    "event": "PreCompact",
+                    "trigger": "auto",
+                    "session_id": self.session.session_id,
+                    "context_tokens": context_before,
+                },
+            )
             console.print("[dim]compacting...[/dim]")
             # Keep more recent conversation so the model retains working context
             # after a compaction instead of re-reading everything.
@@ -1381,6 +1436,19 @@ class AgentScheduler:
                 context_after = await self.refresh_context_usage_from_session(compacted_items)
 
                 self._auto_compact.record_success()
+                self._dispatch_compact_hooks(
+                    "PostCompact",
+                    {
+                        "event": "PostCompact",
+                        "trigger": "auto",
+                        "session_id": self.session.session_id,
+                        "summary": result.summary or "",
+                        "original_count": result.original_count,
+                        "kept_count": len(result.kept_messages),
+                        "context_before": context_before,
+                        "context_after": context_after,
+                    },
+                )
                 console.print(
                     f"[dim]compacted, context size {context_before:,} -> {context_after:,}[/dim]"
                 )
@@ -1391,6 +1459,27 @@ class AgentScheduler:
             if self._auto_compact:
                 self._auto_compact.record_failure()
             logger.warning("Auto-compact failed: %s", e)
+
+    @staticmethod
+    def _dispatch_compact_hooks(event_name: str, payload: dict) -> None:
+        """Best-effort PreCompact/PostCompact dispatch for automatic compaction.
+
+        Matches the payload contract of the manual /compact command with
+        trigger="auto"; hook problems never break compaction itself.
+        """
+        try:
+            from pathlib import Path
+
+            from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+
+            dispatch_command_hooks(
+                cwd=Path.cwd(),
+                event_name=event_name,
+                match_value="auto",
+                payload=payload,
+            )
+        except Exception:
+            logger.debug("%s hook dispatch failed", event_name, exc_info=True)
 
     async def _run_session_memory_extraction(
         self, context_tokens: int, tool_call_count: int

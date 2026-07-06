@@ -17,6 +17,6 @@ from koder_agent.harness.commands.registry import CommandRegistry
 
 def test_command_registry_contains_inspection_domain():
     registry = CommandRegistry.with_defaults()
-    assert {"files", "diff", "context", "cost", "doctor", "help", "copy", "export"} <= set(
+    assert {"files", "diff", "context", "cost", "doctor", "help", "export"} <= set(
         registry.list_names()
     )

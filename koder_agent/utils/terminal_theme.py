@@ -173,6 +173,8 @@ def get_adaptive_prompt_style():
             "stream-output": "#000000",
             "queued-input": "#777777",  # Queued prompts while a turn is running
             "tip-line": "#777777 italic",
+            "working-indicator": "#B45309",  # Spinner glyph + word while a turn runs
+            "working-indicator-detail": "#777777",  # Elapsed time / tool / esc hint
             # Status line styles
             "status-label": "#666666",  # Gray labels
             "status-value": "#333333",  # Dark values
@@ -200,6 +202,8 @@ def get_adaptive_prompt_style():
             "stream-output": "#ffffff",
             "queued-input": "#888888",  # Queued prompts while a turn is running
             "tip-line": "#888888 italic",
+            "working-indicator": "#E5A458",  # Spinner glyph + word while a turn runs
+            "working-indicator-detail": "#888888",  # Elapsed time / tool / esc hint
             # Status line styles
             "status-label": "#888888",  # Gray labels
             "status-value": "#cccccc",  # Light values
@@ -227,6 +231,8 @@ def get_adaptive_prompt_style():
             "stream-output": "",
             "queued-input": "#888888",
             "tip-line": "#888888 italic",
+            "working-indicator": "#E5A458",  # Spinner glyph + word while a turn runs
+            "working-indicator-detail": "#888888",  # Elapsed time / tool / esc hint
             # Status line styles (neutral colors)
             "status-label": "#888888",
             "status-value": "",  # Use terminal default

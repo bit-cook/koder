@@ -24,7 +24,6 @@ class HarnessCompanionConfig(BaseModel):
 class HarnessRuntimeConfig(BaseModel):
     """Runtime-owned harness settings."""
 
-    interactive_shell: str = Field(default="runtime")
     permission_mode: str = Field(default="default")
     teammate_mode: Literal["auto", "tmux", "in-process"] = Field(default="auto")
     last_release_notes_seen: str | None = Field(default=None)

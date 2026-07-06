@@ -74,7 +74,12 @@ def _git_root() -> Path | None:
 
 
 def enter_worktree(name: Optional[str] = None) -> str:
-    """Create and enter an isolated git worktree for parallel development."""
+    """Create and enter an isolated git worktree for parallel development.
+
+    Args:
+        name: Name for the new worktree/branch (letters, digits, dots,
+            underscores, dashes); auto-generated when omitted
+    """
     global _session
     if _session is not None:
         return json.dumps(
@@ -138,7 +143,14 @@ def enter_worktree(name: Optional[str] = None) -> str:
 
 
 def exit_worktree(action: str, discard_changes: Optional[bool] = None) -> str:
-    """Exit the current worktree session."""
+    """Exit the current worktree session.
+
+    Args:
+        action: "keep" to leave the worktree and branch on disk, or "remove"
+            to delete both
+        discard_changes: Required true with action="remove" when the worktree
+            has uncommitted or unmerged changes
+    """
     global _session
     if _session is None:
         return json.dumps(

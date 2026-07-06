@@ -1,1 +1,0 @@
-"""Harness state tests package."""

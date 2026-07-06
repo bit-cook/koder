@@ -26,7 +26,6 @@ def test_debug_and_diagnostic_commands_available():
         "env",
         "issue",
         "summary",
-        "rate-limit-options",
         "oauth-refresh",
     }
     assert expected_debug <= names

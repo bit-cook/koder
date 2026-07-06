@@ -44,7 +44,6 @@ def test_skills_command_lists_available_skills(tmp_path, monkeypatch):
 
     result = asyncio.run(_run_skills(handler))
     assert "batch" in result
-    assert "claude-api" in result
     assert "debug" in result
     assert "loop" in result
     assert "simplify" in result
@@ -238,4 +237,4 @@ def test_direct_skill_invocation_respects_skill_permission_rules(tmp_path, monke
 def test_direct_bundled_skill_invocation_works():
     handler = HarnessInteractiveCommandHandler()
     result = asyncio.run(handler.handle_slash_input("/simplify", scheduler=None))
-    assert "Review the changed code and simplify it." in result
+    assert "improving the **quality** of the changed code" in result

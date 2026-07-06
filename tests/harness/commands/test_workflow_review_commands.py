@@ -22,6 +22,4 @@ def test_workflow_review_commands_are_registered():
         "compact",
         "branch",
         "rewind",
-        "passes",
-        "install-github-app",
     } <= set(registry.list_names())

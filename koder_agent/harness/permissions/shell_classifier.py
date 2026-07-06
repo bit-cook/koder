@@ -173,7 +173,17 @@ WRITE_COMMANDS = {
     "touch",
 }
 
-DANGEROUS_PREFIXES = {
+# Privilege-escalation commands: hard-denied, never routed to an approval prompt.
+PRIVILEGED_PREFIXES = {
+    "doas",
+    "su",
+    "sudo",
+}
+
+# Interpreters and script runners: they execute arbitrary code so they always
+# require approval, but they are everyday dev tools (pytest, build scripts,
+# node tooling) and must stay approvable rather than hard-denied.
+CODE_EXECUTION_PREFIXES = {
     "bash",
     "bun",
     "bunx",
@@ -193,7 +203,6 @@ DANGEROUS_PREFIXES = {
     "ruby",
     "sh",
     "ssh",
-    "sudo",
     "tsx",
     "yarn",
     "zsh",
@@ -257,6 +266,10 @@ class ShellCommandDecision:
     reason: str
 
 
+# find actions that mutate the filesystem or execute commands
+_FIND_MUTATING_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf"}
+
+
 def _is_read_only_segment(tokens: list[str]) -> bool:
     if not tokens:
         return True
@@ -265,6 +278,8 @@ def _is_read_only_segment(tokens: list[str]) -> bool:
         return is_readonly_git_subcommand(tokens)
     if command == "sed":
         return "-i" not in tokens and not any(token.startswith("-i") for token in tokens)
+    if command == "find":
+        return not any(token in _FIND_MUTATING_FLAGS for token in tokens)
     return command in READ_ONLY_COMMANDS
 
 
@@ -279,18 +294,13 @@ def _is_write_segment(tokens: list[str]) -> bool:
     return command in WRITE_COMMANDS
 
 
-def _is_dangerous_segment(tokens: list[str], lowered_command: str) -> bool:
+def _is_privileged_segment(tokens: list[str], lowered_command: str) -> bool:
+    """Segments that are hard-denied: privilege escalation or destructive deletes."""
     if not tokens:
         return False
     command = tokens[0]
 
-    if command in DANGEROUS_PREFIXES:
-        if command == "git" and len(tokens) > 1 and tokens[1] in READ_ONLY_GIT_SUBCOMMANDS:
-            return False
-        if command == "npm" and len(tokens) > 1 and tokens[1] not in {"run", "exec"}:
-            return False
-        if command in {"yarn", "bun"} and len(tokens) > 1 and tokens[1] not in {"run", "exec"}:
-            return False
+    if command in PRIVILEGED_PREFIXES:
         return True
 
     if command in {"rm", "rmdir"} and re.search(
@@ -299,6 +309,21 @@ def _is_dangerous_segment(tokens: list[str], lowered_command: str) -> bool:
         return True
 
     return False
+
+
+def _is_code_execution_segment(tokens: list[str]) -> bool:
+    """Segments that run arbitrary code: allowed, but always need approval."""
+    if not tokens:
+        return False
+    command = tokens[0]
+
+    if command not in CODE_EXECUTION_PREFIXES:
+        return False
+    if command == "npm" and len(tokens) > 1 and tokens[1] not in {"run", "exec"}:
+        return False
+    if command in {"yarn", "bun"} and len(tokens) > 1 and tokens[1] not in {"run", "exec"}:
+        return False
+    return True
 
 
 def classify_shell_command(command: str) -> ShellCommandDecision:
@@ -354,7 +379,7 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             reason="empty command",
         )
 
-    if any(_is_dangerous_segment(tokens, lowered) for tokens in tokenized_segments):
+    if any(_is_privileged_segment(tokens, lowered) for tokens in tokenized_segments):
         return ShellCommandDecision(
             command=command,
             allowed=False,
@@ -365,12 +390,27 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
             reason="dangerous command prefix detected",
         )
 
+    if any(_is_code_execution_segment(tokens) for tokens in tokenized_segments):
+        return ShellCommandDecision(
+            command=command,
+            allowed=True,
+            read_only=False,
+            requires_approval=True,
+            destructive=False,
+            malformed=False,
+            reason="command executes arbitrary code; requires approval",
+        )
+
     read_only = all(_is_read_only_segment(tokens) for tokens in tokenized_segments)
     mutates_filesystem = any(_is_write_segment(tokens) for tokens in tokenized_segments) or bool(
         WRITE_REDIRECTION_PATTERN.search(raw)
     )
 
-    if read_only and not mutates_filesystem:
+    # Command/process substitution can smuggle arbitrary commands into an
+    # otherwise read-only line; never auto-allow those.
+    has_substitution = "$(" in raw or "`" in raw or "<(" in raw or ">(" in raw
+
+    if read_only and not mutates_filesystem and not has_substitution:
         return ShellCommandDecision(
             command=command,
             allowed=True,

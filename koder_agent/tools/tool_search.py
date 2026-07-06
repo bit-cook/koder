@@ -66,7 +66,13 @@ def _score_tool(tool, terms: list[str], required: set[str]) -> int:
 
 
 def tool_search(query: str, max_results: int = 5) -> str:
-    """Search for available tools by keyword or direct selection."""
+    """Search for available tools by keyword or direct selection.
+
+    Args:
+        query: Keywords to match against tool names/descriptions, or
+            "select:name1,name2" to activate specific tools by exact name
+        max_results: Maximum number of matching tools to return
+    """
     tools = _get_deferred_tools()
 
     # Direct selection mode

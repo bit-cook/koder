@@ -17,4 +17,4 @@ from koder_agent.harness.commands.registry import CommandRegistry
 
 def test_workflow_state_commands_are_registered():
     registry = CommandRegistry.with_defaults()
-    assert {"memory", "tasks", "tag", "clear", "exit"} <= set(registry.list_names())
+    assert {"memory", "tasks", "clear", "exit"} <= set(registry.list_names())

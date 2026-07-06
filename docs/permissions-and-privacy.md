@@ -26,7 +26,6 @@ Inspect the active policy:
 /permissions
 /sandbox
 /sandbox status
-/privacy-settings
 ```
 
 Change sandbox policy:
@@ -67,15 +66,14 @@ Managed settings are local high-priority policy files:
 ~/.koder/managed-settings.json
 ```
 
-Inspect them with:
+Inspect the resulting policy with:
 
 ```bash
-/managed-settings
 /hooks
 /sandbox status
 ```
 
-Koder does not fetch a hosted managed-settings service. The command reports the local policy file currently present on disk.
+Koder does not fetch a hosted managed-settings service. Policy is read from the local file currently present on disk.
 
 ## Shell Commands
 
@@ -106,7 +104,6 @@ Avoid putting API keys in project files. OAuth tokens are stored under `~/.koder
 Use these commands when you want to verify what Koder can see:
 
 ```bash
-/privacy-settings
 /status
 /files
 /context

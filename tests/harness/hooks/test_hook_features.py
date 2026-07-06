@@ -232,7 +232,7 @@ def test_hook_output_is_capped_at_10000_chars(tmp_path, monkeypatch):
 # ---- KODER_ENV_FILE for CwdChanged and FileChanged ----
 
 
-def test_cwd_changed_hook_receives_claude_env_file(tmp_path, monkeypatch):
+def test_cwd_changed_hook_receives_koder_env_file(tmp_path, monkeypatch):
     """CwdChanged hooks should receive KODER_ENV_FILE in their environment."""
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"
@@ -270,7 +270,7 @@ def test_cwd_changed_hook_receives_claude_env_file(tmp_path, monkeypatch):
     assert "test-session" in content
 
 
-def test_file_changed_hook_receives_claude_env_file(tmp_path, monkeypatch):
+def test_file_changed_hook_receives_koder_env_file(tmp_path, monkeypatch):
     """FileChanged hooks should receive KODER_ENV_FILE in their environment."""
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / "project"

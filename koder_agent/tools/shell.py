@@ -221,6 +221,26 @@ class BackgroundShellManager:
 async def run_shell(command: str, timeout: int = 120, run_in_background: bool = False) -> str:
     """Execute a shell command with security checks.
 
+    IMPORTANT - use dedicated tools instead of shell equivalents. Dedicated tools
+    are easier to review and to grant permission for:
+    - Read files: use read_file, NOT cat/head/tail
+    - Edit files: use edit_file, NOT sed/awk
+    - Create files: use write_file, NOT echo redirection or heredocs
+    - Find files by name: use glob_search, NOT find/ls
+    - Search file contents: use grep_search, NOT grep/rg
+    - Communicate with the user: output text directly in your response,
+      NEVER via echo or shell comments
+
+    Usage notes:
+    - Set run_in_background=true for long-running commands (dev servers, watchers,
+      long builds); monitor with shell_output and stop with shell_kill. Do not use
+      a trailing '&' instead.
+    - No interactive input is supported: avoid interactive flags (e.g. -i) and
+      commands that prompt; use non-interactive alternatives (e.g. --yes).
+    - Oversized output is truncated (~30,000 characters, head and tail kept), so
+      pipe verbose commands through filters (e.g. tail, --quiet) to keep the
+      relevant part.
+
     Args:
         command: The shell command to execute
         timeout: Timeout in seconds (default: 120, max: 600). Only for foreground.
@@ -339,7 +359,11 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
 
 @function_tool
 async def shell_output(shell_id: str, filter_str: Optional[str] = None) -> str:
-    """Retrieve output from a background shell process.
+    """Retrieve output from a background shell started via run_shell(run_in_background=true).
+
+    Returns only output produced since the last check, plus the process status
+    (e.g. running, completed, failed, terminated). Poll periodically for
+    long-running commands.
 
     Args:
         shell_id: The ID returned when starting a background command
@@ -370,7 +394,10 @@ async def shell_output(shell_id: str, filter_str: Optional[str] = None) -> str:
 
 @function_tool
 async def shell_kill(shell_id: str) -> str:
-    """Terminate a background shell process.
+    """Terminate a background shell started via run_shell(run_in_background=true).
+
+    Use this to stop dev servers, watchers, or other long-running background
+    commands when they are no longer needed.
 
     Args:
         shell_id: The ID of the background shell to terminate
@@ -402,6 +429,14 @@ async def shell_kill(shell_id: str) -> str:
 @function_tool
 async def git_command(command: str, timeout: int = 60) -> str:
     """Execute a git command.
+
+    Git Safety Protocol:
+    - NEVER modify git config.
+    - NEVER run destructive commands (push --force, reset --hard, clean -f,
+      checkout/restore that discards changes) unless the user explicitly requests it.
+    - NEVER use --no-verify or otherwise skip hooks.
+    - If a pre-commit hook fails, the commit did NOT happen: fix the issue and
+      create a NEW commit; do not use --amend (it would rewrite the previous commit).
 
     Args:
         command: The git command to execute (with or without leading 'git')

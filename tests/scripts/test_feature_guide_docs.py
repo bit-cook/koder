@@ -57,3 +57,15 @@ def test_command_reference_has_no_generic_execute_descriptions():
     text = COMMANDS.read_text(encoding="utf-8")
 
     assert "| Execute /" not in text
+
+
+def test_command_reference_has_no_test_fixture_wording():
+    """Fixture vocabulary belongs in the scenario manifest, not user docs."""
+    import re
+
+    text = COMMANDS.read_text(encoding="utf-8")
+    fixture_terms = re.compile(r"\b(stub|stubbed|fake|fixture)\b", re.IGNORECASE)
+
+    for line in text.splitlines():
+        if line.startswith("|"):
+            assert not fixture_terms.search(line), line
