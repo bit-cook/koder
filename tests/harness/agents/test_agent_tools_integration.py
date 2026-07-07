@@ -73,7 +73,7 @@ def test_full_sync_agent_spawn_and_result(monkeypatch):
     """Sync agent_tool call with subagent_type='Explore' returns sub-agent result."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return "analysis complete: 5 endpoints found"
 
@@ -100,7 +100,7 @@ def test_full_team_workflow(tmp_path, monkeypatch):
     prompts: list[str] = []
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         prompts.append(prompt)
         return "teammate done"

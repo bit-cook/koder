@@ -19,7 +19,7 @@ if str(project_root) not in sys.path:
 def test_agent_tool_sync_spawn_returns_result(monkeypatch):
     """Sync agent_tool call blocks and returns the sub-agent result."""
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return f"result for: {prompt}"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -40,7 +40,7 @@ def test_agent_tool_sync_spawn_returns_result(monkeypatch):
 def test_agent_tool_with_subagent_type(monkeypatch):
     """Agent tool resolves a named agent type."""
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return f"explored by {agent_definition.agent_type}"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -80,7 +80,7 @@ def test_agent_tool_unknown_agent_type_returns_error():
 def test_agent_tool_async_spawn_returns_agent_id(tmp_path, monkeypatch):
     """Async agent_tool call returns immediately with agent_id."""
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "background result"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -134,7 +134,7 @@ def test_agent_tool_with_isolation_worktree(tmp_path, monkeypatch):
     seen_definitions = []
     seen_cwds = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_definitions.append(agent_definition)
         seen_cwds.append(cwd)
         return "worktree result"
@@ -173,7 +173,7 @@ def test_agent_tool_with_isolation_worktree(tmp_path, monkeypatch):
 def test_agent_tool_background_frontmatter_forces_async(monkeypatch):
     """background=true in agent definition forces async execution."""
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "bg forced result"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -241,7 +241,7 @@ def test_agent_tool_disable_background_tasks_env(monkeypatch):
     """KODER_DISABLE_BACKGROUND_TASKS=1 forces sync execution."""
     monkeypatch.setenv("KODER_DISABLE_BACKGROUND_TASKS", "1")
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "forced sync"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)

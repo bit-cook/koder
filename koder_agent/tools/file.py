@@ -142,6 +142,60 @@ def _find_actual_string(file_content: str, search_string: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Line-ending preservation
+#
+# read_file exposes files to the model in universal-newline (LF) form, and the
+# model supplies edits with LF. But writing that LF text straight back rewrites a
+# CRLF file's every line ending to LF — a whole-file diff from a one-line intent,
+# and broken CRLF-sensitive tooling. So tools operate on LF-normalized text
+# internally but detect and RE-APPLY the file's dominant on-disk ending on write.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_newlines(text: str) -> str:
+    """Normalize all line endings (CRLF, lone CR) to LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _detect_line_ending(raw: str) -> str:
+    """Detect the dominant line ending of raw (untranslated) file text.
+
+    Returns "\\r\\n", "\\n", or "\\r" -- whichever occurs most often. Ties break
+    in favor of "\\n" first, then "\\r\\n", then "\\r". Text with no line endings
+    defaults to "\\n".
+    """
+    crlf = raw.count("\r\n")
+    lf = raw.count("\n") - crlf
+    cr = raw.count("\r") - crlf
+    best = max(lf, crlf, cr)
+    if best == 0 or lf == best:
+        return "\n"
+    if crlf == best:
+        return "\r\n"
+    return "\r"
+
+
+def _read_text_preserving_ending(p: Path) -> Tuple[str, str]:
+    """Read a file without newline translation.
+
+    Returns (LF-normalized text, dominant line ending). The normalized text is
+    what tools operate on internally (matching what read_file exposed to the
+    model); the ending is re-applied when writing back to disk.
+    """
+    with open(p, encoding="utf-8", newline="") as f:
+        raw = f.read()
+    return _normalize_newlines(raw), _detect_line_ending(raw)
+
+
+def _apply_line_ending(text: str, ending: str) -> bytes:
+    """Re-apply ``ending`` to LF-normalized ``text`` and return UTF-8 bytes."""
+    normalized = _normalize_newlines(text)
+    if ending != "\n":
+        normalized = normalized.replace("\n", ending)
+    return normalized.encode("utf-8")
+
+
 def get_file_state() -> ReadFileState:
     """Get the global file state tracker."""
     return _file_state
@@ -448,18 +502,23 @@ def write_file(path: str, content: str) -> str:
                 )
 
         old_content = ""
+        line_ending = "\n"
         if not is_new_file:
             try:
-                old_content = p.read_text(encoding="utf-8")
+                old_content, line_ending = _read_text_preserving_ending(p)
             except Exception:
                 old_content = ""
 
         # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
         record_pre_edit(str(p))
 
-        # Write the new content atomically, refusing to follow a leaf symlink.
-        _atomic_write_no_follow(path, content.encode("utf-8"))
-        _file_state.record_read(str(p), content=content)
+        # Write atomically (symlink-safe), preserving the existing file's dominant
+        # line ending; a brand-new file keeps the content's own endings.
+        disk_bytes = (
+            content.encode("utf-8") if is_new_file else _apply_line_ending(content, line_ending)
+        )
+        _atomic_write_no_follow(path, disk_bytes)
+        _file_state.record_read(str(p), content=_normalize_newlines(content))
 
         # Generate diff for display
         filename = p.name
@@ -504,23 +563,31 @@ def append_file(path: str, content: str) -> str:
                 )
 
         old_content = ""
+        line_ending = "\n"
         if not is_new_file:
             try:
-                old_content = p.read_text(encoding="utf-8")
+                old_content, line_ending = _read_text_preserving_ending(p)
             except Exception:
                 old_content = ""
 
         # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
         record_pre_edit(str(p))
 
-        # Append the content (refusing to follow a leaf symlink)
-        _write_bytes_no_follow(path, content.encode("utf-8"), append=True)
+        # Append the content (refusing to follow a leaf symlink), re-encoding the
+        # appended text to the existing file's dominant ending so we never splice a
+        # lone LF into an otherwise-CRLF file. A new file keeps the content's own.
+        append_bytes = (
+            content.encode("utf-8") if is_new_file else _apply_line_ending(content, line_ending)
+        )
+        _write_bytes_no_follow(path, append_bytes, append=True)
 
         # Generate diff for display (showing appended content)
         new_content = old_content + content
-        # Record the new full content so a subsequent append/edit doesn't
-        # spuriously fail the staleness check (mirrors write_file).
-        _file_state.record_read(str(p), content=new_content)
+        # Record LF-normalized content so a subsequent append/edit doesn't
+        # spuriously fail the staleness check: is_stale() re-reads the file with
+        # universal newlines (LF), so the stored copy must be LF too (mirrors
+        # write_file). Storing raw CR-bearing content would look "modified".
+        _file_state.record_read(str(p), content=_normalize_newlines(new_content))
         filename = p.name
         diff_output = _generate_diff_output(old_content, new_content, filename, is_new_file)
 
@@ -574,7 +641,7 @@ def edit_file_by_replacement(
             if e.errno == errno.ELOOP:
                 return f"{_SYMLINK_WRITE_MSG}: {path}"
             return str(e)
-        _file_state.record_read(str(p), content=new_string)
+        _file_state.record_read(str(p), content=_normalize_newlines(new_string))
         return f"Created {path} ({len(new_string)} bytes)"
 
     # File must exist
@@ -592,7 +659,9 @@ def edit_file_by_replacement(
             "Read it again before attempting to edit it."
         )
 
-    content = p.read_text(encoding="utf-8")
+    # Read LF-normalized (so the model's LF old_string matches, even for a CRLF
+    # file), remembering the dominant on-disk ending to re-apply on write.
+    content, line_ending = _read_text_preserving_ending(p)
 
     # Find with quote normalization
     actual_old = _find_actual_string(content, old_string)
@@ -626,12 +695,14 @@ def edit_file_by_replacement(
     record_pre_edit(str(p))
 
     try:
-        _atomic_write_no_follow(path, new_content.encode("utf-8"))
+        _atomic_write_no_follow(path, _apply_line_ending(new_content, line_ending))
     except OSError as e:
         if e.errno == errno.ELOOP:
             return f"{_SYMLINK_WRITE_MSG}: {path}"
         return str(e)
-    _file_state.record_read(str(p), content=new_content)
+    # Store LF-normalized content so the staleness check (which re-reads with
+    # universal newlines) stays consistent even if new_string carried literal \r.
+    _file_state.record_read(str(p), content=_normalize_newlines(new_content))
 
     diff_output = _generate_diff_output(content, new_content, p.name)
     return f"Successfully edited {path}\n---DIFF---\n{diff_output}"
@@ -692,14 +763,14 @@ def edit_file(
                     "Read it again before attempting to edit it."
                 )
 
-            content = p.read_text(encoding="utf-8")
+            content, line_ending = _read_text_preserving_ending(p)
             new_content, error = apply_diff(content, diff)
             if error:
                 return f"Failed to apply diff: {error}"
             # Snapshot pre-edit content for /rewind code restoration (no-op-safe).
             record_pre_edit(str(p))
-            _atomic_write_no_follow(path, new_content.encode("utf-8"))
-            _file_state.record_read(str(p), content=new_content)
+            _atomic_write_no_follow(path, _apply_line_ending(new_content, line_ending))
+            _file_state.record_read(str(p), content=_normalize_newlines(new_content))
             return f"Successfully applied diff to {path}\n---DIFF---\n{diff}"
         except OSError as e:
             if e.errno == errno.ELOOP:

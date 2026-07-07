@@ -92,7 +92,11 @@ async def _agent_tool_impl(
     if effective_isolation and effective_isolation != selected.isolation:
         agent_def = _replace(agent_def, isolation=effective_isolation)
 
-    service = AgentService()
+    from .permission_context import get_tool_permission_context
+
+    _perm_ctx = get_tool_permission_context()
+    _perm_service = _perm_ctx.permission_service if _perm_ctx is not None else None
+    service = AgentService(permission_service=_perm_service)
 
     # Build fork context if requested
     seed_items = None

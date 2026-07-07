@@ -133,7 +133,7 @@ def test_agents_summary_reports_runtime_agent_records(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "Reviewed router tests\nDetails hidden from summary"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)

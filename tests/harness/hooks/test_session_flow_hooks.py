@@ -30,6 +30,7 @@ class _FakeScheduler:
         instructions_override=None,
         instructions_append=None,
         permission_service=None,
+        approver=None,
     ):
         self.session = _FakeSchedulerSession(session_id)
         self.streaming = streaming

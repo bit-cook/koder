@@ -158,7 +158,9 @@ def test_hook_pretool_guardrail_rejects_blocked_command(tmp_path, monkeypatch):
     data = MagicMock(spec=ToolInputGuardrailData)
     data.context = mock_context
 
-    result = hook_pretool_guardrail(data)
+    # The guardrail is async (runs hook I/O off the event loop); the SDK's
+    # ToolInputGuardrail.run awaits awaitable guardrail results.
+    result = __import__("asyncio").run(hook_pretool_guardrail(data))
     assert result.behavior["type"] == "reject_content"
 
 

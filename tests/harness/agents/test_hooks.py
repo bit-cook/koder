@@ -147,3 +147,31 @@ def test_subagent_shell_preflight_does_not_fail_without_tool_arguments(tmp_path)
         name = "run_shell"
 
     asyncio.run(hooks.on_tool_start(None, _Agent(), _Tool()))
+
+
+def test_subagent_frontmatter_command_hooks_are_timeout_bounded(monkeypatch):
+    """Fix 5 (subagent parity): the frontmatter hook mini-runner must never call
+    subprocess.run with timeout=None — a hanging PreToolUse/Stop hook would
+    otherwise freeze the subagent forever."""
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["timeout"] = kwargs.get("timeout", "MISSING")
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr("koder_agent.harness.agents.hooks.subprocess.run", fake_run)
+
+    # SubagentLifecycleHooks is already imported (module fully loaded), so reach
+    # the private mini-runner via its module without re-triggering package import.
+    hooks_mod = sys.modules[SubagentLifecycleHooks.__module__]
+    rules = [{"hooks": [{"type": "command", "command": "echo hi"}]}]
+    hooks_mod._run_command_hooks(rules, {"event": "PreToolUse"}, cwd=".")
+
+    assert seen["timeout"] not in (None, "MISSING"), "hook subprocess.run got an unbounded timeout"
+    assert isinstance(seen["timeout"], (int, float)) and seen["timeout"] > 0

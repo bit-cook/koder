@@ -205,6 +205,18 @@ def is_readonly_git_subcommand(tokens: list[str]) -> bool:
         return False
 
     subcommand = tokens[1]
+    rest = tokens[2:]
+
+    # ``--output[=]FILE`` (git's diff-machinery flag, accepted by log/show/
+    # diff/...) writes/truncates an arbitrary path, so any otherwise read-only
+    # subcommand carrying it must require approval. A stray ``-o FILE`` is
+    # likewise treated as a write, but only for the core read-only subcommands:
+    # on extended subcommands such as ``ls-files``, ``-o`` means ``--others``
+    # and is a legitimate read-only flag.
+    if any(token == "--output" or token.startswith("--output=") for token in rest):
+        return False
+    if subcommand in READ_ONLY_GIT_SUBCOMMANDS and "-o" in rest:
+        return False
 
     # Pure read-only subcommands that have no write flags
     if subcommand in READ_ONLY_GIT_SUBCOMMANDS and subcommand not in GIT_WRITE_FLAGS:
@@ -212,7 +224,6 @@ def is_readonly_git_subcommand(tokens: list[str]) -> bool:
 
     # Subcommands with per-flag write rules
     if subcommand in GIT_WRITE_FLAGS:
-        rest = tokens[2:]
         write_flags = GIT_WRITE_FLAGS[subcommand]
 
         # ``config`` and ``tag`` need value-assignment analysis, not just a flag
@@ -331,7 +342,13 @@ DANGEROUS_PATTERNS = [
     re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:", re.IGNORECASE),
 ]
 
-WRITE_REDIRECTION_PATTERN = re.compile(r"(?:^|[^\d])>>?(?!\s*/dev/null\b)")
+# A write redirection to a file: ``>``/``>>``, optionally fd-prefixed (``1>``,
+# ``2>>``) — a digit before ``>`` picks the stream but still truncates/appends
+# the target file, so it MUST count as a write (mirrors bash_security's
+# ``_REDIRECT_RE``). Exemptions: ``/dev/null`` (discard) and fd duplication /
+# closing (``2>&1``, ``>&2``, ``2>&-``), which retarget a descriptor rather
+# than write a file. Other ``/dev/*`` targets are caught earlier as dangerous.
+WRITE_REDIRECTION_PATTERN = re.compile(r"\d*>>?(?!\s*/dev/null\b)(?!&(?:\d|-))")
 COMMAND_SPLIT_PATTERN = re.compile(r"\s*(?:\|\||&&|[|;])\s*")
 
 # Shell operators that separate command segments during quote-aware tokenization.
@@ -393,8 +410,19 @@ class ShellCommandDecision:
     reason: str
 
 
-# find actions that mutate the filesystem or execute commands
-_FIND_MUTATING_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf"}
+# find actions that mutate the filesystem, execute commands, or write to a
+# caller-supplied file (the whole ``-f*`` output family truncates its target).
+_FIND_MUTATING_FLAGS = {
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-fls",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
+    "-ok",
+    "-okdir",
+}
 
 # Runner options that consume a SEPARATE following argument (so the argument is
 # not mistaken for the inner command). All other ``-`` tokens are treated as
@@ -524,6 +552,23 @@ def normalize_segment_for_rule(tokens: list[str]) -> str | None:
     return normalized
 
 
+def _sort_writes_output(tokens: list[str]) -> bool:
+    """Return True if any ``sort`` token requests writing to an output file.
+
+    ``sort -o FILE`` / ``sort --output=FILE`` overwrite FILE, so they are
+    writes even though plain ``sort`` is read-only. Covers the separate
+    (``-o FILE``), attached (``-oFILE``), and clustered (``-uo FILE``) short
+    forms plus both long forms. Any short-option cluster containing ``o`` is
+    treated as a write; over-matching is safe (falls back to approval).
+    """
+    for token in tokens[1:]:
+        if token == "--output" or token.startswith("--output="):
+            return True
+        if token.startswith("-") and not token.startswith("--") and "o" in token:
+            return True
+    return False
+
+
 def _sed_is_in_place(tokens: list[str]) -> bool:
     """Return True if any ``sed`` token requests in-place editing (a write).
 
@@ -549,6 +594,9 @@ def _is_read_only_segment(tokens: list[str]) -> bool:
         return not _sed_is_in_place(tokens)
     if command == "find":
         return not any(token in _FIND_MUTATING_FLAGS for token in tokens)
+    if command == "sort":
+        # sort is read-only unless -o/--output overwrites a file.
+        return not _sort_writes_output(tokens)
     return command in READ_ONLY_COMMANDS
 
 
@@ -561,6 +609,11 @@ def _is_write_segment(tokens: list[str]) -> bool:
     if command == "sed":
         # In-place sed mutates files; flag-dependent, so handled specially.
         return _sed_is_in_place(tokens)
+    if command == "find":
+        return any(token in _FIND_MUTATING_FLAGS for token in tokens)
+    if command == "sort":
+        # sort -o/--output overwrites its target file.
+        return _sort_writes_output(tokens)
     return command in WRITE_COMMANDS
 
 

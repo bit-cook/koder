@@ -89,14 +89,23 @@ Return your findings or results directly without unnecessary explanation."""
                     ),
                 )
 
-                # Run the delegated agent
-                result = await Runner.run(
-                    delegated_agent,
-                    task.prompt,
-                    max_turns=get_max_turns(),
-                    run_config=RunConfig(),
-                    hooks=get_display_hooks(),
+                from ..harness.agents.service import _deny_approver
+                from .permission_context import (
+                    reset_tool_permission_context,
+                    subagent_permission_scope,
                 )
+
+                _tok = subagent_permission_scope(deny_approver=_deny_approver)
+                try:
+                    result = await Runner.run(
+                        delegated_agent,
+                        task.prompt,
+                        max_turns=get_max_turns(),
+                        run_config=RunConfig(),
+                        hooks=get_display_hooks(),
+                    )
+                finally:
+                    reset_tool_permission_context(_tok)
 
                 return task.description, result.final_output
 

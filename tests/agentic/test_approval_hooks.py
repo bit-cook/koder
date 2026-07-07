@@ -230,7 +230,7 @@ async def test_post_tool_use_dispatch_receives_tool_input_from_context():
     ctx.tool_arguments = json.dumps({"file_path": "/tmp/test.py", "content": "hello"})
     agent = MagicMock()
 
-    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks") as mock_dispatch:
+    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks_async") as mock_dispatch:
         mock_dispatch.return_value = MagicMock(blocked=False)
         await hooks.on_tool_end(ctx, agent, tool, "ok")
 
@@ -252,7 +252,7 @@ async def test_post_tool_use_dispatch_empty_when_no_tool_arguments():
     ctx = MagicMock(spec=[])  # spec=[] means no attributes
     agent = MagicMock()
 
-    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks") as mock_dispatch:
+    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks_async") as mock_dispatch:
         mock_dispatch.return_value = MagicMock(blocked=False)
         await hooks.on_tool_end(ctx, agent, tool, "content")
 
@@ -271,7 +271,7 @@ async def test_post_tool_use_dispatch_handles_malformed_json():
     ctx.tool_arguments = "not valid json {"
     agent = MagicMock()
 
-    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks") as mock_dispatch:
+    with patch("koder_agent.agentic.approval_hooks.dispatch_command_hooks_async") as mock_dispatch:
         mock_dispatch.return_value = MagicMock(blocked=False)
         await hooks.on_tool_end(ctx, agent, tool, "error")
 

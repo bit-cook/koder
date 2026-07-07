@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 
-from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+from koder_agent.harness.hooks.runtime import dispatch_command_hooks_async
 from koder_agent.tools.permission_context import GUARDED_TOOLS
 
 if TYPE_CHECKING:
@@ -67,7 +67,9 @@ class ApprovalHooks(RunHooks):
         """Called when the agent produces a final output."""
         if self.wrapped_hooks:
             await self.wrapped_hooks.on_agent_end(context, agent, output)
-        result = dispatch_command_hooks(
+        # Await the off-loop variant so a slow Stop hook cannot freeze the
+        # event loop (streaming UI, concurrent subagents, cron).
+        result = await dispatch_command_hooks_async(
             cwd=Path.cwd(),
             event_name="Stop",
             match_value=None,
@@ -163,7 +165,9 @@ class ApprovalHooks(RunHooks):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        dispatch_command_hooks(
+        # Await the off-loop variant so a slow PostToolUse hook cannot freeze
+        # the event loop (streaming UI, concurrent subagents, cron).
+        await dispatch_command_hooks_async(
             cwd=Path.cwd(),
             event_name="PostToolUse",
             match_value=tool.name,

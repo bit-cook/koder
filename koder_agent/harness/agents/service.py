@@ -22,6 +22,11 @@ from koder_agent.harness.paths import worktrees_dir
 from koder_agent.harness.plan.mode import PlanModeService
 from koder_agent.harness.worktree.service import WorktreeService
 from koder_agent.tools import get_all_tools
+from koder_agent.tools.permission_context import (
+    get_tool_permission_context,
+    reset_tool_permission_context,
+    subagent_permission_scope,
+)
 from koder_agent.tools.plan_mode import plan_service_scope
 from koder_agent.utils.client import get_model_client_snapshot
 
@@ -40,6 +45,17 @@ from .teams.context import TeamToolContext, team_tool_context
 logger = logging.getLogger(__name__)
 
 AgentRunExecutor = Callable[..., Awaitable[str]]
+
+
+async def _deny_approver(tool_name, arguments, decision):
+    """Always-deny approver used for subagents.
+
+    A subagent has no interactive terminal, so an approval-gated call must fail
+    CLOSED. Passing approver=None instead would hit enforce_tool_permission's
+    TTY-aware fallback, which fails OPEN in an interactive session. Returning
+    "deny" is the verdict enforce_tool_permission understands as a block.
+    """
+    return "deny"
 
 
 def _utc_now_iso() -> str:
@@ -88,7 +104,8 @@ def _redacted_model_config_snapshot(agent_definition: AgentDefinition) -> dict[s
 
 
 async def _cleanup_agent_mcp_servers(agent: Any) -> None:
-    for server in list(getattr(agent, "mcp_servers", []) or []):
+    servers = getattr(agent, "mcp_servers", None) or getattr(agent, "_koder_mcp_servers", None)
+    for server in list(servers or []):
         cleanup = getattr(server, "cleanup", None)
         if cleanup is None:
             continue
@@ -115,6 +132,7 @@ async def _execute_agent_run(
     seed_items: list[dict[str, Any]] | None,
     cwd: str | None,
     team_context: TeamToolContext | None = None,
+    permission_service: Any = None,
 ) -> str:
     tools = filter_tools_for_agent_definition(agent_definition, get_all_tools())
     # Subagents cannot spawn other subagents
@@ -132,6 +150,9 @@ async def _execute_agent_run(
         if not existing_items:
             await session.add_items(seed_items)
 
+    perm_token = subagent_permission_scope(permission_service, deny_approver=_deny_approver)
+    perm_ctx = get_tool_permission_context()
+    effective_service = perm_ctx.permission_service if perm_ctx else None
     try:
         with team_tool_context(team_context):
             result = await Runner.run(
@@ -143,10 +164,12 @@ async def _execute_agent_run(
                     agent_definition=agent_definition,
                     cwd=cwd or Path.cwd(),
                     wrapped_hooks=get_display_hooks(),
+                    permission_service=effective_service,
                 ),
                 max_turns=agent_definition.max_turns or get_max_turns(),
             )
     finally:
+        reset_tool_permission_context(perm_token)
         await _cleanup_agent_mcp_servers(agent)
     return str(result.final_output)
 
@@ -154,12 +177,13 @@ async def _execute_agent_run(
 class AgentService:
     """Stable service for spawning agents and routing mailbox messages."""
 
-    def __init__(self, *, output_root: Path | None = None):
+    def __init__(self, *, output_root: Path | None = None, permission_service: Any = None):
         self._agents: dict[str, AgentRecord] = {}
         self._mailboxes: dict[str, list[AgentMessage]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._name_registry: dict[str, str] = {}  # name -> agent_id
         self._owned_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._permission_service = permission_service
         self.output_root = (output_root or (Path.home() / ".koder" / "agents")).expanduser()
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._load_records()
@@ -307,6 +331,7 @@ class AgentService:
                     session_id=f"subagent-sync-{uuid.uuid4().hex[:8]}",
                     seed_items=seed_items,
                     cwd=effective_cwd,
+                    permission_service=self._permission_service,
                 )
         finally:
             # Dirty worktrees are kept so the user can inspect or merge them.
@@ -442,6 +467,7 @@ class AgentService:
                     "session_id": session_id,
                     "seed_items": seed_items,
                     "cwd": cwd,
+                    "permission_service": self._permission_service,
                 }
                 if team_context is not None:
                     execute_kwargs["team_context"] = team_context

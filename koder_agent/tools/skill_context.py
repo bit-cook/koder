@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -300,11 +300,48 @@ def clear_restrictions() -> None:
     _active_restrictions.set(None)
 
 
+def begin_skill_restriction_scope() -> Token:
+    """Seed a persistent restrictions container at the current (run-loop) scope.
+
+    The scheduler MUST call this before ``Runner.run`` so that skill restrictions
+    survive the SDK task boundary. The openai-agents runner executes every tool
+    call inside its own ``asyncio.Task``, which runs in a COPY of the context
+    captured when the task was created. A ContextVar ``.set()`` performed *inside*
+    a tool task (as ``get_skill`` does when it loads a restricted skill) mutates
+    only that task's copy and is invisible to sibling / later tool tasks.
+
+    By seeding a mutable ``SkillRestrictions`` container in the parent scope up
+    front, ``add_skill_restrictions`` can mutate it *in place* from within any
+    child tool task; because contextvar copies share the same object *reference*,
+    every other tool task under the same parent observes the mutation. This
+    mirrors ``set_tool_permission_context`` / ``set_goal_context``.
+
+    Returns a token for :func:`reset_skill_restriction_scope`.
+    """
+    return _active_restrictions.set(SkillRestrictions())
+
+
+def reset_skill_restriction_scope(token: Token) -> None:
+    """Restore the restrictions container captured before the scope began."""
+    try:
+        _active_restrictions.reset(token)
+    except (ValueError, LookupError):
+        # Token created in a different context (e.g. across task boundaries);
+        # best-effort clear instead.
+        _active_restrictions.set(None)
+
+
 def add_skill_restrictions(skill: "Skill") -> None:
     """Add tool restrictions from a loaded skill.
 
-    Uses union semantics: if restrictions already exist, the skill's
-    allowed tools are added to the existing set.
+    Uses union semantics: if restrictions already exist, the skill's allowed
+    tools are added to the existing set.
+
+    Mutates the active container IN PLACE (never ``.set()`` a fresh object when a
+    scope is already seeded) so a restriction registered from inside ``get_skill``'s
+    tool task is visible to every other tool task sharing the parent context. If no
+    scope has been seeded (e.g. a direct call outside a scheduler run), fall back to
+    creating one so behavior is still correct for standalone callers/tests.
 
     Args:
         skill: The skill whose restrictions should be added
@@ -315,7 +352,9 @@ def add_skill_restrictions(skill: "Skill") -> None:
     current = _active_restrictions.get()
 
     if current is None:
-        # First skill with restrictions
+        # No seeded scope (standalone call): create one. Note this ``.set()`` only
+        # persists when called outside an isolated tool task; the scheduler seeds a
+        # scope via begin_skill_restriction_scope so the in-place path below runs.
         current = SkillRestrictions()
         _active_restrictions.set(current)
 

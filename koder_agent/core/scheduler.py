@@ -69,6 +69,10 @@ from ..tools.permission_context import (
     reset_tool_permission_context,
     set_tool_permission_context,
 )
+from ..tools.skill_context import (
+    begin_skill_restriction_scope,
+    reset_skill_restriction_scope,
+)
 from ..utils.client import get_model_name
 from ..utils.model_info import get_context_window_size, get_maximum_output_tokens
 from ..utils.terminal_theme import get_adaptive_console
@@ -414,9 +418,11 @@ class AgentScheduler:
                     else None
                 ),
             )
-            # Track MCP servers for cleanup
-            if hasattr(self.dev_agent, "mcp_servers") and self.dev_agent.mcp_servers:
-                self._mcp_servers = list(self.dev_agent.mcp_servers)  # Create a copy
+            tracked_servers = getattr(self.dev_agent, "mcp_servers", None) or getattr(
+                self.dev_agent, "_koder_mcp_servers", None
+            )
+            if tracked_servers:
+                self._mcp_servers = list(tracked_servers)  # Create a copy
 
             # Initialize AutoCompactManager with model's context window
             model_name = get_model_name()
@@ -655,6 +661,7 @@ class AgentScheduler:
         # Set before Runner.run so the run-loop task copies a context that has it.
         perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
         goal_token = set_goal_context(self.goal_runtime)
+        skill_token = begin_skill_restriction_scope()
         await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
         self._last_turn_cancelled = False
         self._last_turn_errored = False
@@ -749,6 +756,7 @@ class AgentScheduler:
         finally:
             reset_goal_context(goal_token)
             reset_tool_permission_context(perm_token)
+            reset_skill_restriction_scope(skill_token)
 
         if companion is not None and not companion_config.harness.companion_muted:
             reaction = observe_turn(
@@ -818,6 +826,7 @@ class AgentScheduler:
 
         perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
         goal_token = set_goal_context(self.goal_runtime)
+        skill_token = begin_skill_restriction_scope()
         await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
         try:
             result = Runner.run_streamed(
@@ -940,6 +949,7 @@ class AgentScheduler:
         finally:
             reset_goal_context(goal_token)
             reset_tool_permission_context(perm_token)
+            reset_skill_restriction_scope(skill_token)
 
     def _goal_cumulative_tokens(self) -> int:
         """Cumulative billable tokens used as the goal accounting baseline."""

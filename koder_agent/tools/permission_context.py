@@ -121,6 +121,25 @@ def get_tool_permission_context() -> Optional[ToolPermissionContext]:
     return _tool_permission_ctx.get()
 
 
+def subagent_permission_scope(
+    permission_service: "PermissionService | None" = None,
+    deny_approver: Optional[Approver] = None,
+) -> Token:
+    """Set up a deny-only permission scope for a subagent run.
+
+    Resolves the effective service from the explicit argument or the inherited
+    context, pairs it with the given deny approver, and publishes it.  Returns
+    a token for :func:`reset_tool_permission_context`.
+    """
+    inherited = get_tool_permission_context()
+    effective = (
+        permission_service
+        if permission_service is not None
+        else (inherited.permission_service if inherited is not None else None)
+    )
+    return set_tool_permission_context(effective, approver=deny_approver)
+
+
 def _enforce_approval_when_unattended() -> bool:
     raw = os.environ.get(_ENFORCE_APPROVAL_ENV)
     if raw:

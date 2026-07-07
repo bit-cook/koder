@@ -89,7 +89,7 @@ def test_agent_service_handles_delayed_worker_response_without_corrupting_state(
 
 
 def test_agent_service_launches_background_agent_and_writes_output(tmp_path, monkeypatch):
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         assert agent_definition.agent_type == "general-purpose"
         assert prompt == "Investigate the auth flow"
         assert session_id.startswith("subagent-")
@@ -127,7 +127,7 @@ def test_agent_service_launches_background_agent_and_writes_output(tmp_path, mon
 
 
 def test_agent_service_records_redacted_model_config_snapshot(tmp_path, monkeypatch):
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "subagent result"
 
     def fake_snapshot(model_override):
@@ -189,7 +189,7 @@ def test_agent_service_records_redacted_model_config_snapshot(tmp_path, monkeypa
 
 
 def test_agent_service_refreshes_summary_from_persisted_output(tmp_path, monkeypatch):
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "Reviewed runtime output\nwith details"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -219,7 +219,7 @@ def test_agent_service_refreshes_summary_from_persisted_output(tmp_path, monkeyp
 
 
 def test_agent_service_records_failure_summary(tmp_path, monkeypatch):
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         raise RuntimeError("provider unavailable")
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -250,7 +250,7 @@ def test_agent_service_records_failure_summary(tmp_path, monkeypatch):
 def test_agent_service_can_resume_background_agent_with_same_session(tmp_path, monkeypatch):
     seen_session_ids: list[str] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_session_ids.append(session_id)
         return f"result for {prompt}"
 
@@ -291,7 +291,7 @@ def test_agent_service_launches_isolated_worktree_agent_in_worktree_cwd(tmp_path
     seen_cwds: list[str] = []
     seen_git_dirs: list[bool] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_cwds.append(cwd)
         seen_git_dirs.append((Path(cwd) / ".git").exists())
         return "isolated result"
@@ -335,7 +335,7 @@ def test_agent_service_keeps_dirty_worktree_after_completion(tmp_path, monkeypat
 
     seen_cwds: list[str] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_cwds.append(cwd)
         (Path(cwd) / "result.txt").write_text("agent output\n", encoding="utf-8")
         return "isolated result"
@@ -385,7 +385,7 @@ def test_agent_service_run_sync_removes_clean_worktree_and_branch(tmp_path, monk
 
     seen_cwds: list[str] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_cwds.append(cwd)
         return "sync isolated result"
 
@@ -422,7 +422,7 @@ def test_agent_service_run_sync_keeps_dirty_worktree(tmp_path, monkeypatch):
 
     seen_cwds: list[str] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_cwds.append(cwd)
         (Path(cwd) / "result.txt").write_text("agent output\n", encoding="utf-8")
         return "sync isolated result"
@@ -459,7 +459,7 @@ def test_agent_service_run_sync_removes_clean_worktree_on_failure(tmp_path, monk
 
     seen_cwds: list[str] = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_cwds.append(cwd)
         raise RuntimeError("agent exploded")
 
@@ -490,7 +490,7 @@ def test_agent_service_run_sync_removes_clean_worktree_on_failure(tmp_path, monk
 
 
 def test_agent_service_can_reload_agent_record_from_disk(tmp_path, monkeypatch):
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "persisted result"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -520,7 +520,7 @@ def test_agent_service_can_reload_agent_record_from_disk(tmp_path, monkeypatch):
 def test_agent_service_can_cancel_background_agent(tmp_path, monkeypatch):
     started = asyncio.Event()
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         started.set()
         await asyncio.sleep(60)
         return "never reached"
@@ -552,7 +552,7 @@ def test_agent_service_can_cancel_background_agent(tmp_path, monkeypatch):
 def test_agent_service_applies_plan_mode_per_background_run(tmp_path, monkeypatch):
     observed_modes: dict[str, tuple[str, bool]] = {}
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         await asyncio.sleep(0)
         service = _get_plan_service()
         observed_modes[prompt] = (service.mode, service.is_plan_mode())

@@ -757,6 +757,14 @@ async def run_harness_session_flow(
     from koder_agent.core.file_index import ProjectFileIndex
     from koder_agent.core.interactive import InteractivePrompt
     from koder_agent.core.scheduler import AgentScheduler
+    from koder_agent.harness.permissions.interactive_approver import build_interactive_approver
+
+    interactive_stdin = False
+    try:
+        interactive_stdin = sys.stdin.isatty()
+    except Exception:
+        interactive_stdin = False
+    tool_approver = build_interactive_approver() if interactive_stdin else None
 
     scheduler = AgentScheduler(
         session_id=args.session,
@@ -765,6 +773,7 @@ async def run_harness_session_flow(
         instructions_override=system_prompt_override,
         instructions_append=system_prompt_append,
         permission_service=permission_service,
+        approver=tool_approver,
     )
     scheduler.agent_definitions = agent_definitions
 
@@ -1302,6 +1311,7 @@ async def run_harness_session_flow(
                                     session_id=new_session_id,
                                     streaming=streaming,
                                     permission_service=permission_service,
+                                    approver=tool_approver,
                                 )
                                 interactive_prompt.update_session(new_session_id)
                                 interactive_prompt.reset_history()

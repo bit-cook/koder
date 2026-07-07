@@ -270,7 +270,9 @@ class HarnessInteractiveCommandHandler:
         self.permission_service = permission_service or PermissionService.default()
         self.plugin_root = plugin_root or (Path.home() / ".koder" / "plugins")
         self.cli_agents_json = cli_agents_json
-        self.agent_service = agent_service or AgentService()
+        self.agent_service = agent_service or AgentService(
+            permission_service=self.permission_service
+        )
         self.team_service = team_service or TeamService(cwd=Path.cwd())
 
         # Create permission bridge for in-process teammates

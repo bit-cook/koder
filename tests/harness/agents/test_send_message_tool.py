@@ -486,7 +486,7 @@ def test_execute_agent_run_cleans_up_agent_mcp_servers(tmp_path, monkeypatch):
 def test_send_message_to_stopped_agent_indicates_stopped_state(tmp_path, monkeypatch):
     """SendMessage to a stopped agent should indicate the agent is stopped."""
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "done"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)

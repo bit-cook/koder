@@ -2427,7 +2427,7 @@ def test_fork_command_launches_background_agent(tmp_path):
     service = AgentService.for_test(tmp_path)
     seen_seed_items = []
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_seed_items.append(seed_items)
         return "forked result"
 
@@ -2503,7 +2503,7 @@ def test_fork_command_respects_main_agent_spawn_allowlist(tmp_path):
 
     import koder_agent.harness.agents.service as agent_service_module
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return "forked allowlist result"
 
     original = agent_service_module._execute_agent_run
@@ -2530,7 +2530,7 @@ def test_fork_command_can_resume_background_agent(tmp_path):
 
     import koder_agent.harness.agents.service as agent_service_module
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return f"result for {prompt}"
 
     original = agent_service_module._execute_agent_run
@@ -2573,7 +2573,7 @@ def test_fork_command_preserves_plan_permission_mode_on_resume(tmp_path):
     import koder_agent.harness.agents.service as agent_service_module
     from koder_agent.tools.plan_mode import _get_plan_service
 
-    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd):
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         return f"mode={_get_plan_service().mode}; prompt={prompt}"
 
     original = agent_service_module._execute_agent_run

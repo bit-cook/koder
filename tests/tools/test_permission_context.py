@@ -367,3 +367,58 @@ class TestAlwaysAllowPersistence:
             else {"rules": {}}
         )
         assert not on_disk.get("rules", {}).get("run_shell", {}).get("allow")
+
+
+class TestInteractiveApproverIntegration:
+    """Fix 1: the real interactive approver, wired via set_tool_permission_context,
+    drives enforce_tool_permission's approval verdict end-to-end."""
+
+    @pytest.mark.asyncio
+    async def test_deny_choice_blocks_guarded_call(self):
+        from koder_agent.harness.permissions.interactive_approver import (
+            build_interactive_approver,
+        )
+
+        svc = _fake_service(requires_approval=True, reason="mutating")
+        approver = build_interactive_approver(reader=lambda _p: "n")
+        token = set_tool_permission_context(svc, approver=approver)
+        try:
+            result = await enforce_tool_permission(
+                "run_shell", json.dumps({"command": "rm -rf build"})
+            )
+        finally:
+            reset_tool_permission_context(token)
+        assert result is not None
+        assert "Permission denied" in result
+
+    @pytest.mark.asyncio
+    async def test_allow_choice_permits_guarded_call(self):
+        from koder_agent.harness.permissions.interactive_approver import (
+            build_interactive_approver,
+        )
+
+        svc = _fake_service(requires_approval=True, reason="mutating")
+        approver = build_interactive_approver(reader=lambda _p: "y")
+        token = set_tool_permission_context(svc, approver=approver)
+        try:
+            result = await enforce_tool_permission("run_shell", json.dumps({"command": "npm test"}))
+        finally:
+            reset_tool_permission_context(token)
+        assert result is None  # allowed once
+
+    @pytest.mark.asyncio
+    async def test_always_choice_persists_rule(self):
+        from koder_agent.harness.permissions.interactive_approver import (
+            build_interactive_approver,
+        )
+
+        svc = _fake_service(requires_approval=True, reason="mutating")
+        svc.add_approval_rule = MagicMock()
+        approver = build_interactive_approver(reader=lambda _p: "a")
+        token = set_tool_permission_context(svc, approver=approver)
+        try:
+            result = await enforce_tool_permission("run_shell", json.dumps({"command": "ls"}))
+        finally:
+            reset_tool_permission_context(token)
+        assert result is None
+        svc.add_approval_rule.assert_called_once()

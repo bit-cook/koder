@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,65 @@ from ..utils.prompts import KODER_SYSTEM_PROMPT
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def _safe_mcp_name_part(value: str) -> str:
+    """Collapse non-identifier chars to ``_`` for use in ``mcp__server__tool`` ids."""
+    cleaned = re.sub(r"[^0-9A-Za-z_]", "_", value or "").strip("_")
+    return cleaned or "unknown"
+
+
+def prefixed_mcp_tool_name(server_name: str, tool_name: str) -> str:
+    """Return the ``mcp__<server>__<tool>`` public name for an MCP tool."""
+    return f"mcp__{_safe_mcp_name_part(server_name)}__{_safe_mcp_name_part(tool_name)}"
+
+
+async def _build_prefixed_mcp_tools(mcp_servers, guardrails):
+    """Wrap MCP tools as Koder-named FunctionTools with guardrails applied."""
+    from agents import FunctionTool
+    from agents.mcp.util import MCPUtil
+
+    if not mcp_servers:
+        return []
+
+    results = await asyncio.gather(
+        *[server.list_tools() for server in mcp_servers], return_exceptions=True
+    )
+    built: list[Any] = []
+    seen: set[str] = set()
+    for server, result in zip(mcp_servers, results):
+        server_name = getattr(server, "name", "unknown")
+        if isinstance(result, BaseException):
+            logger.warning("MCP server '%s' failed to list tools: %s", server_name, result)
+            continue
+        for mcp_tool in result:
+            public_name = prefixed_mcp_tool_name(server_name, mcp_tool.name)
+            # De-dupe identical public names within one build (defensive; the
+            # server+tool namespacing already makes cross-server collisions rare).
+            if public_name in seen:
+                logger.warning("Duplicate MCP tool name skipped: %s", public_name)
+                continue
+            seen.add(public_name)
+            try:
+                fn_tool = MCPUtil.to_function_tool(
+                    mcp_tool,
+                    server,
+                    convert_schemas_to_strict=False,
+                    tool_name_override=public_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to build MCP tool %s from server %s: %s",
+                    mcp_tool.name,
+                    server_name,
+                    exc,
+                )
+                continue
+            if isinstance(fn_tool, FunctionTool):
+                fn_tool.tool_input_guardrails = list(guardrails)
+            built.append(fn_tool)
+    return built
+
 
 # GITHUB_COPILOT_HEADERS is defined in ..utils.client (single source of truth)
 # and re-imported above; the is_copilot branch below spreads it and appends a
@@ -563,18 +623,20 @@ async def create_dev_agent(
         .lower()
     )
 
-    all_deferred = list(tools)  # Start with regular tools
-    # Start all MCP servers in parallel for faster initialization
-    if mcp_servers:
-        results = await asyncio.gather(
-            *[server.list_tools() for server in mcp_servers], return_exceptions=True
-        )
-        for server, result in zip(mcp_servers, results):
-            if isinstance(result, BaseException):
-                server_name = getattr(server, "name", "unknown")
-                logger.warning("MCP server '%s' failed to list tools: %s", server_name, result)
-            else:
-                all_deferred.extend(result)
+    from koder_agent.agentic.hook_guardrail import hook_pretool_input_guardrail
+    from koder_agent.agentic.plan_guardrail import plan_mode_restriction_guardrail
+    from koder_agent.agentic.skill_guardrail import skill_restriction_guardrail
+
+    mcp_guardrails = [
+        plan_mode_restriction_guardrail,
+        skill_restriction_guardrail,
+        hook_pretool_input_guardrail,
+    ]
+    mcp_tools = await _build_prefixed_mcp_tools(mcp_servers, mcp_guardrails)
+
+    tools = [*tools, *mcp_tools]
+
+    all_deferred = list(tools)  # Regular tools + prefixed MCP tools
     _set_deferred_tools(all_deferred if tool_search_mode != "false" else None)
 
     model_override_value = None if model_override in (None, "", "inherit") else str(model_override)
@@ -662,9 +724,11 @@ async def create_dev_agent(
         model=model,
         instructions=system_prompt,
         tools=tools,
-        mcp_servers=mcp_servers,
+        mcp_servers=[],
         model_settings=model_settings,
     )
+    # Retained for lifecycle cleanup (scheduler/subagent teardown).
+    dev_agent._koder_mcp_servers = mcp_servers
 
     if "github_copilot" in model_name_str:
         # NOTE: x-request-id is generated once here and reused for all requests

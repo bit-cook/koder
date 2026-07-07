@@ -11,10 +11,10 @@ from agents import (
     ToolInputGuardrailData,
 )
 
-from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+from koder_agent.harness.hooks.runtime import dispatch_command_hooks_async
 
 
-def hook_pretool_guardrail(
+async def hook_pretool_guardrail(
     data: ToolInputGuardrailData,
 ) -> ToolGuardrailFunctionOutput:
     tool_name = getattr(data.context, "tool_name", "") or ""
@@ -33,7 +33,10 @@ def hook_pretool_guardrail(
     elif isinstance(raw_args, dict):
         parsed_args = raw_args
 
-    result = dispatch_command_hooks(
+    # Run the blocking hook I/O off the event loop so a slow PreToolUse hook
+    # cannot freeze streaming, subagents, or cron. The SDK's
+    # ToolInputGuardrail.run awaits awaitable guardrail results.
+    result = await dispatch_command_hooks_async(
         cwd=Path.cwd(),
         event_name="PreToolUse",
         match_value=tool_name,

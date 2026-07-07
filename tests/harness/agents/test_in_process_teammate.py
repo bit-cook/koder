@@ -19,7 +19,7 @@ def test_in_process_runner_spawns_and_completes(tmp_path, monkeypatch):
     """InProcessTeammateRunner spawns a teammate that completes."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return f"teammate done: {prompt}"
 
@@ -65,7 +65,7 @@ def test_in_process_runner_registers_member(tmp_path, monkeypatch):
     """Spawned teammate is registered as a team member."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return "done"
 
@@ -111,7 +111,7 @@ def test_in_process_runner_marks_idle_on_completion(tmp_path, monkeypatch):
     """Completed teammate stays registered and transitions to an idle worker state."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return "done"
 
@@ -164,7 +164,7 @@ def test_in_process_runner_can_terminate_teammate(tmp_path, monkeypatch):
     """Runner can terminate a running teammate."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         await asyncio.sleep(60)
         return "never reached"
@@ -213,7 +213,7 @@ def test_in_process_runner_is_active_tracking(tmp_path, monkeypatch):
     """is_active returns True while task is running, False after completion."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         await asyncio.sleep(0.1)
         return "done"
@@ -259,7 +259,7 @@ def test_in_process_runner_sends_idle_notification_to_lead(tmp_path, monkeypatch
     """Completed teammate sends idle notification to lead's mailbox."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return "done"
 
@@ -315,7 +315,7 @@ def test_in_process_runner_registers_name_for_routing(tmp_path, monkeypatch):
     """Spawned teammate name is registered in AgentService for SendMessage routing."""
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return "done"
 
@@ -366,7 +366,7 @@ def test_in_process_runner_propagates_plan_mode_to_teammate_runtime(tmp_path, mo
     from koder_agent.tools.plan_mode import _get_plan_service
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         return f"plan_mode={_get_plan_service().mode}; prompt={prompt}"
 
@@ -424,7 +424,7 @@ def test_in_process_runner_consumes_live_mailbox_messages(tmp_path, monkeypatch)
     prompts: list[str] = []
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         prompts.append(prompt)
         return f"done: {prompt}"
@@ -508,7 +508,7 @@ def test_in_process_runner_routes_teammate_send_message_to_peer(tmp_path, monkey
     prompts: list[tuple[str | None, str]] = []
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         sender = team_context.sender_name if team_context is not None else None
         prompts.append((sender, prompt))
@@ -615,7 +615,7 @@ def test_in_process_runner_claims_and_completes_team_tasks_when_idle(tmp_path, m
     prompts: list[str] = []
 
     async def fake_execute(
-        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None
+        *, agent_definition, prompt, session_id, seed_items, cwd, team_context=None, **_kwargs
     ):
         prompts.append(prompt)
         return f"done: {prompt}"

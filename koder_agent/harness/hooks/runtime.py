@@ -25,6 +25,14 @@ from koder_agent.harness.session_env import (
 
 logger = logging.getLogger(__name__)
 
+# Maximum characters of hook output injected into model context.
+_MAX_HOOK_OUTPUT_CHARS = 10_000
+
+# Default hook timeout (seconds) when a hook config omits ``timeout``.
+# A hook must never run unbounded: ``subprocess.run(timeout=None)`` /
+# ``urlopen(timeout=None)`` would block the dispatching thread forever.
+_DEFAULT_HOOK_TIMEOUT_SECONDS = 60
+
 # Events that receive KODER_ENV_FILE.
 _ENV_FILE_EVENTS = frozenset({"SessionStart", "CwdChanged", "FileChanged"})
 
@@ -268,7 +276,7 @@ class HookConfig:
     command: str = ""
     url: str = ""
     prompt: str = ""
-    timeout: int = 60
+    timeout: int = _DEFAULT_HOOK_TIMEOUT_SECONDS
     shell: str = ""  # "" means default, or "bash"/"zsh"/"sh"
     headers: dict[str, str] | None = None
     allowed_env_vars: list[str] | None = None
@@ -478,6 +486,29 @@ def _hook_identity(hook: dict[str, Any]) -> str:
     return f"unknown:{id(hook)}"
 
 
+def _bounded_timeout(raw: Any) -> int | float:
+    """Return a positive timeout in seconds, defaulting when unset/invalid.
+
+    Guards against ``None`` (key omitted), zero, negative, and non-numeric
+    values — any of which would otherwise disable the timeout and let a hung
+    hook block forever.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return _DEFAULT_HOOK_TIMEOUT_SECONDS
+    if raw <= 0:
+        return _DEFAULT_HOOK_TIMEOUT_SECONDS
+    return raw
+
+
+def _cap_output(text: str | None) -> str | None:
+    """Cap hook output to _MAX_HOOK_OUTPUT_CHARS."""
+    if text is None:
+        return None
+    if len(text) <= _MAX_HOOK_OUTPUT_CHARS:
+        return text
+    return text[:_MAX_HOOK_OUTPUT_CHARS] + f"\n... (truncated, {len(text)} chars total)"
+
+
 def _run_command_hook(
     *,
     command: str,
@@ -504,7 +535,8 @@ def _run_command_hook(
             capture_output=True,
             env=env,
             check=False,
-            timeout=timeout,
+            # Never run unbounded: timeout=None would block forever.
+            timeout=_bounded_timeout(timeout),
         )
     except subprocess.TimeoutExpired:
         return 1, "", "Hook timed out"
@@ -531,7 +563,8 @@ def _run_http_hook(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # Never run unbounded: timeout=None would block forever.
+        with urllib.request.urlopen(request, timeout=_bounded_timeout(timeout)) as response:
             body = response.read().decode("utf-8")
             return response.status, body.strip(), ""
     except Exception as exc:  # pragma: no cover - defensive
@@ -827,7 +860,7 @@ def dispatch_command_hooks(
                     if event_name in _ENV_FILE_EVENTS:
                         env["KODER_ENV_FILE"] = str(session_env_file(str(payload["session_id"])))
                 hook_type = hook.get("type")
-                hook_timeout = hook.get("timeout")
+                hook_timeout = _bounded_timeout(hook.get("timeout"))
                 hook_shell = hook.get("shell") or ""
                 hook_headers = (
                     hook.get("headers") if isinstance(hook.get("headers"), dict) else None
@@ -904,7 +937,9 @@ def dispatch_command_hooks(
                     return HookDispatchResult(
                         matched_hooks=result.matched_hooks,
                         blocked=True,
-                        block_reason=stderr or block_reason or "Blocked by hook",
+                        # Cap the reason injected into model context so a runaway
+                        # hook cannot flood the conversation.
+                        block_reason=_cap_output(stderr or block_reason or "Blocked by hook"),
                         permission_request_result=result.permission_request_result,
                         watch_paths=result.watch_paths,
                         worktree_path=result.worktree_path,
@@ -915,7 +950,7 @@ def dispatch_command_hooks(
                     return HookDispatchResult(
                         matched_hooks=result.matched_hooks,
                         blocked=True,
-                        block_reason=block_reason,
+                        block_reason=_cap_output(block_reason),
                         permission_request_result=result.permission_request_result,
                         watch_paths=result.watch_paths,
                         worktree_path=result.worktree_path,
@@ -927,6 +962,30 @@ def dispatch_command_hooks(
         session_env_file(session_id)
         apply_session_env_file_to_process(session_id)
     return result
+
+
+async def dispatch_command_hooks_async(
+    *,
+    cwd: str | Path,
+    event_name: str,
+    payload: dict[str, Any],
+    match_value: str | None = None,
+) -> HookDispatchResult:
+    """Run :func:`dispatch_command_hooks` off the event loop.
+
+    ``dispatch_command_hooks`` performs blocking I/O (``subprocess.run``,
+    ``urllib.request.urlopen``). Async callers must use this entrypoint so a
+    slow hook cannot freeze the event loop (streaming UI, subagents, cron).
+    ``asyncio.to_thread`` copies the current context, so contextvars such as
+    the active skill hook scopes propagate into the worker thread.
+    """
+    return await asyncio.to_thread(
+        dispatch_command_hooks,
+        cwd=cwd,
+        event_name=event_name,
+        payload=payload,
+        match_value=match_value,
+    )
 
 
 @contextmanager

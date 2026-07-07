@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 
 from ...tools.permission_context import GUARDED_TOOLS
-from ..hooks.runtime import dispatch_command_hooks
+from ..hooks.runtime import _bounded_timeout, dispatch_command_hooks
 from .definitions import AgentDefinition
 
 if TYPE_CHECKING:
@@ -58,14 +58,21 @@ def _run_command_hooks(rules: list[dict], payload: dict[str, Any], cwd: str | Pa
             command = hook.get("command")
             if not isinstance(command, str) or not command.strip():
                 continue
-            subprocess.run(
-                command,
-                input=payload_text,
-                text=True,
-                cwd=str(cwd),
-                shell=True,
-                check=False,
-            )
+            # Bound the timeout (Fix 5 parity): this subagent frontmatter mini-runner
+            # must never inherit subprocess.run's default timeout=None, or a hanging
+            # PreToolUse/PostToolUse/Stop hook would freeze the subagent forever.
+            try:
+                subprocess.run(
+                    command,
+                    input=payload_text,
+                    text=True,
+                    cwd=str(cwd),
+                    shell=True,
+                    check=False,
+                    timeout=_bounded_timeout(hook.get("timeout")),
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("Subagent frontmatter hook timed out: %s", command)
 
 
 def dispatch_project_hook_event(
