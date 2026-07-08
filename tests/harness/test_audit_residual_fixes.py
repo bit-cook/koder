@@ -55,9 +55,9 @@ class TestAllowRuleCommandSubstitution:
         """A prefix allow rule must not greenlight a hidden inner command."""
         service = self._service_with_make_allow()
         result = service.evaluate_tool_call("run_shell", {"command": command})
-        assert not (
-            result.allowed and not result.requires_approval
-        ), f"{command!r} was auto-allowed via the make:* rule despite command substitution"
+        assert not (result.allowed and not result.requires_approval), (
+            f"{command!r} was auto-allowed via the make:* rule despite command substitution"
+        )
 
     def test_plain_command_still_auto_allowed(self):
         """Non-regression: a legit `make build` still matches the allow rule."""

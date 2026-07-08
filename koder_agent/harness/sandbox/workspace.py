@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from pathlib import Path
@@ -49,7 +50,14 @@ _INTERPRETER_NAMES = {
     "lua",
     "tclsh",
     "Rscript",
+    "awk",
+    "gawk",
+    "mawk",
 }
+# Commands that serve as wrappers/prefixes before an interpreter (e.g.
+# ``env bash -c ...``, ``sudo python3 -c ...``) — the interpreter check must
+# look past these to find the real command word.
+_COMMAND_PREFIXES = {"env", "sudo", "nice", "nohup", "command", "exec", "xargs", "time"}
 # Flags that introduce an inline code payload for the interpreters above.
 _INLINE_CODE_FLAGS = {"-c", "-e", "-E", "--eval", "--exec"}
 _HEREDOC_RE = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*")
@@ -160,8 +168,12 @@ def interpreter_payload_violation(command: str) -> str | None:
                     f"command runs an inline {base} payload; "
                     "interpreter code cannot be verified by preflight"
                 )
-        # Only inspect the first real command word of the segment; deeper tokens
-        # are its arguments and are handled by the literal-path scan.
+            # Interpreter found but no inline flag — it runs a script file, safe.
+            break
+        if base in _COMMAND_PREFIXES:
+            # Look past wrapper commands (env, sudo, etc.) to the next token.
+            continue
+        # Non-interpreter, non-prefix command word — stop scanning.
         break
     return None
 
@@ -205,7 +217,11 @@ def protected_write_violation(
         raw = Path(token).expanduser()
         if not raw.is_absolute():
             raw = repo_root / raw
-        candidate = raw.resolve(strict=False)
+        # Resolve symlinks via os.path.realpath to defeat TOCTOU attacks where a
+        # symlink initially points to a safe path but targets a protected path at
+        # check time (finding H3). realpath always resolves the full chain even for
+        # non-existent trailing components.
+        candidate = Path(os.path.realpath(str(raw)))
         for protected_root in protected_roots:
             if candidate == protected_root or _is_under(candidate, protected_root):
                 try:
@@ -213,6 +229,21 @@ def protected_write_violation(
                 except ValueError:
                     display = candidate
                 return f"write targets protected path {display}"
+        # Additionally check the resolved path against deny_write globs — a
+        # symlink's real target name may match a protected glob even when the
+        # symlink name itself does not (symlink-based bypass of glob matching).
+        resolved_glob = policy.matches_deny_write_glob(candidate.name)
+        if resolved_glob is None and candidate != raw:
+            try:
+                resolved_rel = str(candidate.relative_to(repo_root))
+                resolved_glob = policy.matches_deny_write_glob(resolved_rel)
+            except ValueError:
+                pass
+        if resolved_glob is not None:
+            return (
+                f"write targets protected path {token} "
+                f"(resolves to {candidate.name}, matches deny_write {resolved_glob})"
+            )
     return None
 
 

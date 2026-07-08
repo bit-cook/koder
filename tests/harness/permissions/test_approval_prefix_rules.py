@@ -419,3 +419,32 @@ def test_scheduler_threads_approver_into_permission_context():
 
     assert captured["approver"] is _approver
     assert captured["service"] is service
+
+
+# ---------------------------------------------------------------------------
+# git branch / fetch should NOT be widened to prefix rules
+# ---------------------------------------------------------------------------
+
+
+class TestGitBranchNotWidened:
+    def test_git_branch_not_widened_to_prefix(self):
+        from koder_agent.harness.permissions.rules import derive_shell_prefix_rule
+
+        # git branch should no longer be in safe two-token verbs
+        result = derive_shell_prefix_rule("git branch")
+        # Should return exact match (None), not "git branch:*"
+        assert result is None or result == "git branch"
+        # Verify it does NOT return "git branch:*"
+        assert result != "git branch:*"
+
+    def test_git_fetch_not_widened_to_prefix(self):
+        from koder_agent.harness.permissions.rules import derive_shell_prefix_rule
+
+        result = derive_shell_prefix_rule("git fetch origin")
+        assert result != "git fetch:*"
+
+    def test_git_status_still_widened(self):
+        from koder_agent.harness.permissions.rules import derive_shell_prefix_rule
+
+        result = derive_shell_prefix_rule("git status --short")
+        assert result == "git status:*"

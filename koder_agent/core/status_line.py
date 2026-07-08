@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import unicodedata
 from typing import TYPE_CHECKING, Optional
 
 from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
@@ -80,6 +82,8 @@ class StatusLine:
         self._project_dir = os.getcwd()
         self._cached_command_signature: str | None = None
         self._cached_command_output: str | None = None
+        self._command_lock = threading.Lock()
+        self._command_refresh_pending = False
 
     def _format_tokens(self, n: int) -> str:
         """Format token count with k/M suffix for readability."""
@@ -93,17 +97,50 @@ class StatusLine:
             return f"{val:.1f}k"
         return str(n)
 
+    @staticmethod
+    def _display_width(text: str) -> int:
+        """Return the terminal display width of *text*.
+
+        CJK ideographs, fullwidth forms, and most emoji occupy 2 columns in a
+        terminal; all other printable characters occupy 1. Uses
+        :func:`unicodedata.east_asian_width` for the classification.
+        """
+        width = 0
+        for ch in text:
+            eaw = unicodedata.east_asian_width(ch)
+            width += 2 if eaw in ("W", "F") else 1
+        return width
+
     def _truncate(self, s: str, max_len: int, from_start: bool = False) -> str:
-        """Truncate string with ellipsis."""
+        """Truncate string with ellipsis, respecting display width."""
         if max_len <= 0:
             return ""
         if max_len <= 3:
             return s[:max_len]
-        if len(s) <= max_len:
+        if self._display_width(s) <= max_len:
             return s
         if from_start:
-            return s[: max_len - 3] + "..."
-        return "..." + s[-(max_len - 3) :]
+            # Truncate keeping the start, append "..."
+            result: list[str] = []
+            used = 3  # reserve for "..."
+            for ch in s:
+                cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                if used + cw > max_len:
+                    break
+                result.append(ch)
+                used += cw
+            return "".join(result) + "..."
+        else:
+            # Truncate keeping the end, prepend "..."
+            result_rev: list[str] = []
+            used = 3  # reserve for "..."
+            for ch in reversed(s):
+                cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                if used + cw > max_len:
+                    break
+                result_rev.append(ch)
+                used += cw
+            return "..." + "".join(reversed(result_rev))
 
     def _terminal_columns(self) -> int:
         """Return the current terminal width with a conservative fallback."""
@@ -117,13 +154,13 @@ class StatusLine:
         home = os.path.expanduser("~")
         if cwd.startswith(home):
             cwd = "~" + cwd[len(home) :]
-        if len(cwd) <= max_len:
+        if self._display_width(cwd) <= max_len:
             return cwd
 
         basename = os.path.basename(cwd.rstrip(os.sep)) or cwd
         parent = os.path.basename(os.path.dirname(cwd.rstrip(os.sep)))
         compact = f".../{parent}/{basename}" if parent else basename
-        if len(compact) <= max_len:
+        if self._display_width(compact) <= max_len:
             return compact
         return self._truncate(cwd, max_len)
 
@@ -304,6 +341,18 @@ class StatusLine:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         return " | ".join(lines)
 
+    def _refresh_command_in_background(self, command: str, payload: dict[str, object]) -> None:
+        """Run the configured statusline command in a background thread."""
+        try:
+            output = self._run_configured_command(command, payload)
+            with self._command_lock:
+                self._cached_command_output = output
+        except Exception:
+            pass
+        finally:
+            with self._command_lock:
+                self._command_refresh_pending = False
+
     def _render_custom_statusline(self) -> FormattedText | None:
         config = resolve_statusline_config(os.getcwd())
         if config is None:
@@ -316,8 +365,26 @@ class StatusLine:
         )
         if signature != self._cached_command_signature:
             self._cached_command_signature = signature
-            self._cached_command_output = self._run_configured_command(config.command, payload)
-        normalized = self._normalize_command_output(self._cached_command_output or "")
+            if self._cached_command_output is None:
+                # First render (cold start): run synchronously so the status
+                # line is populated immediately. Subsequent refreshes (signature
+                # unchanged or changed again) dispatch to a background thread.
+                self._refresh_command_in_background(config.command, payload)
+            else:
+                # Dispatch subprocess to a background thread so the render
+                # callback never blocks on subsequent refreshes.
+                with self._command_lock:
+                    if not self._command_refresh_pending:
+                        self._command_refresh_pending = True
+                        t = threading.Thread(
+                            target=self._refresh_command_in_background,
+                            args=(config.command, payload),
+                            daemon=True,
+                        )
+                        t.start()
+        with self._command_lock:
+            cached = self._cached_command_output
+        normalized = self._normalize_command_output(cached or "")
         if not normalized and not self._notice:
             return None
         fragments: list[tuple[str, str]] = []
@@ -434,11 +501,13 @@ class StatusLine:
             self._append_field(fragments, "", self._compact_cwd(cwd, 14))
             self._append_field(fragments, "", f"{context_pct:.1f}%")
 
+        rendered_len = sum(self._display_width(text) for _, text in fragments)
+
         if pr_fragments:
-            rendered_len = sum(len(text) for _, text in fragments)
-            pr_len = sum(len(text) for _, text in pr_fragments)
+            pr_len = sum(self._display_width(text) for _, text in pr_fragments)
             if rendered_len + pr_len <= columns:
                 fragments.extend(pr_fragments)
+                rendered_len += pr_len
 
         # Absolute-threshold token warning (independent of context %). Only shown
         # on wider terminals and when no transient notice is already occupying
@@ -449,17 +518,18 @@ class StatusLine:
                 ("class:status-separator", " | "),
                 ("class:status-context-critical", f"⚠ {token_warning}"),
             ]
-            rendered_len = sum(len(text) for _, text in fragments)
-            warn_len = sum(len(text) for _, text in warn_fragments)
+            warn_len = sum(self._display_width(text) for _, text in warn_fragments)
             if rendered_len + warn_len <= columns:
                 fragments.extend(warn_fragments)
+                rendered_len += warn_len
 
         if self._notice:
             if self._notice.startswith("Voice error:"):
                 notice = self._notice
             else:
                 notice = self._truncate(
-                    self._notice, max(10, columns - sum(len(t) for _, t in fragments) - 12)
+                    self._notice,
+                    max(10, columns - rendered_len - 12),
                 )
             if notice:
                 self._append_field(fragments, "Notice: ", notice)

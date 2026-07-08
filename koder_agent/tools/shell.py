@@ -487,6 +487,15 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
                         msg += f"\n[stderr]: {partial_stderr}"
                     return msg
                 return f"Command timed out after {timeout} seconds"
+            except asyncio.CancelledError:
+                # ESC/cancel: kill the detached process tree before propagating
+                _kill_process_group(process)
+                # Brief drain so killpg's SIGKILL has time to reap
+                try:
+                    await asyncio.wait_for(process.communicate(), timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                raise  # Re-raise so the SDK knows the turn was cancelled
 
             # Decode output
             output = stdout.decode("utf-8", errors="replace").strip()

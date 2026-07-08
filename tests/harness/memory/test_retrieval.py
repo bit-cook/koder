@@ -46,7 +46,7 @@ def test_word_boundary_scoring_matches_whole_word(tmp_path):
     """'cat' matches a standalone 'cat' token even next to 'category' text."""
     note = tmp_path / "note.md"
     note.write_text(
-        "---\ntype: note\ndescription: pets\n---\n" "The cat sat in the category aisle.\n",
+        "---\ntype: note\ndescription: pets\n---\nThe cat sat in the category aisle.\n",
         encoding="utf-8",
     )
 

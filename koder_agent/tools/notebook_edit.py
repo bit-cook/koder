@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .compat import function_tool
+from .file import get_file_state
 
 
 @function_tool
@@ -32,11 +33,21 @@ def notebook_edit(
         new_source: New cell source (required for replace/insert).
         cell_type: Cell type for insert: 'code' or 'markdown'. Defaults to 'code'.
     """
-    path = Path(notebook_path)
+    path = Path(notebook_path).resolve()
     if not path.exists():
         return f"Error: notebook not found: {notebook_path}"
     if not path.suffix == ".ipynb":
         return f"Error: not a notebook file: {notebook_path}"
+
+    # Security: require that the notebook was read before editing (prevents
+    # blind writes and ensures the agent has seen current content).
+    fs = get_file_state()
+    resolved_str = str(path)
+    if not fs.has_been_read(resolved_str) and not fs.has_been_read(notebook_path):
+        return (
+            "Error: you must read the notebook with read_file before editing it. "
+            "This ensures you have the current content and prevents accidental overwrites."
+        )
 
     try:
         nb = json.loads(path.read_text(encoding="utf-8"))

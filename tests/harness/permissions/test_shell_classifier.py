@@ -243,3 +243,79 @@ def test_shell_classifier_relative_path_sudo_hard_denied():
     result = classify_shell_command("./sudo rm -rf /")
     assert result.allowed is False
     assert result.destructive is True
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: subshell-group-defeats-hard-deny
+# ---------------------------------------------------------------------------
+
+
+class TestSubshellPrivilegeEscalation:
+    def test_subshell_sudo_is_destructive(self):
+        result = classify_shell_command("(sudo rm -rf /)")
+        assert result.destructive is True
+
+    def test_subshell_su_is_destructive(self):
+        result = classify_shell_command("(su -c 'rm -rf /')")
+        assert result.destructive is True
+
+    def test_normal_parens_in_args_not_blocked(self):
+        """Parentheses in arguments (grep patterns) should not trigger."""
+        result = classify_shell_command("grep '(pattern)' file.txt")
+        assert result.destructive is False
+
+
+# ---------------------------------------------------------------------------
+# M4: Separated flags for rm must still be detected as destructive.
+# ---------------------------------------------------------------------------
+
+
+class TestRmSeparatedFlagsDetection:
+    """rm -r -f / and similar separated-flag patterns must be hard-denied."""
+
+    def test_rm_dash_r_dash_f_root(self):
+        result = classify_shell_command("rm -r -f /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_dash_capital_r_dash_f_root(self):  # noqa: N802
+        result = classify_shell_command("rm -R -f /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_recursive_force_long_flags(self):
+        result = classify_shell_command("rm --recursive --force /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_mixed_long_short_flags(self):
+        result = classify_shell_command("rm --recursive -f /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_rf_glob_root(self):
+        result = classify_shell_command("rm -r -f /*")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_rf_combined_still_works(self):
+        """Original combined-flag pattern must still be caught."""
+        result = classify_shell_command("rm -rf /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_fr_combined_still_works(self):
+        result = classify_shell_command("rm -fr /")
+        assert result.allowed is False
+        assert result.destructive is True
+
+    def test_rm_safe_usage_not_blocked(self):
+        """Removing a normal directory should not be hard-denied."""
+        result = classify_shell_command("rm -rf /tmp/build")
+        assert result.destructive is False
+
+    def test_rm_recursive_without_force_not_blocked(self):
+        """rm -r / without -f is still dangerous, but our check requires both."""
+        # This is a conscious trade-off: we only hard-deny when both flags are present
+        result = classify_shell_command("rm -r /")
+        assert result.destructive is False

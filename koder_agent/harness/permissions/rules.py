@@ -105,7 +105,7 @@ _SAFE_TWO_TOKEN_VERBS: dict[str, frozenset[str]] = {
     "bun": frozenset({"test", "run"}),
     "cargo": frozenset({"test", "build", "check", "clippy", "fmt", "bench", "doc"}),
     "go": frozenset({"test", "build", "vet", "run"}),
-    "git": frozenset({"status", "log", "diff", "show", "branch", "fetch"}),
+    "git": frozenset({"status", "log", "diff", "show"}),
     "pip": frozenset({"list", "show", "freeze"}),
     "docker": frozenset({"ps", "images", "logs"}),
     "kubectl": frozenset({"get", "describe", "logs"}),

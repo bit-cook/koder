@@ -471,15 +471,15 @@ class TestToolGuardrailIntegration:
         # Verify each FunctionTool has the guardrail attached
         for tool in tools:
             if isinstance(tool, FunctionTool):
-                assert (
-                    tool.tool_input_guardrails is not None
-                ), f"Tool '{tool.name}' should have tool_input_guardrails"
-                assert (
-                    len(tool.tool_input_guardrails) > 0
-                ), f"Tool '{tool.name}' should have at least one guardrail"
-                assert (
-                    skill_restriction_guardrail in tool.tool_input_guardrails
-                ), f"Tool '{tool.name}' should have skill_restriction_guardrail"
+                assert tool.tool_input_guardrails is not None, (
+                    f"Tool '{tool.name}' should have tool_input_guardrails"
+                )
+                assert len(tool.tool_input_guardrails) > 0, (
+                    f"Tool '{tool.name}' should have at least one guardrail"
+                )
+                assert skill_restriction_guardrail in tool.tool_input_guardrails, (
+                    f"Tool '{tool.name}' should have skill_restriction_guardrail"
+                )
 
     def test_skill_restriction_guardrail_is_correct_type(self):
         """Test that skill_restriction_guardrail is a ToolInputGuardrail, not InputGuardrail."""
@@ -489,15 +489,15 @@ class TestToolGuardrailIntegration:
 
         # The guardrail must be ToolInputGuardrail (for per-tool validation)
         # NOT InputGuardrail (which has run_in_parallel and is for agent-level)
-        assert isinstance(
-            skill_restriction_guardrail, ToolInputGuardrail
-        ), "skill_restriction_guardrail must be a ToolInputGuardrail instance"
+        assert isinstance(skill_restriction_guardrail, ToolInputGuardrail), (
+            "skill_restriction_guardrail must be a ToolInputGuardrail instance"
+        )
 
         # ToolInputGuardrail should NOT have run_in_parallel attribute
         # (that's only on InputGuardrail for agent-level guardrails)
-        assert not hasattr(
-            skill_restriction_guardrail, "run_in_parallel"
-        ), "ToolInputGuardrail should not have run_in_parallel attribute"
+        assert not hasattr(skill_restriction_guardrail, "run_in_parallel"), (
+            "ToolInputGuardrail should not have run_in_parallel attribute"
+        )
 
     def test_agent_creation_with_tools_no_attribute_error(self):
         """Test that Agent can be created with tools without run_in_parallel AttributeError.
@@ -537,9 +537,9 @@ class TestToolGuardrailIntegration:
         for tool in tools:
             if hasattr(tool, "tool_input_guardrails") and tool.tool_input_guardrails:
                 guardrail_count = tool.tool_input_guardrails.count(skill_restriction_guardrail)
-                assert (
-                    guardrail_count == 1
-                ), f"Tool '{tool.name}' has {guardrail_count} copies of skill_restriction_guardrail, expected 1"
+                assert guardrail_count == 1, (
+                    f"Tool '{tool.name}' has {guardrail_count} copies of skill_restriction_guardrail, expected 1"
+                )
 
 
 class TestPatternBasedRestrictions:
@@ -666,24 +666,27 @@ class TestPatternBasedRestrictions:
         )
 
         # Exact match
-        assert restrictions.is_tool_allowed("git_command", json.dumps({"args": "status"})) is True
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "status"})) is True
+        )
 
         # Pattern match
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "log --oneline"}))
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "log --oneline"}))
             is True
         )
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "diff HEAD~1"})) is True
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "diff HEAD~1"}))
+            is True
         )
 
         # Non-matching
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "push origin main"}))
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "push origin main"}))
             is False
         )
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "commit -m 'test'"}))
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "commit -m 'test'"}))
             is False
         )
 
@@ -933,14 +936,174 @@ class TestShellPatternChainingBypass:
         )
 
         # Plain read-only still works.
-        assert restrictions.is_tool_allowed("git_command", json.dumps({"args": "status"})) is True
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "status"})) is True
+        )
 
         # Chained / substituted git args are rejected.
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "status; rm -rf /"}))
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "status; rm -rf /"}))
             is False
         )
         assert (
-            restrictions.is_tool_allowed("git_command", json.dumps({"args": "status $(rm -rf /)"}))
+            restrictions.is_tool_allowed(
+                "git_command", json.dumps({"command": "status $(rm -rf /)"})
+            )
+            is False
+        )
+
+
+# ---------------------------------------------------------------------------
+# H8: Malformed frontmatter must reject skill (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedFrontmatterRejectsSkill:
+    def test_malformed_yaml_returns_none(self, tmp_path):
+        """A skill with invalid YAML frontmatter must not be loaded."""
+        from koder_agent.tools.skill import SkillLoader
+
+        skill_path = tmp_path / "bad-skill.md"
+        skill_path.write_text(
+            "---\n"
+            "name: bad-skill\n"
+            "allowed_tools: [read_file\n"  # Invalid YAML (missing closing bracket)
+            "---\n"
+            "# Skill content\n"
+            "Do something dangerous\n",
+            encoding="utf-8",
+        )
+
+        loader = SkillLoader(tmp_path)
+        result = loader.load_skill(skill_path, source="project")
+
+        # Must return None — skill should NOT be loaded
+        assert result is None
+
+    def test_non_mapping_frontmatter_returns_none(self, tmp_path):
+        """A skill with YAML that parses to a non-dict must not be loaded."""
+        from koder_agent.tools.skill import SkillLoader
+
+        skill_path = tmp_path / "list-skill.md"
+        skill_path.write_text(
+            "---\n- item1\n- item2\n---\n# Skill content\n",
+            encoding="utf-8",
+        )
+
+        loader = SkillLoader(tmp_path)
+        result = loader.load_skill(skill_path, source="project")
+
+        # Must return None — non-mapping frontmatter is invalid
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# H9: disable_model_invocation blocks get_skill
+# ---------------------------------------------------------------------------
+
+
+class TestDisableModelInvocationBlocksGetSkill:
+    def test_get_skill_rejects_disabled_skill(self, monkeypatch):
+        """get_skill must refuse to load a skill with disable_model_invocation=True."""
+        import asyncio
+        import json as json_mod
+
+        from koder_agent.tools.skill import Skill, get_skill
+
+        disabled_skill = Skill(
+            name="secret-skill",
+            description="A secret skill",
+            content="Secret instructions",
+            disable_model_invocation=True,
+        )
+
+        # Mock _get_merged_skills to return our test skill
+        monkeypatch.setattr(
+            "koder_agent.tools.skill._get_merged_skills",
+            lambda: {"secret-skill": disabled_skill},
+        )
+
+        # Invoke via the on_invoke_tool async API (ctx=None supported by wrapper)
+        result = asyncio.run(
+            get_skill.on_invoke_tool(None, json_mod.dumps({"skill_name": "secret-skill"}))
+        )
+
+        assert "cannot be loaded by the model" in result
+        assert "disable_model_invocation" in result
+
+    def test_get_skill_allows_normal_skill(self, monkeypatch):
+        """get_skill should load a skill without disable_model_invocation."""
+        import asyncio
+        import json as json_mod
+
+        from koder_agent.tools.skill import Skill, get_skill
+        from koder_agent.tools.skill_context import clear_restrictions
+
+        normal_skill = Skill(
+            name="normal-skill",
+            description="A normal skill",
+            content="Normal instructions",
+            disable_model_invocation=False,
+        )
+
+        monkeypatch.setattr(
+            "koder_agent.tools.skill._get_merged_skills",
+            lambda: {"normal-skill": normal_skill},
+        )
+
+        result = asyncio.run(
+            get_skill.on_invoke_tool(None, json_mod.dumps({"skill_name": "normal-skill"}))
+        )
+        clear_restrictions()
+
+        # Should return the prompt content, not an error
+        assert "cannot be loaded" not in result
+        assert "Normal instructions" in result
+
+
+# ---------------------------------------------------------------------------
+# H10: git_command restriction uses "command" field (not "args")
+# ---------------------------------------------------------------------------
+
+
+class TestGitCommandRestrictionUsesCommandField:
+    def test_git_command_restriction_matches_command_field(self):
+        """git_command tool restriction must check the 'command' field, not 'args'."""
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-readonly"],
+            allowed_tools={"git_command:status"},
+        )
+
+        # The correct field name is "command" (matching the tool's parameter)
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "status"})) is True
+        )
+
+        # The old (buggy) field name "args" should NOT match
+        assert restrictions.is_tool_allowed("git_command", json.dumps({"args": "status"})) is False
+
+    def test_git_command_restriction_blocks_unallowed_via_command_field(self):
+        """git_command restriction correctly blocks commands not in allowed list."""
+        import json
+
+        restrictions = SkillRestrictions(
+            loaded_skills=["git-readonly"],
+            allowed_tools={"git_command:status", "git_command:log *"},
+        )
+
+        # Allowed
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "status"})) is True
+        )
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "log --oneline"}))
+            is True
+        )
+
+        # Blocked
+        assert (
+            restrictions.is_tool_allowed("git_command", json.dumps({"command": "push origin main"}))
             is False
         )

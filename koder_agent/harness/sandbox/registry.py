@@ -124,7 +124,11 @@ BACKEND_SPECS: tuple[BackendSpec, ...] = (
             supports_filesystem=True,
             supports_pty="yes",
             supports_background=False,
-            supports_network_policy="provider-dependent",
+            # Network isolation depends on how the Docker container is launched.
+            # The SDK docker backend does NOT enforce --network=none by default;
+            # containers use Docker's default bridge network unless the caller
+            # explicitly configures network mode.  Do not claim enforcement.
+            supports_network_policy="not-enforced-by-default",
             supports_protected_paths="workspace-copy",
         ),
     ),

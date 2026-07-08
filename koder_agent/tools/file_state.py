@@ -116,6 +116,10 @@ class ReadFileState:
 
         return False
 
+    def invalidate_all(self) -> None:
+        """Clear all state after compaction (context no longer has file contents)."""
+        self._records.clear()
+
     def clear(self, path: Optional[str] = None) -> None:
         if path:
             self._records.pop(self._normalize(path), None)

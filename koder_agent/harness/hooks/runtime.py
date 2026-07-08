@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Maximum characters of hook output injected into model context.
 _MAX_HOOK_OUTPUT_CHARS = 10_000
 
+# Thread-local guard to prevent reentrant dispatch (e.g., an agent-type hook
+# triggering its own PreToolUse check which would cause infinite recursion).
+_dispatch_guard = threading.local()
+
 # Default hook timeout (seconds) when a hook config omits ``timeout``.
 # A hook must never run unbounded: ``subprocess.run(timeout=None)`` /
 # ``urlopen(timeout=None)`` would block the dispatching thread forever.
@@ -266,6 +270,7 @@ _watched_paths: dict[str, float | None] = {}
 # Key is ``(source, event_name, hook_identity)`` where hook_identity
 # is the command/url/prompt text that uniquely identifies the hook.
 _once_fired: set[tuple[str, str, str]] = set()
+_once_fired_lock = threading.Lock()
 
 
 @dataclass
@@ -449,6 +454,14 @@ def _payload_target(payload: dict[str, Any]) -> str:
         value = tool_input.get(field)
         if isinstance(value, str) and value:
             return value
+    # Fallback: check all string values in tool_input so tools with non-standard
+    # parameter names (e.g. "query", "pattern", "selector") can still match `if`
+    # conditions rather than silently failing open.
+    for key, value in tool_input.items():
+        if key in ("command", "file_path", "path", "args", "url"):
+            continue  # Already checked above.
+        if isinstance(value, str) and value:
+            return value
     return ""
 
 
@@ -539,7 +552,7 @@ def _run_command_hook(
             timeout=_bounded_timeout(timeout),
         )
     except subprocess.TimeoutExpired:
-        return 1, "", "Hook timed out"
+        return 2, "", "Hook timed out (fail-closed)"
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
@@ -691,31 +704,52 @@ def _merge_dispatch_result(
         if isinstance(parsed.get("hookSpecificOutput"), dict)
         else {}
     )
-    permission_request_result = (
+    # Extract new values from the hook output.
+    new_permission = (
         hook_specific.get("decision") if isinstance(hook_specific.get("decision"), dict) else None
     )
+    new_watch_paths = (
+        hook_specific.get("watchPaths")
+        if isinstance(hook_specific.get("watchPaths"), list)
+        else None
+    )
+    new_worktree_path = (
+        hook_specific.get("worktreePath")
+        if isinstance(hook_specific.get("worktreePath"), str)
+        else None
+    )
+    new_elicitation_action = (
+        hook_specific.get("action") if isinstance(hook_specific.get("action"), str) else None
+    )
+    new_elicitation_content = (
+        hook_specific.get("content") if isinstance(hook_specific.get("content"), dict) else None
+    )
+    new_retry = hook_specific.get("retry") is True
+
+    # Merge: only overwrite fields from the current result when the new value
+    # is non-None, so earlier hooks' values are preserved (not clobbered to None).
     return HookDispatchResult(
         matched_hooks=current.matched_hooks,
         blocked=current.blocked,
         block_reason=current.block_reason,
-        permission_request_result=permission_request_result,
-        watch_paths=(
-            hook_specific.get("watchPaths")
-            if isinstance(hook_specific.get("watchPaths"), list)
-            else None
+        permission_request_result=(
+            new_permission if new_permission is not None else current.permission_request_result
         ),
+        watch_paths=new_watch_paths if new_watch_paths is not None else current.watch_paths,
         worktree_path=(
-            hook_specific.get("worktreePath")
-            if isinstance(hook_specific.get("worktreePath"), str)
-            else None
+            new_worktree_path if new_worktree_path is not None else current.worktree_path
         ),
         elicitation_action=(
-            hook_specific.get("action") if isinstance(hook_specific.get("action"), str) else None
+            new_elicitation_action
+            if new_elicitation_action is not None
+            else current.elicitation_action
         ),
         elicitation_content=(
-            hook_specific.get("content") if isinstance(hook_specific.get("content"), dict) else None
+            new_elicitation_content
+            if new_elicitation_content is not None
+            else current.elicitation_content
         ),
-        retry=hook_specific.get("retry") is True,
+        retry=new_retry or current.retry,
     )
 
 
@@ -756,6 +790,29 @@ def poll_file_change_hooks(cwd: str | Path) -> int:
     return fired
 
 
+def _build_hook_env(hook: dict, scope: "HookScope") -> dict[str, str]:
+    """Build scrubbed env for hook execution.
+
+    User-settings hooks get full env by default (trusted).
+    Project/plugin hooks get scrubbed env (untrusted).
+    Any hook with "passFullEnv": true gets full env (opt-in).
+    """
+    from koder_agent.harness.session_env import SANDBOX_ENV_ALLOWLIST, is_probably_secret_env_name
+
+    # User-level hooks or explicit opt-in: full env
+    if scope.source == "user_settings" or hook.get("passFullEnv"):
+        return os.environ.copy()
+
+    # All other sources (project, plugin, skill): scrubbed env
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in SANDBOX_ENV_ALLOWLIST or key.startswith("LC_"):
+            env[key] = value
+        elif not is_probably_secret_env_name(key):
+            env[key] = value
+    return env
+
+
 def _run_async_command(
     *,
     command: str,
@@ -763,6 +820,7 @@ def _run_async_command(
     cwd: Path,
     env: dict[str, str],
     shell: str = "",
+    timeout: int | float | None = None,
 ) -> None:
     if shell:
         cmd: str | list[str] = [shell, "-c", command]
@@ -771,23 +829,53 @@ def _run_async_command(
         cmd = command
         use_shell = True
 
+    # Use bounded timeout to prevent indefinite thread blocking.
+    effective_timeout = _bounded_timeout(timeout)
+
     def _target():
-        subprocess.run(
-            cmd,
-            input=payload_text,
-            text=True,
-            cwd=str(cwd),
-            shell=use_shell,
-            capture_output=True,
-            env=env,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                cmd,
+                input=payload_text,
+                text=True,
+                cwd=str(cwd),
+                shell=use_shell,
+                capture_output=True,
+                env=env,
+                check=False,
+                timeout=effective_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("Async hook timed out after %s seconds: %s", effective_timeout, command)
 
     thread = threading.Thread(target=_target, daemon=True)
     thread.start()
 
 
 def dispatch_command_hooks(
+    *,
+    cwd: str | Path,
+    event_name: str,
+    payload: dict[str, Any],
+    match_value: str | None = None,
+) -> HookDispatchResult:
+    # Reentrancy guard: prevent infinite recursion when an agent-type hook
+    # triggers tool calls that would dispatch back into this function.
+    if getattr(_dispatch_guard, "in_dispatch", False):
+        return HookDispatchResult(matched_hooks=0)
+    _dispatch_guard.in_dispatch = True
+    try:
+        return _dispatch_command_hooks_inner(
+            cwd=cwd,
+            event_name=event_name,
+            payload=payload,
+            match_value=match_value,
+        )
+    finally:
+        _dispatch_guard.in_dispatch = False
+
+
+def _dispatch_command_hooks_inner(
     *,
     cwd: str | Path,
     event_name: str,
@@ -807,6 +895,16 @@ def dispatch_command_hooks(
     result = HookDispatchResult(matched_hooks=0)
     seen_hooks: set[str] = set()
     for scope in scopes:
+        # C1: Project-level hook trust gate — skip untrusted project hooks.
+        if scope.source in ("project_settings", "local_settings"):
+            from .project_approval import is_project_hooks_allowed
+
+            # Project root is the parent of the .koder/ directory containing settings.
+            project_root = scope.file_path.parent.parent
+            if not is_project_hooks_allowed(project_root):
+                logger.debug("Skipping untrusted project hooks from %s", project_root)
+                continue
+
         groups = scope.hooks.get(event_name)
         if not isinstance(groups, list):
             continue
@@ -830,12 +928,14 @@ def dispatch_command_hooks(
                 # Once-only: skip hooks that have already fired.
                 if hook.get("once") is True:
                     once_key = (scope.source, event_name, identity)
-                    if once_key in _once_fired:
-                        continue
-                    _once_fired.add(once_key)
+                    with _once_fired_lock:
+                        if once_key in _once_fired:
+                            continue
+                        _once_fired.add(once_key)
 
                 command = hook.get("command")
-                env = os.environ.copy()
+                # C4: Scrub secrets from hook env for untrusted sources.
+                env = _build_hook_env(hook, scope)
                 env["KODER_PROJECT_DIR"] = str(Path(cwd).resolve())
                 if scope.skill_root is not None:
                     env["KODER_SKILL_DIR"] = str(scope.skill_root)
@@ -884,6 +984,7 @@ def dispatch_command_hooks(
                             cwd=scope.skill_root or Path(cwd).resolve(),
                             env=env,
                             shell=hook_shell,
+                            timeout=hook_timeout,
                         )
                         continue
                     result = HookDispatchResult(matched_hooks=result.matched_hooks + 1)

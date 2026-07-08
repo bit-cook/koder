@@ -149,11 +149,11 @@ def test_interactive_handler_wires_permission_service_into_agent_service():
 def test_agent_tool_threads_active_permission_service(monkeypatch):
     """Fix 3 production wiring: agent_tool reads the active tool-permission context
     and hands the service to the AgentService it spawns."""
-    from koder_agent.tools.permission_context import (
-        set_tool_permission_context,
-        reset_tool_permission_context,
-    )
     import koder_agent.tools.agent as agent_tool_mod
+    from koder_agent.tools.permission_context import (
+        reset_tool_permission_context,
+        set_tool_permission_context,
+    )
 
     captured = {}
 
@@ -280,8 +280,8 @@ def test_subagent_falls_back_to_inherited_service_when_none_passed(monkeypatch):
     monkeypatch.setattr(service_mod, "EnhancedSQLiteSession", _FakeSession)
 
     from koder_agent.tools.permission_context import (
-        set_tool_permission_context,
         reset_tool_permission_context,
+        set_tool_permission_context,
     )
 
     async def scenario():

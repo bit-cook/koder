@@ -331,6 +331,15 @@ async def _run_foreground_unsandboxed(
         if warning:
             timeout_output = f"{warning}\n{timeout_output}"
         return ShellExecutionResult(status="error", output=timeout_output)
+    except asyncio.CancelledError:
+        # ESC/cancel: kill the detached process tree before propagating
+        _kill_process_group(process)
+        # Brief drain so killpg's SIGKILL has time to reap
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        raise  # Re-raise so the SDK knows the turn was cancelled
 
     output = stdout.decode("utf-8", errors="replace").strip()
     stderr_text = stderr.decode("utf-8", errors="replace").strip()

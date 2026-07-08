@@ -54,8 +54,31 @@ def is_replayable_session_item(item: Any) -> bool:
 
 
 def replayable_session_items(items: list[Any]) -> list[dict]:
-    """Filter session history down to valid SDK input items."""
-    return [item for item in items if is_replayable_session_item(item)]
+    """Filter session history down to valid SDK input items.
+
+    Guarantees pair-consistency: a ``function_call`` is only kept if its
+    matching ``function_call_output`` (same ``call_id``) also passes the
+    replayability filter, and vice versa. Orphaned halves trigger HTTP 400
+    from providers.
+    """
+    candidates = [item for item in items if is_replayable_session_item(item)]
+    call_ids_with_call = {
+        item.get("call_id")
+        for item in candidates
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    call_ids_with_output = {
+        item.get("call_id")
+        for item in candidates
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+    paired_ids = call_ids_with_call & call_ids_with_output
+    return [
+        item
+        for item in candidates
+        if item.get("type") not in ("function_call", "function_call_output")
+        or item.get("call_id") in paired_ids
+    ]
 
 
 def is_compactable_session_item(item: Any) -> bool:

@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from koder_agent.tools.file import get_file_state
 from koder_agent.tools.notebook_edit import notebook_edit
 
 
@@ -51,6 +52,8 @@ def sample_notebook(tmp_path):
     )
     path = tmp_path / "test.ipynb"
     path.write_text(json.dumps(nb))
+    # Register the file as read so the read-before-write guard passes
+    get_file_state().record_read(str(path.resolve()))
     return path
 
 

@@ -13,7 +13,10 @@ SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
 # Backends able to actually enforce a network deny/allow policy at runtime. The
 # unix-local backend cannot, so network_access must never be presented as
 # enforced when it is the resolved backend (honesty-first, finding #4).
-NETWORK_ENFORCING_BACKENDS = frozenset({"docker", "cloudflare", "e2b", "modal", "vercel"})
+# NOTE: Docker is excluded because the SDK docker backend does NOT set
+# --network=none by default; containers use the default bridge network.
+# Only cloud-hosted backends guarantee network isolation.
+NETWORK_ENFORCING_BACKENDS = frozenset({"cloudflare", "e2b", "modal", "vercel"})
 
 DEFAULT_PROTECTED_PATHS = (".git", ".koder", ".agents", ".codex")
 DEFAULT_SENSITIVE_DENY_WRITE = (

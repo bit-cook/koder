@@ -291,6 +291,13 @@ PRIVILEGED_PREFIXES = {
     "sudo",
 }
 
+# Pre-compiled regex to catch privilege escalation wrapped in subshell groups.
+# shlex treats `(` as a regular character, so `(sudo rm -rf /)` bypasses
+# token-level hard-deny unless we check the raw command first.
+_SUBSHELL_PRIV_RE = re.compile(
+    r"\(\s*(?:" + "|".join(re.escape(p) for p in PRIVILEGED_PREFIXES) + r")\b"
+)
+
 # Command-runner wrappers: they run whatever command follows them, so they can
 # never be treated as read-only on their own. Their own options / VAR=val
 # assignments are stripped and the inner command is classified recursively.
@@ -628,10 +635,32 @@ def _is_privileged_segment(tokens: list[str], lowered_command: str) -> bool:
     if command in PRIVILEGED_PREFIXES:
         return True
 
-    if command in {"rm", "rmdir"} and re.search(
-        r"\brm\b.*(?:-rf|-fr).*(?:^|[ /])/(?:\s|$)", lowered_command
-    ):
-        return True
+    if command in {"rm", "rmdir"}:
+        # Detect recursive force delete of root regardless of flag style:
+        # rm -rf /, rm -r -f /, rm --recursive --force /, rm -Rf /*, etc.
+        args = tokens[1:]
+        has_recursive = False
+        has_force = False
+        targets_root = False
+        for tok in args:
+            if tok.startswith("--"):
+                if tok == "--recursive":
+                    has_recursive = True
+                elif tok == "--force":
+                    has_force = True
+            elif tok.startswith("-") and len(tok) > 1:
+                # Combined short flags: -rf, -fr, -r, -f, -Rf, etc.
+                flag_chars = tok[1:]
+                if "r" in flag_chars or "R" in flag_chars:
+                    has_recursive = True
+                if "f" in flag_chars:
+                    has_force = True
+            else:
+                # Non-flag argument: check if it targets root
+                if tok == "/" or tok.startswith("/*"):
+                    targets_root = True
+        if has_recursive and has_force and targets_root:
+            return True
 
     return False
 
@@ -677,6 +706,19 @@ def classify_shell_command(command: str) -> ShellCommandDecision:
                 malformed=False,
                 reason="dangerous command pattern detected",
             )
+
+    # Guard against subshell-wrapped privilege escalation: (sudo ...) or (rm ...)
+    # bypass the token-level hard-deny because shlex treats `(` as a regular char.
+    if _SUBSHELL_PRIV_RE.search(raw):
+        return ShellCommandDecision(
+            command=command,
+            allowed=False,
+            read_only=False,
+            requires_approval=True,
+            destructive=True,
+            malformed=False,
+            reason="privilege escalation inside subshell group",
+        )
 
     try:
         tokenized_segments = _tokenize_segments(raw)

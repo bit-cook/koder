@@ -67,8 +67,7 @@ def skill_tool_restriction_guardrail(
     message = (
         f"Tool '{tool_name}' is not permitted while skill(s) [{skills_list}] "
         f"are active with tool restrictions. "
-        f"Allowed tools: {allowed_list}. "
-        f"You can load a skill without restrictions to clear these limits."
+        f"Allowed tools: {allowed_list}."
     )
 
     return ToolGuardrailFunctionOutput.reject_content(

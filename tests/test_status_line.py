@@ -227,3 +227,63 @@ def test_wide_statusline_marks_cost_unavailable(monkeypatch, tmp_path):
     rendered = "".join(fragment for _, fragment in fragments)
 
     assert "$?" in rendered
+
+
+# --- M11: CJK/emoji display width tests ---
+
+
+def test_display_width_ascii():
+    """ASCII characters are each 1 column wide."""
+    assert StatusLine._display_width("hello") == 5
+    assert StatusLine._display_width("") == 0
+    assert StatusLine._display_width("abc123") == 6
+
+
+def test_display_width_cjk():
+    """CJK ideographs occupy 2 columns each."""
+    assert StatusLine._display_width("中文") == 4
+    assert StatusLine._display_width("日本語") == 6
+    assert StatusLine._display_width("a中b") == 4  # 1 + 2 + 1
+
+
+def test_display_width_fullwidth():
+    """Fullwidth Latin letters occupy 2 columns each."""
+    # U+FF21 = FULLWIDTH LATIN CAPITAL LETTER A
+    assert StatusLine._display_width("ＡＢ") == 4
+
+
+def test_truncate_respects_cjk_width():
+    """Truncation accounts for double-width CJK characters."""
+    status_line = StatusLine(usage_tracker=_UsageTracker(), session_id="s")
+    # "中文测试" is 8 columns wide. Truncating to max_len=7 should produce
+    # a result fitting in 7 columns.
+    result = status_line._truncate("中文测试", 7)
+    assert StatusLine._display_width(result) <= 7
+    assert "..." in result
+
+
+def test_truncate_cjk_no_truncation_needed():
+    """When CJK string fits, it's returned unchanged."""
+    status_line = StatusLine(usage_tracker=_UsageTracker(), session_id="s")
+    result = status_line._truncate("中文", 4)
+    assert result == "中文"
+
+
+def test_truncate_cjk_from_start():
+    """From-start truncation also respects CJK width."""
+    status_line = StatusLine(usage_tracker=_UsageTracker(), session_id="s")
+    result = status_line._truncate("中文测试数据", 9, from_start=True)
+    assert StatusLine._display_width(result) <= 9
+    assert result.endswith("...")
+
+
+def test_compact_cwd_cjk_path(tmp_path, monkeypatch):
+    """CJK path segments are measured by display width, not character count."""
+    status_line = StatusLine(usage_tracker=_UsageTracker(), session_id="s")
+    # A path with CJK characters: "中文" = 4 cols but len() = 2
+    cjk_path = "/home/用户/项目/代码"
+    # display width = 1+4+1+2+1+4+1+2+1+4 = all ASCII separators (/) + CJK
+    # Actually: /home/用户/项目/代码 = 18 display cols
+    # With max_len=10, it must truncate
+    result = status_line._compact_cwd(cjk_path, 10)
+    assert StatusLine._display_width(result) <= 10

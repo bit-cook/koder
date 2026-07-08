@@ -385,8 +385,10 @@ class SkillLoader:
                     meta = loaded
                 else:
                     logger.warning("Frontmatter in %s must be a mapping", skill_path)
+                    return None  # Reject skill with non-mapping frontmatter
             except yaml.YAMLError as exc:
                 logger.warning("invalid YAML in %s: %s", skill_path, exc)
+                return None  # Reject skill with malformed YAML (fail-closed)
         else:
             logger.warning("no frontmatter found in %s", skill_path)
 
@@ -444,7 +446,9 @@ class SkillLoader:
             argument_hint=(
                 "[" + " ".join(str(item) for item in meta["argument-hint"]) + "]"
                 if isinstance(meta.get("argument-hint"), list)
-                else str(meta["argument-hint"]) if meta.get("argument-hint") is not None else None
+                else str(meta["argument-hint"])
+                if meta.get("argument-hint") is not None
+                else None
             ),
             argument_names=_parse_list(meta.get("arguments")),
             model=(
@@ -741,7 +745,7 @@ def _merge_skill(merged: dict[str, Skill], skill: Skill) -> None:
     existing = merged.get(skill.name)
     if existing is not None and existing.source != skill.source:
         logger.warning(
-            "skill '%s' from source '%s' overrides skill of the same name from " "source '%s'",
+            "skill '%s' from source '%s' overrides skill of the same name from source '%s'",
             skill.name,
             skill.source,
             existing.source,
@@ -943,6 +947,11 @@ def get_skill(skill_name: str) -> str:
     skill = skills.get(skill_name)
 
     if skill:
+        if skill.disable_model_invocation:
+            return (
+                f"Skill '{skill_name}' cannot be loaded by the model "
+                f"(disable_model_invocation=true). It is user-invocable only."
+            )
         _apply_skill_restrictions(skill)
         return skill.to_prompt()
 

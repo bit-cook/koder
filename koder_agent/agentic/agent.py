@@ -663,6 +663,7 @@ async def create_dev_agent(
     model_settings = ModelSettings(
         metadata={"source": "koder"},
         max_tokens=get_maximum_output_tokens(model_name_str),
+        include_usage=True,
     )
     reasoning_display = normalize_reasoning_display_mode(
         os.environ.get("KODER_REASONING_DISPLAY")

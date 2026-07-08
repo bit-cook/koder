@@ -230,6 +230,6 @@ def test_tmux_dev_channels_flag(channel_mcp_json):
     )
 
     output = _wait_prompt(session, timeout=25)
-    assert (
-        "unrecognized arguments" not in output
-    ), f"--dangerously-load-development-channels was rejected: {output}"
+    assert "unrecognized arguments" not in output, (
+        f"--dangerously-load-development-channels was rejected: {output}"
+    )

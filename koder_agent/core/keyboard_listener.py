@@ -107,6 +107,16 @@ class KeyboardListener:
                     # Only trigger on standalone ESC (not escape sequences like arrows)
                     # Arrow keys: ESC[A, ESC[B, etc. Function keys: ESC[15~, etc.
                     if sequence == chr(self.ESC_KEY):
+                        # Wait briefly to see if this is the start of a multi-byte
+                        # escape sequence split across reads (common in SSH/tmux where
+                        # network latency can separate ESC from the trailing bytes).
+                        await asyncio.sleep(0.025)  # 25ms disambiguation window
+                        if self._key_available():
+                            # More bytes arrived — this is an escape sequence (e.g.
+                            # arrow key ESC[A), not a standalone ESC press.
+                            self._read_available()  # consume and discard
+                            continue
+                        # No follow-up bytes: confirmed standalone ESC.
                         self._listening = False
                         await on_escape()
                         break

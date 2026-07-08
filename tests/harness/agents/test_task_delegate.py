@@ -119,8 +119,8 @@ def test_task_delegate_uses_deny_approver_not_inherited_prompt(monkeypatch):
 
     from koder_agent.tools.permission_context import (
         get_tool_permission_context,
-        set_tool_permission_context,
         reset_tool_permission_context,
+        set_tool_permission_context,
     )
     from koder_agent.tools.task import TaskModel, _task_delegate_impl
 

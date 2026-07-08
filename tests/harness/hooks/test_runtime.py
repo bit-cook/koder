@@ -21,6 +21,7 @@ from agents import ToolInputGuardrailData
 
 from koder_agent.agentic.hook_guardrail import hook_pretool_guardrail
 from koder_agent.harness.hooks.runtime import (
+    _once_fired,
     dispatch_command_hooks,
     list_configured_hooks,
     poll_file_change_hooks,
@@ -584,3 +585,142 @@ def test_elicitation_events_support_structured_output(tmp_path, monkeypatch):
     assert elicitation.elicitation_action == "accept"
     assert elicitation.elicitation_content == {"answer": "ok"}
     assert json.loads(marker.read_text(encoding="utf-8"))["event"] == "ElicitationResult"
+
+
+# ---------------------------------------------------------------------------
+# H12: Reentrancy guard prevents infinite recursion
+# ---------------------------------------------------------------------------
+
+
+class TestHookReentrancyGuard:
+    """dispatch_command_hooks inside a hook dispatch should be a no-op."""
+
+    def test_dispatch_does_not_reenter(self, tmp_path, monkeypatch):
+        """Nested dispatch_command_hooks returns empty result (no-op)."""
+        from koder_agent.harness.hooks.runtime import _dispatch_guard
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        project = tmp_path / "project"
+        (project / ".koder").mkdir(parents=True)
+        (project / ".koder" / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [{"hooks": [{"type": "command", "command": "echo block"}]}]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Simulate already being inside a dispatch
+        _dispatch_guard.in_dispatch = True
+        try:
+            result = dispatch_command_hooks(
+                cwd=project,
+                event_name="PreToolUse",
+                payload={"tool_name": "run_shell"},
+                match_value="run_shell",
+            )
+            # Should be a no-op due to reentrancy guard
+            assert result.matched_hooks == 0
+            assert result.blocked is False
+        finally:
+            _dispatch_guard.in_dispatch = False
+
+    def test_dispatch_works_after_guard_released(self, tmp_path, monkeypatch):
+        """After a guarded call completes, future dispatch calls work normally."""
+        import subprocess
+
+        from koder_agent.harness.hooks.runtime import _dispatch_guard
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        project = tmp_path / "project"
+        (project / ".koder").mkdir(parents=True)
+        (project / ".koder" / "settings.json").write_text(
+            json.dumps(
+                {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo ok"}]}]}}
+            ),
+            encoding="utf-8",
+        )
+
+        # Confirm guard is not set
+        assert not getattr(_dispatch_guard, "in_dispatch", False)
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = dispatch_command_hooks(
+            cwd=project,
+            event_name="Stop",
+            payload={"event": "Stop"},
+            match_value=None,
+        )
+        assert result.matched_hooks == 1
+
+        # Guard should be released after the call
+        assert not getattr(_dispatch_guard, "in_dispatch", False)
+
+
+def test_once_hook_does_not_double_fire(tmp_path, monkeypatch):
+    """Concurrent dispatches with once:true hooks must not double-fire (M8 race fix)."""
+    _once_fired.clear()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / "project"
+    counter = tmp_path / "race-counter"
+    counter.write_text("0", encoding="utf-8")
+
+    (project / ".koder").mkdir(parents=True, exist_ok=True)
+    (project / ".koder" / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        f'python -c "'
+                                        f"import pathlib, time; "
+                                        f"time.sleep(0.05); "
+                                        f"p = pathlib.Path(r'{counter}'); "
+                                        f'p.write_text(str(int(p.read_text()) + 1))"'
+                                    ),
+                                    "once": True,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    # Fire many concurrent dispatches — only one should actually run the hook.
+    errors: list[Exception] = []
+
+    def _dispatch():
+        try:
+            dispatch_command_hooks(
+                cwd=project,
+                event_name="SessionStart",
+                payload={"event": "SessionStart", "source": "startup"},
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_dispatch) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # The hook should have fired exactly once despite 10 concurrent dispatches.
+    assert int(counter.read_text()) == 1
+    _once_fired.clear()

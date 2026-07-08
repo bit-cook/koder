@@ -27,7 +27,8 @@ def invoke_get_skill(payload: dict) -> str:
     return asyncio.run(skill_module.get_skill.on_invoke_tool(None, json.dumps(payload)))
 
 
-def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, caplog):
+def test_load_skill_with_invalid_yaml_rejects_skill(tmp_path, caplog):
+    """H8 fix: malformed YAML frontmatter must fail-closed (reject skill)."""
     skill_file = tmp_path / "bad" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     skill_file.write_text(
@@ -47,11 +48,8 @@ def test_load_skill_with_invalid_yaml_warns_and_defaults(tmp_path, caplog):
     output = caplog.text
 
     assert "invalid YAML" in output
-    assert skill is not None
-    assert skill.name == "bad"
-    assert "Body text that should still load." in skill.content
-    assert skill.description == ""
-    assert skill.allowed_tools is None
+    # H8: skill must NOT load when frontmatter is malformed (fail-closed)
+    assert skill is None
 
 
 def test_load_skill_without_frontmatter_warns_and_uses_body(tmp_path, caplog):

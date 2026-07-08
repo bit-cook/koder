@@ -161,6 +161,6 @@ class TestHookPayload:
             "ElicitationResult": "elicitation_result",
         }
         for event_name, method_name in event_to_method.items():
-            assert hasattr(
-                HookPayload, method_name
-            ), f"Missing factory method for {event_name}: {method_name}"
+            assert hasattr(HookPayload, method_name), (
+                f"Missing factory method for {event_name}: {method_name}"
+            )

@@ -248,7 +248,7 @@ class SkillRestrictions:
 
         Args:
             pattern: Glob pattern to match (e.g., "status", "commit *", "*")
-            tool_args: JSON string containing {"args": "..."}
+            tool_args: JSON string containing {"command": "..."}
 
         Returns:
             True if the git args match the pattern
@@ -257,7 +257,7 @@ class SkillRestrictions:
             args = json.loads(tool_args)
             if not isinstance(args, dict):
                 return False
-            git_args = args.get("args", "")
+            git_args = args.get("command", "")
             if not isinstance(git_args, str):
                 return False
             # ``git_command`` runs a single ``git <args>`` invocation, but the

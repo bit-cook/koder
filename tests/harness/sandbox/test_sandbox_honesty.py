@@ -160,10 +160,19 @@ def test_network_not_enforced_on_unix_local():
 
 
 def test_network_enforced_flag_for_enforcing_backend():
-    policy = SandboxPolicy(mode="workspace-write", backend="docker", network_access=False)
+    # Docker does NOT enforce network isolation by default (no --network=none),
+    # so it is not in NETWORK_ENFORCING_BACKENDS.  Use a cloud backend instead.
+    policy = SandboxPolicy(mode="workspace-write", backend="e2b", network_access=False)
     assert policy.network_enforced is True
     # Restriction requested AND backend can enforce -> not the dishonest case.
     assert policy.network_restricted_but_unenforced is False
+
+
+def test_docker_network_not_enforced():
+    """Docker backend does NOT enforce network isolation by default."""
+    policy = SandboxPolicy(mode="workspace-write", backend="docker", network_access=False)
+    assert policy.network_enforced is False
+    assert policy.network_restricted_but_unenforced is True
 
 
 def test_network_restriction_flag_with_domain_lists():
@@ -320,3 +329,142 @@ def test_sandboxed_exec_path_uses_env_allowlist(monkeypatch, tmp_path):
     assert "ANTHROPIC_API_KEY" not in env
     # But keeps benign essentials.
     assert "PATH" in env
+
+
+# --- Finding H3: symlink TOCTOU protection -----------------------------------
+
+
+class TestSymlinkToctouProtection:
+    """Symlinks to protected paths must be detected regardless of link name."""
+
+    def test_symlink_to_protected_git_dir_detected(self, tmp_path):
+        """Symlink pointing to .git/ protected path must be caught."""
+        protected = tmp_path / ".git" / "hooks" / "pre-commit"
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.touch()
+
+        link = tmp_path / "innocent_link"
+        link.symlink_to(protected)
+
+        policy = SandboxPolicy(mode="workspace-write")
+        cmd = f"echo malicious > {link}"
+        result = protected_write_violation(cmd, policy=policy, repo_root=tmp_path)
+        assert result is not None
+        assert "protected path" in result
+
+    def test_symlink_to_dot_koder_detected(self, tmp_path):
+        """Symlink to .koder/ directory must be caught."""
+        protected = tmp_path / ".koder" / "settings.json"
+        protected.parent.mkdir(parents=True, exist_ok=True)
+        protected.touch()
+
+        link = tmp_path / "safe_name.txt"
+        link.symlink_to(protected)
+
+        policy = SandboxPolicy(mode="workspace-write")
+        cmd = f"cp /tmp/evil {link}"
+        result = protected_write_violation(cmd, policy=policy, repo_root=tmp_path)
+        assert result is not None
+        assert "protected path" in result
+
+    def test_symlink_to_env_file_detected_via_glob(self, tmp_path):
+        """Symlink whose real target matches a deny_write glob must be caught."""
+        # Create a .env.production file and symlink to it with an innocent name
+        env_file = tmp_path / ".env.production"
+        env_file.touch()
+
+        link = tmp_path / "config.txt"
+        link.symlink_to(env_file)
+
+        policy = SandboxPolicy(mode="workspace-write")
+        cmd = f"echo SECRET=x > {link}"
+        result = protected_write_violation(cmd, policy=policy, repo_root=tmp_path)
+        assert result is not None
+        assert "deny_write" in result or "protected path" in result
+
+    def test_non_symlink_safe_path_still_allowed(self, tmp_path):
+        """Regular files in non-protected locations must not be falsely flagged."""
+        safe = tmp_path / "src" / "main.py"
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        safe.touch()
+
+        policy = SandboxPolicy(mode="workspace-write")
+        cmd = f"echo code > {safe}"
+        result = protected_write_violation(cmd, policy=policy, repo_root=tmp_path)
+        assert result is None
+
+
+# --- Finding H4: compound interpreter preflight bypass ------------------------
+
+
+class TestCompoundInterpreterPreflight:
+    """Interpreter payloads via various shells and wrappers must be caught."""
+
+    def test_bash_c_with_rm_detected(self):
+        result = interpreter_payload_violation("bash -c 'rm -rf /protected'")
+        assert result is not None
+        assert "bash" in result
+
+    def test_sh_c_detected(self):
+        result = interpreter_payload_violation("sh -c 'cat /etc/shadow'")
+        assert result is not None
+        assert "sh" in result
+
+    def test_perl_e_with_unlink_detected(self):
+        result = interpreter_payload_violation("perl -e 'unlink(\"/protected\")'")
+        assert result is not None
+        assert "perl" in result
+
+    def test_python_c_with_os_remove_detected(self):
+        result = interpreter_payload_violation("python3 -c 'import os; os.remove(\"/etc/passwd\")'")
+        assert result is not None
+        assert "python3" in result
+
+    def test_ruby_e_detected(self):
+        result = interpreter_payload_violation("ruby -e 'File.delete(\"/etc/passwd\")'")
+        assert result is not None
+        assert "ruby" in result
+
+    def test_awk_detected(self):
+        """awk with inline code must be flagged (H4 extension)."""
+        result = interpreter_payload_violation("awk -e 'BEGIN{system(\"rm /etc/passwd\")}'")
+        assert result is not None
+        assert "awk" in result
+
+    def test_gawk_detected(self):
+        result = interpreter_payload_violation("gawk -e 'BEGIN{system(\"rm -rf /\")}'")
+        assert result is not None
+        assert "gawk" in result
+
+    def test_mawk_detected(self):
+        result = interpreter_payload_violation("mawk -e 'BEGIN{}'")
+        assert result is not None
+        assert "mawk" in result
+
+    def test_env_bash_c_detected(self):
+        """env prefix before interpreter must not hide the payload (H4 extension)."""
+        result = interpreter_payload_violation("env bash -c 'rm -rf /'")
+        assert result is not None
+        assert "bash" in result
+
+    def test_sudo_python_c_detected(self):
+        """sudo prefix before interpreter must not hide the payload."""
+        result = interpreter_payload_violation("sudo python3 -c 'import os; os.unlink(\"/x\")'")
+        assert result is not None
+        assert "python3" in result
+
+    def test_node_eval_detected(self):
+        result = interpreter_payload_violation('node --eval \'require("fs").unlinkSync("/x")\'')
+        assert result is not None
+        assert "node" in result
+
+    def test_plain_script_not_flagged(self):
+        """Running a script file (no inline flag) must not be flagged."""
+        assert interpreter_payload_violation("python3 deploy.py") is None
+        assert interpreter_payload_violation("bash ./run.sh") is None
+        assert interpreter_payload_violation("perl script.pl") is None
+
+    def test_non_interpreter_not_flagged(self):
+        assert interpreter_payload_violation("git status") is None
+        assert interpreter_payload_violation("ls -la /tmp") is None
+        assert interpreter_payload_violation("cat README.md") is None

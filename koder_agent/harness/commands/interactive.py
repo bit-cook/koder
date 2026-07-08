@@ -2543,7 +2543,7 @@ If verification fails because this skill's instructions are stale, ask before ed
         if not styles:
             lines.append("(no output styles found)")
             lines.append(
-                "hint: add markdown personas to .koder/output-styles/ " "or ~/.koder/output-styles/"
+                "hint: add markdown personas to .koder/output-styles/ or ~/.koder/output-styles/"
             )
             return "\n".join(lines)
         for key in sorted(styles):

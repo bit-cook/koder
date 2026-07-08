@@ -22,7 +22,10 @@ project_root = Path(__file__).resolve().parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from koder_agent.harness.hooks.runtime import dispatch_command_hooks
+from koder_agent.harness.hooks.runtime import (
+    _run_command_hook,
+    dispatch_command_hooks,
+)
 
 
 def _write_stop_hook_settings(project: Path, hook: dict) -> None:
@@ -246,3 +249,66 @@ def test_on_tool_end_does_not_block_event_loop(tmp_path, monkeypatch):
         return loop_responsive
 
     assert asyncio.run(_main()) is True
+
+
+# ---------------------------------------------------------------------------
+# H11: PreToolUse hook timeout must fail-closed (block)
+# ---------------------------------------------------------------------------
+
+
+class TestPreToolHookTimeoutFailsClosed:
+    def test_pretool_hook_timeout_blocks_tool(self):
+        """A PreToolUse hook that times out must block the tool call (exit 2)."""
+        from unittest.mock import patch
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 5)):
+            code, stdout, stderr = _run_command_hook(
+                command="sleep 100",
+                payload_text="{}",
+                cwd=Path.cwd(),
+                env={},
+                timeout=1,
+            )
+        assert code == 2  # Block signal
+        assert "timed out" in stderr.lower()
+
+    def test_pretool_hook_timeout_dispatch_returns_blocked(self, tmp_path, monkeypatch):
+        """dispatch_command_hooks returns blocked=True when a PreToolUse hook times out."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        project = tmp_path / "project"
+        (project / ".koder").mkdir(parents=True)
+        (project / ".koder" / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "sleep 100",
+                                        "timeout": 1,
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Make subprocess.run raise TimeoutExpired
+        def _timeout_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired("sleep 100", 1)
+
+        monkeypatch.setattr(subprocess, "run", _timeout_run)
+
+        result = dispatch_command_hooks(
+            cwd=project,
+            event_name="PreToolUse",
+            payload={"tool_name": "run_shell", "tool_input": {}},
+            match_value="run_shell",
+        )
+        assert result.blocked is True
+        assert "timed out" in (result.block_reason or "").lower()

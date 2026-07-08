@@ -25,7 +25,7 @@ from rich.text import Text
 
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
 from ..agentic.api_errors import ApiErrorCategory, classify_api_error
-from ..core.constants import get_max_turns
+from ..core.constants import get_max_turns, get_turn_timeout
 from ..core.goal_prompts import GOAL_CONTEXT_MARKER
 from ..core.goal_runtime import GoalRuntime
 from ..core.goals import GoalStore
@@ -680,7 +680,8 @@ class AgentScheduler:
                     streaming_ui=streaming_ui,
                     run_input=run_input,
                 )
-            result = await Runner.run(
+            turn_timeout = get_turn_timeout()
+            coro = Runner.run(
                 self.dev_agent,
                 run_input,  # Just current input - session handles history
                 session=self.session,  # Automatic history management
@@ -688,6 +689,10 @@ class AgentScheduler:
                 hooks=self.hooks,
                 max_turns=get_max_turns(),
             )
+            if turn_timeout > 0:
+                result = await asyncio.wait_for(coro, timeout=turn_timeout)
+            else:
+                result = await coro
             # Capture token usage from result
             await self._capture_usage(result)
 
@@ -758,6 +763,13 @@ class AgentScheduler:
             reset_tool_permission_context(perm_token)
             reset_skill_restriction_scope(skill_token)
 
+        # Check session cost ceiling after each turn
+        cost_error = self._check_session_cost_limit()
+        if cost_error:
+            if render_output:
+                print_reflowable(console, f"[red]{cost_error}[/red]")
+            return cost_error
+
         if companion is not None and not companion_config.harness.companion_muted:
             reaction = observe_turn(
                 companion=companion,
@@ -782,21 +794,23 @@ class AgentScheduler:
         include_partial_messages: bool = False,
     ) -> str:
         """Handle headless stream-json execution and emit NDJSON-friendly events."""
+        turn_timeout = get_turn_timeout()
         async with self._turn_lock:
-            response = await self._handle_stream_json_unlocked(
-                user_input,
-                on_event=on_event,
-                include_partial_messages=include_partial_messages,
-            )
-
-            async def run_continuation(prompt: str) -> str:
-                return await self._handle_stream_json_unlocked(
-                    prompt,
+            async with asyncio.timeout(turn_timeout if turn_timeout > 0 else None):
+                response = await self._handle_stream_json_unlocked(
+                    user_input,
                     on_event=on_event,
                     include_partial_messages=include_partial_messages,
                 )
 
-            return await self._run_goal_continuations(response, run_continuation)
+                async def run_continuation(prompt: str) -> str:
+                    return await self._handle_stream_json_unlocked(
+                        prompt,
+                        on_event=on_event,
+                        include_partial_messages=include_partial_messages,
+                    )
+
+                return await self._run_goal_continuations(response, run_continuation)
 
     async def _handle_stream_json_unlocked(
         self,
@@ -938,6 +952,12 @@ class AgentScheduler:
             await self._capture_usage(result)
             await self._finish_goal_turn()
 
+            # Check session cost ceiling after each headless turn
+            cost_error = self._check_session_cost_limit()
+            if cost_error:
+                on_event({"type": "error", "error": cost_error})
+                return cost_error
+
             final_response = result.final_output
             if final_response is None:
                 final_response = "".join(partial_text_chunks)
@@ -955,6 +975,25 @@ class AgentScheduler:
         """Cumulative billable tokens used as the goal accounting baseline."""
         usage = self.usage_tracker.session_usage
         return int(getattr(usage, "input_tokens", 0)) + int(getattr(usage, "output_tokens", 0))
+
+    def _check_session_cost_limit(self) -> str | None:
+        """Return an error message if the session cost exceeds the configured ceiling.
+
+        The ceiling is read from ``KODER_MAX_SESSION_COST`` (default: no limit).
+        When unset or set to ``0``, cost limiting is disabled.
+        """
+        from .constants import get_max_session_cost
+
+        max_cost = get_max_session_cost()
+        if max_cost <= 0:
+            return None
+        current_cost = self.usage_tracker.session_usage.total_cost
+        if current_cost >= max_cost:
+            return (
+                f"Session cost limit reached (${current_cost:.4f} >= ${max_cost:.2f}). "
+                "Adjust KODER_MAX_SESSION_COST to raise the ceiling."
+            )
+        return None
 
     async def _finish_goal_turn(self, *, error: bool = False, cancelled: bool = False) -> None:
         """Charge the finished turn against the session goal (best effort)."""
@@ -1738,6 +1777,14 @@ class AgentScheduler:
                 )
 
                 self._auto_compact.record_success()
+
+                # Invalidate the file-read dedup cache: compaction removes file
+                # contents from context, so the "already in context" fast-path
+                # would return stale/missing data if not cleared.
+                from ..tools.file import get_file_state
+
+                get_file_state().invalidate_all()
+
                 self._dispatch_compact_hooks(
                     "PostCompact",
                     {

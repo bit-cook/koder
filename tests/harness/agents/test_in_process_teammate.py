@@ -304,9 +304,9 @@ def test_in_process_runner_sends_idle_notification_to_lead(tmp_path, monkeypatch
         idle_messages = [
             m for m in lead_mail if "idle" in m.content.lower() or "finished" in m.content.lower()
         ]
-        assert (
-            len(idle_messages) >= 1
-        ), f"Expected idle notification in lead mailbox, got: {[m.content for m in lead_mail]}"
+        assert len(idle_messages) >= 1, (
+            f"Expected idle notification in lead mailbox, got: {[m.content for m in lead_mail]}"
+        )
 
     asyncio.run(run_case())
 

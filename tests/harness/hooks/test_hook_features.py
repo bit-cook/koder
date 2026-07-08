@@ -185,9 +185,12 @@ def test_command_hook_timeout_prevents_hang(tmp_path, monkeypatch):
         match_value="Edit",
         payload={"event": "PreToolUse", "tool_name": "Edit", "tool_input": {}},
     )
-    # Should not block forever; timeout causes non-blocking error (exit 1)
+    # H11 fix: timeout now fail-closed (exit 2 = block signal).
+    # Previously this returned exit 1 (not blocked); now it correctly blocks
+    # the tool call to prevent fail-open on timeout.
     assert result.matched_hooks == 1
-    assert not result.blocked
+    assert result.blocked is True
+    assert "timed out" in (result.block_reason or "").lower()
 
 
 # ---- KODER_ENV_FILE for CwdChanged and FileChanged ----
@@ -361,3 +364,56 @@ def test_permission_denied_hook_fires_when_tool_is_denied(tmp_path, monkeypatch)
     assert payload["event"] == "PermissionDenied"
     assert payload["tool_name"] == "run_shell"
     assert payload["reason"] == "Dangerous command"
+
+
+# ---- async hook timeout (M5) ----
+
+
+def test_async_hook_has_timeout(tmp_path, monkeypatch):
+    """An async command hook must use a bounded timeout so it cannot block/leak a thread."""
+    import time
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / "project"
+    marker = tmp_path / "async-timeout-marker"
+    # The hook sleeps 30s but has a 1s timeout — it should be killed.
+    _write_settings(
+        project,
+        {
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    f'python -c "'
+                                    f"import time, pathlib; "
+                                    f"pathlib.Path(r'{marker}').write_text('started'); "
+                                    f"time.sleep(30); "
+                                    f"pathlib.Path(r'{marker}').write_text('finished')\""
+                                ),
+                                "async": True,
+                                "timeout": 1,
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+    )
+    monkeypatch.chdir(project)
+
+    result = dispatch_command_hooks(
+        cwd=project,
+        event_name="PostToolUse",
+        match_value="Edit",
+        payload={"event": "PostToolUse", "tool_name": "Edit", "tool_input": {}, "result": "ok"},
+    )
+    assert result.matched_hooks == 1
+    # Give the async thread time to start and be killed by timeout
+    time.sleep(2.5)
+    # The marker should say "started" (process was launched) but NOT "finished"
+    # (timeout killed it before the 30s sleep completed).
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "started"

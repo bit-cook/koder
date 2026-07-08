@@ -22,6 +22,7 @@ from .rules import (
     parse_permission_rule,
 )
 from .shell_classifier import (
+    WRITE_REDIRECTION_PATTERN,
     _tokenize_segments,
     classify_shell_command,
     normalize_segment_for_rule,
@@ -34,6 +35,14 @@ if TYPE_CHECKING:
 
 def _empty_rules() -> dict[str, dict[str, list[str]]]:
     return {}
+
+
+def _normalize_git_command(command: str) -> str:
+    """Normalize a git_command argument to ``git <subcommand> ...`` form."""
+    rest = command.strip()
+    if rest.startswith("git"):
+        rest = rest[len("git") :].strip()
+    return f"git {rest}"
 
 
 # Markers for command/process substitution. A prefix allow rule cannot reason
@@ -313,6 +322,12 @@ class PermissionService:
         if _contains_command_substitution(command):
             return None
 
+        # Write redirections smuggle filesystem writes behind an innocent-looking
+        # segment (e.g. `echo hi > /etc/passwd` after `>` is stripped); never
+        # auto-allow via a rule — fall through to static classification.
+        if WRITE_REDIRECTION_PATTERN.search(command):
+            return None
+
         # Allow only when EVERY segment is individually allowed by a rule. A
         # segment counts as allowed when its RAW or NORMALIZED form matches an
         # allow rule, so a prefix rule like ``npm test:*`` generalizes across
@@ -478,10 +493,14 @@ class PermissionService:
         # allow cannot green-light ``echo hi; rm -rf ~`` and an ``rm:*`` deny is
         # not skipped in ``ls && rm -rf x``. Deny wins; allow needs every
         # segment covered. Other tools keep whole-string matching.
-        if tool_name in {"run_shell", "run_powershell"} and isinstance(
+        if tool_name in {"run_shell", "run_powershell", "git_command"} and isinstance(
             arguments.get("command"), str
         ):
-            shell_rule_result = self._match_shell_rules(tool_name, arguments["command"], target)
+            # git_command needs normalization to "git ..." for segment matching
+            rule_command = arguments["command"]
+            if tool_name == "git_command":
+                rule_command = _normalize_git_command(rule_command)
+            shell_rule_result = self._match_shell_rules(tool_name, rule_command, target)
             if shell_rule_result is not None:
                 return shell_rule_result
         else:
@@ -541,10 +560,7 @@ class PermissionService:
             # push --force / reset --hard become requires_approval.
             classify_command = command
             if tool_name == "git_command":
-                rest = command.strip()
-                if rest.startswith("git"):
-                    rest = rest[len("git") :].strip()
-                classify_command = f"git {rest}"
+                classify_command = _normalize_git_command(command)
             current_cwd = Path.cwd()
             state = resolve_sandbox_settings(current_cwd)
             excluded_from_sandbox = is_excluded_command(classify_command, cwd=current_cwd)
@@ -608,6 +624,7 @@ class PermissionService:
                         decision.requires_approval
                         and state.auto_allow_bash_if_sandboxed
                         and state.backend_available
+                        and state.policy is not None
                     ):
                         return PermissionEvaluationResult.allow(
                             tool_name=tool_name,

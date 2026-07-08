@@ -572,6 +572,12 @@ class StreamingDisplayManager:
                 # Apply inline formatting
                 formatted_line = line
 
+                # Escape literal brackets in model output BEFORE applying
+                # our own Rich markup tags. Rich interprets unescaped [...]
+                # as markup tags, which would swallow user-visible content
+                # like [important text] or [link labels].
+                formatted_line = formatted_line.replace("[", "\\[")
+
                 # Bold text
                 formatted_line = re.sub(r"\*\*([^*]+)\*\*", r"[bold]\1[/bold]", formatted_line)
 
