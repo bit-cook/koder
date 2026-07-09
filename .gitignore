@@ -185,7 +185,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .tmp/
-.tmp-team-members/
+.tmp-team-members
+.tmp-team-service
 .koder/
 /.mcp.json
 agent-output/

@@ -208,6 +208,7 @@ koder auth login google
 koder auth login claude
 koder auth login chatgpt
 koder auth login antigravity
+koder auth login github-copilot
 koder auth list
 ```
 
