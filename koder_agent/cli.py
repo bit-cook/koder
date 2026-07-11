@@ -595,6 +595,27 @@ async def main():
     return await run_harness_runtime(runtime_request)
 
 
+def _format_fatal_error(error: Exception) -> str:
+    """Format fatal errors without exposing dependency-specific help links."""
+    from pydantic import ValidationError
+
+    if not isinstance(error, ValidationError):
+        return str(error)
+
+    error_count = error.error_count()
+    error_label = "validation error" if error_count == 1 else "validation errors"
+    lines = [f"{error_count} {error_label} for {error.title}"]
+    for detail in error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = ".".join(str(part) for part in detail.get("loc", ())) or "(root)"
+        message = detail.get("msg", "Invalid value")
+        lines.extend((location, f"  {message}"))
+    return "\n".join(lines)
+
+
 def run():
     """Run the Koder CLI."""
     try:
@@ -608,7 +629,11 @@ def run():
         raise
     except Exception as e:
         console.print(
-            Panel(f"[red]Fatal error: {e}[/red]", title="Fatal Error", border_style="red")
+            Panel(
+                f"[red]Fatal error: {_format_fatal_error(e)}[/red]",
+                title="Fatal Error",
+                border_style="red",
+            )
         )
         exit(1)
 
