@@ -7533,6 +7533,87 @@
     }
   },
   "features": {
+    "onboarding-session-env-startup": {
+      "validation_level": "acceptance",
+      "purpose": "Use a fixed session with a persisted selected-provider credential before launch, suppress the startup setup panel, then remove only that credential and verify explicit onboarding reports it missing despite an unrelated provider key.",
+      "env": {
+        "KODER_API_KEY": "",
+        "OPENAI_API_KEY": "synthetic-unrelated-openai-key",
+        "ANTHROPIC_API_KEY": "",
+        "GOOGLE_API_KEY": "",
+        "GEMINI_API_KEY": "",
+        "AZURE_API_KEY": "",
+        "OPENROUTER_API_KEY": ""
+      },
+      "cli_args": [
+        "--session",
+        "onboarding-session-env-startup"
+      ],
+      "prelaunch_files": [
+        {
+          "path": "$HOME/.koder/session-env/onboarding-session-env-startup.sh",
+          "content": "export KODER_MODEL=openrouter/anthropic/claude-3-opus\nexport OPENROUTER_API_KEY=synthetic-session-openrouter-key\n"
+        }
+      ],
+      "acceptance_criteria": [
+        "automatic startup reads the fixed session environment before onboarding",
+        "the persisted OpenRouter credential suppresses Setup Recommended",
+        "an unrelated OpenAI key does not satisfy the selected OpenRouter provider",
+        "removing only OPENROUTER_API_KEY makes explicit onboarding report the credential missing",
+        "the process-visible output never exposes the persisted credential value"
+      ],
+      "acceptance_artifacts": [
+        "startup visible capture without Setup Recommended",
+        "session environment unset capture",
+        "explicit onboarding missing-credential capture",
+        "persisted fixed-session environment file"
+      ],
+      "turns": [
+        {
+          "wait": 0.2,
+          "capture": "visible",
+          "expect_all": [
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "Setup Recommended",
+            "synthetic-session-openrouter-key"
+          ],
+          "timeout": 3
+        },
+        {
+          "send": "/env unset OPENROUTER_API_KEY",
+          "expect_all": [
+            "env: removed OPENROUTER_API_KEY from this session."
+          ]
+        },
+        {
+          "send": "/onboarding",
+          "expect_all": [
+            "Setup checklist:",
+            "Configure API key: Set KODER_API_KEY",
+            "Completed: API key=\u2717, Model=\u2713, Workspace=\u2713"
+          ],
+          "expect_not": [
+            "synthetic-session-openrouter-key"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$HOME/.koder/session-env/onboarding-session-env-startup.sh",
+            "export KODER_MODEL=openrouter/anthropic/claude-3-opus"
+          ]
+        },
+        {
+          "file_not_contains": [
+            "$HOME/.koder/session-env/onboarding-session-env-startup.sh",
+            "synthetic-session-openrouter-key"
+          ]
+        }
+      ]
+    },
     "auto-dream-task": {
       "validation_level": "acceptance",
       "purpose": "Run a deterministic AutoDream consolidation, verify task and memory persistence, update task metadata, and report malformed task records through /tasks.",
