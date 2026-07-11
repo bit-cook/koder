@@ -3314,6 +3314,7 @@ If verification fails because this skill's instructions are stale, ask before ed
                 if not is_valid_env_name(name):
                     return f"env: invalid variable name: {name}"
                 delete_session_env_var(session_id, name)
+                os.environ.pop(name, None)
                 return f"env: removed {name} from this session."
 
             if len(_args) != 1 or "=" not in _args[0]:

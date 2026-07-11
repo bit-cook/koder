@@ -1348,6 +1348,57 @@ def test_onboarding_scenario_is_acceptance_backed_by_real_state_transitions():
     ]
 
 
+def test_onboarding_session_env_startup_scenario_is_hermetic_and_selected_provider_aware():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["onboarding-session-env-startup"]
+    session_id = "onboarding-session-env-startup"
+    session_file = f"$HOME/.koder/session-env/{session_id}.sh"
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["cli_args"] == ["--session", session_id]
+    assert scenario["env"] == {
+        "KODER_API_KEY": "",
+        "OPENAI_API_KEY": "synthetic-unrelated-openai-key",
+        "ANTHROPIC_API_KEY": "",
+        "GOOGLE_API_KEY": "",
+        "GEMINI_API_KEY": "",
+        "AZURE_API_KEY": "",
+        "OPENROUTER_API_KEY": "",
+    }
+    assert scenario["prelaunch_files"] == [
+        {
+            "path": session_file,
+            "content": (
+                "export KODER_MODEL=openrouter/anthropic/claude-3-opus\n"
+                "export OPENROUTER_API_KEY=synthetic-session-openrouter-key\n"
+            ),
+        }
+    ]
+    assert scenario["turns"][0]["capture"] == "visible"
+    assert "Setup Recommended" in scenario["turns"][0]["expect_not"]
+    assert scenario["turns"][1] == {
+        "send": "/env unset OPENROUTER_API_KEY",
+        "expect_all": ["env: removed OPENROUTER_API_KEY from this session."],
+    }
+    assert scenario["turns"][2]["send"] == "/onboarding"
+    assert "Configure API key: Set KODER_API_KEY" in scenario["turns"][2]["expect_all"]
+    assert "Completed: API key=✗, Model=✓, Workspace=✓" in scenario["turns"][2]["expect_all"]
+    assert scenario["post_assertions"] == [
+        {
+            "file_contains": [
+                session_file,
+                "export KODER_MODEL=openrouter/anthropic/claude-3-opus",
+            ]
+        },
+        {
+            "file_not_contains": [
+                session_file,
+                "synthetic-session-openrouter-key",
+            ]
+        },
+    ]
+
+
 def test_debug_tool_call_scenario_is_acceptance_backed_by_seeded_records_and_redaction():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["slash_commands"]["debug-tool-call"]

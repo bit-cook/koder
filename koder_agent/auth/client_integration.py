@@ -15,6 +15,11 @@ from koder_agent.auth.token_storage import get_token_storage
 logger = logging.getLogger(__name__)
 
 
+def _normalize_provider_for_log(provider: str) -> str:
+    """Return a stable provider identifier suitable for refresh logs."""
+    return provider.strip().lower()
+
+
 def get_oauth_token(provider: str) -> Optional[OAuthTokens]:
     """Get OAuth tokens for a provider if available.
 
@@ -78,11 +83,18 @@ def _sync_refresh_token(provider: str, tokens: OAuthTokens) -> Optional[OAuthTok
             logger.info(f"Refreshed OAuth tokens for {provider}")
             return result.tokens
 
-        logger.warning(f"Failed to refresh OAuth tokens for {provider}: {result.error}")
+        logger.warning(
+            "OAuth token refresh failed provider=%s category=refresh_rejected",
+            _normalize_provider_for_log(provider),
+        )
         return None
 
-    except Exception as e:
-        logger.error(f"Error refreshing OAuth tokens for {provider}: {e}")
+    except Exception as error:
+        logger.error(
+            "OAuth token refresh failed provider=%s category=exception exception_type=%s",
+            _normalize_provider_for_log(provider),
+            type(error).__name__,
+        )
         return None
 
 
@@ -109,11 +121,18 @@ async def async_refresh_token(provider: str, tokens: OAuthTokens) -> Optional[OA
             logger.info(f"Refreshed OAuth tokens for {provider}")
             return result.tokens
 
-        logger.warning(f"Failed to refresh OAuth tokens for {provider}: {result.error}")
+        logger.warning(
+            "OAuth token refresh failed provider=%s category=refresh_rejected",
+            _normalize_provider_for_log(provider),
+        )
         return None
 
-    except Exception as e:
-        logger.error(f"Error refreshing OAuth tokens for {provider}: {e}")
+    except Exception as error:
+        logger.error(
+            "OAuth token refresh failed provider=%s category=exception exception_type=%s",
+            _normalize_provider_for_log(provider),
+            type(error).__name__,
+        )
         return None
 
 

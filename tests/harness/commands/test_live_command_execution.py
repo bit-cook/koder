@@ -1302,10 +1302,12 @@ def test_env_command_persists_session_scoped_variables(tmp_path, monkeypatch):
     env_output = _run_with_scheduler("/env", handler=handler, scheduler=scheduler)
     assert "session_env:" in env_output
     assert "- DEMO_ENV=hello" in env_output
+    monkeypatch.setenv("DEMO_ENV", "hello")
 
     assert _run_with_scheduler("/env unset DEMO_ENV", handler=handler, scheduler=scheduler) == (
         "env: removed DEMO_ENV from this session."
     )
+    assert "DEMO_ENV" not in os.environ
     env_output = _run_with_scheduler("/env", handler=handler, scheduler=scheduler)
     assert "session_env: none" in env_output
 

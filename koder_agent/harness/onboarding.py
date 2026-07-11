@@ -6,7 +6,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from koder_agent.utils.client import resolve_auth_status
+
 logger = logging.getLogger(__name__)
+
+AUTH_PROVIDER_LABELS = {
+    "claude": "Claude",
+    "chatgpt": "ChatGPT",
+    "google": "Google",
+    "antigravity": "Antigravity",
+    "github_copilot": "GitHub Copilot",
+}
 
 
 @dataclass
@@ -21,11 +31,13 @@ class OnboardingState:
 
 
 def _is_github_copilot_configured(runtime_env: Mapping[str, str | None]) -> bool:
-    model = (runtime_env.get("KODER_MODEL") or "").strip().lower()
-    if model.startswith("litellm/"):
-        model = model[len("litellm/") :]
-    if model.startswith("github_copilot/"):
-        return True
+    env_model = runtime_env.get("KODER_MODEL")
+    if env_model is not None:
+        model = env_model.strip().lower()
+        if model.startswith("litellm/"):
+            model = model[len("litellm/") :]
+        if "/" in model:
+            return model.split("/", 1)[0] == "github_copilot"
 
     try:
         from koder_agent.config import get_config
@@ -67,18 +79,21 @@ def check_onboarding_state(
         project_dir = Path.cwd()
     runtime_env = os.environ if env is None else env
 
-    # Check for API key in environment variables
-    api_key_env_vars = [
-        "KODER_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-    ]
-    github_copilot_configured = _is_github_copilot_configured(runtime_env)
-    api_key_configured = any(runtime_env.get(var) for var in api_key_env_vars)
-    auth_provider_hint = "github_copilot" if github_copilot_configured else None
-    if github_copilot_configured and _has_litellm_copilot_token(runtime_env):
-        api_key_configured = True
+    if _is_github_copilot_configured(runtime_env):
+        api_key_configured = _has_litellm_copilot_token(runtime_env)
+        auth_provider_hint = "github_copilot"
+    else:
+        try:
+            auth_status = resolve_auth_status(env=runtime_env)
+            api_key_configured = auth_status.configured
+            auth_provider_hint = auth_status.oauth_provider
+        except Exception as error:
+            logger.debug(
+                "Onboarding auth resolution failed exception_type=%s",
+                type(error).__name__,
+            )
+            api_key_configured = False
+            auth_provider_hint = None
 
     # Check for model configuration (env var OR config file — koder always has a default)
     model_selected = True  # koder has a built-in default model (gpt-4.1)
@@ -123,8 +138,10 @@ def get_onboarding_steps(state: OnboardingState) -> list[str]:
 
     steps = []
 
-    if not state.api_key_configured and state.auth_provider_hint == "github_copilot":
-        steps.append("Authenticate GitHub Copilot: run koder auth login github_copilot")
+    if not state.api_key_configured and state.auth_provider_hint:
+        provider = state.auth_provider_hint
+        label = AUTH_PROVIDER_LABELS.get(provider, provider.replace("_", " ").title())
+        steps.append(f"Authenticate {label}: run koder auth login {provider}")
     elif not state.api_key_configured:
         steps.append(
             "Configure API key: Set KODER_API_KEY, OPENAI_API_KEY, "

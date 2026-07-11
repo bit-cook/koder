@@ -3,7 +3,9 @@
 import logging
 import os
 import uuid
-from typing import Optional
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import backoff
 import litellm
@@ -99,6 +101,21 @@ PROVIDER_ENV_VARS = {
 }
 
 
+@dataclass(frozen=True)
+class AuthResolutionStatus:
+    provider: str
+    configured: bool
+    oauth_provider: Optional[str] = None
+    credential_mode: Literal["api_key", "provider_managed"] = "api_key"
+
+    def __post_init__(self) -> None:
+        if self.credential_mode == "provider_managed" and not self.configured:
+            raise ValueError("provider_managed authentication must be configured")
+
+
+_PROVIDER_MANAGED_AUTH_PROVIDERS = frozenset({"ollama", "vertex_ai", "bedrock"})
+
+
 def _ensure_oauth_providers_registered() -> None:
     """Ensure OAuth providers are registered with LiteLLM.
 
@@ -129,6 +146,15 @@ def _get_provider_env_var_name(provider: str) -> str:
 def get_provider_api_env_var(provider: str) -> str:
     """Public helper so other modules can discover the provider's API key env var."""
     return _get_provider_env_var_name(provider)
+
+
+def _read_environment_value(
+    name: str,
+    env: Mapping[str, str | None] | None = None,
+) -> Optional[str]:
+    """Read one environment value without mutating the selected environment."""
+    source = os.environ if env is None else env
+    return source.get(name)
 
 
 def _split_model_identifier(model: str) -> tuple[Optional[str], str, bool]:
@@ -177,7 +203,7 @@ def _strip_matching_provider(raw_model: str, provider: str) -> str:
     return raw_model
 
 
-def _resolve_model_settings():
+def _resolve_model_settings(env: Mapping[str, str | None] | None = None):
     """Resolve the effective config, provider, and raw model string.
 
     When model comes from KODER_MODEL env var, it may use 'provider/model' format
@@ -191,11 +217,9 @@ def _resolve_model_settings():
     config = get_config()
     config_manager = get_config_manager()
 
-    # Check if KODER_MODEL env var is set
-    env_model = os.environ.get("KODER_MODEL")
+    env_model = _read_environment_value("KODER_MODEL", env)
     model_from_env = env_model is not None
-
-    raw_model = config_manager.get_effective_value(config.model.name, "KODER_MODEL")
+    raw_model = env_model if model_from_env else config.model.name
 
     # Resolve model aliases (e.g., 'sonnet' → 'claude-sonnet-4-6')
     raw_model = resolve_model_alias(raw_model)
@@ -213,12 +237,17 @@ def _resolve_model_settings():
     return config, config_manager, provider, raw_model, model_from_env
 
 
-def _get_provider_api_key(config, config_manager, provider: str):
+def _get_provider_api_key(
+    config,
+    provider: str,
+    env: Mapping[str, str | None] | None = None,
+) -> Optional[str]:
     """Get API key with priority: KODER_API_KEY > OAuth > ENV > Config."""
-    if provider.lower() == "github_copilot":
+    provider = provider.lower()
+    if provider == "github_copilot":
         return None
 
-    koder_api_key = os.environ.get("KODER_API_KEY")
+    koder_api_key = _read_environment_value("KODER_API_KEY", env)
     if koder_api_key:
         return koder_api_key
 
@@ -233,9 +262,12 @@ def _get_provider_api_key(config, config_manager, provider: str):
     except ImportError:
         pass
 
-    env_var_name = _get_provider_env_var_name(provider)
+    env_value = _read_environment_value(_get_provider_env_var_name(provider), env)
+    if env_value is not None:
+        return env_value
+
     config_value = config.model.api_key if config.model.provider.lower() == provider else None
-    return config_manager.get_effective_value(config_value, env_var_name)
+    return config_value
 
 
 def _setup_provider_env_vars(config, provider: str):
@@ -388,10 +420,10 @@ def _normalize_model_name(provider: str, raw_model: str, model_from_env: bool = 
 _native_vs_litellm_logged = False
 
 
-def _compute_effective_model(config, config_manager, provider, raw_model, model_from_env=False):
+def _compute_effective_model(config, provider, raw_model, model_from_env=False):
     """Determine the model name and whether to use native OpenAI integration."""
     global _native_vs_litellm_logged
-    api_key = _get_provider_api_key(config, config_manager, provider)
+    api_key = _get_provider_api_key(config, provider)
 
     # Determine whether to use native OpenAI client:
     # 1. Primary: known OpenAI model prefix (gpt-, o1-, o3-, o4-, chatgpt-, dall-e-)
@@ -428,9 +460,12 @@ def _compute_effective_model(config, config_manager, provider, raw_model, model_
     return _normalize_model_name(provider, raw_model, model_from_env), False, api_key
 
 
-def _resolve_completion_settings(model_override: Optional[str] = None):
+def _resolve_completion_settings(
+    model_override: Optional[str] = None,
+    env: Mapping[str, str | None] | None = None,
+):
     """Resolve provider/model settings for a completion call, honoring overrides."""
-    config, config_manager, provider, raw_model, model_from_env = _resolve_model_settings()
+    config, config_manager, provider, raw_model, model_from_env = _resolve_model_settings(env)
 
     if model_override is not None:
         # Resolve aliases in overrides (e.g., 'sonnet' → 'claude-sonnet-4-6')
@@ -447,12 +482,8 @@ def _resolve_completion_settings(model_override: Optional[str] = None):
 
 def get_model_name(model_override: Optional[str] = None):
     """Get the appropriate model name with priority: ENV > Config > Default."""
-    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
-        model_override
-    )
-    model, _, _ = _compute_effective_model(
-        config, config_manager, provider, raw_model, model_from_env
-    )
+    config, _, provider, raw_model, model_from_env = _resolve_completion_settings(model_override)
+    model, _, _ = _compute_effective_model(config, provider, raw_model, model_from_env)
     # Check for model deprecation and warn if applicable
     try:
         warning = check_model_deprecation(raw_model)
@@ -465,19 +496,49 @@ def get_model_name(model_override: Optional[str] = None):
 
 def resolve_model_override_name(raw_model: str) -> str:
     """Resolve a model override into the actual call model name."""
-    config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
-        raw_model
-    )
-    model, _, _ = _compute_effective_model(
-        config, config_manager, provider, raw_model, model_from_env
-    )
+    config, _, provider, raw_model, model_from_env = _resolve_completion_settings(raw_model)
+    model, _, _ = _compute_effective_model(config, provider, raw_model, model_from_env)
     return model
 
 
-def get_api_key(model_override: Optional[str] = None):
+def get_api_key(
+    model_override: Optional[str] = None,
+    *,
+    env: Mapping[str, str | None] | None = None,
+) -> Optional[str]:
     """Get API key with priority: KODER_API_KEY > OAuth > ENV > Config."""
-    config, config_manager, provider, _, _ = _resolve_completion_settings(model_override)
-    return _get_provider_api_key(config, config_manager, provider)
+    config, _, provider, _, _ = _resolve_completion_settings(model_override, env)
+    return _get_provider_api_key(config, provider, env)
+
+
+def resolve_auth_status(
+    model_override: Optional[str] = None,
+    *,
+    env: Mapping[str, str | None] | None = None,
+) -> AuthResolutionStatus:
+    """Resolve non-secret authentication status for the selected provider."""
+    config, _, provider, _, _ = _resolve_completion_settings(model_override, env)
+    if provider == "github_copilot":
+        return AuthResolutionStatus(provider=provider, configured=False)
+    if provider in _PROVIDER_MANAGED_AUTH_PROVIDERS:
+        return AuthResolutionStatus(
+            provider=provider,
+            configured=True,
+            credential_mode="provider_managed",
+        )
+    configured = bool(_get_provider_api_key(config, provider, env))
+    oauth_provider = None
+    try:
+        from ..auth.client_integration import map_provider_to_oauth
+
+        oauth_provider = map_provider_to_oauth(provider)
+    except ImportError:
+        pass
+    return AuthResolutionStatus(
+        provider=provider,
+        configured=configured,
+        oauth_provider=oauth_provider,
+    )
 
 
 def _resolve_base_url(config, config_manager, provider: str) -> Optional[str]:
@@ -551,7 +612,7 @@ def get_litellm_model_kwargs(model_override: Optional[str] = None) -> dict:
     if model.startswith("litellm/"):
         model = model[len("litellm/") :]
 
-    api_key = _get_provider_api_key(config, config_manager, provider)
+    api_key = _get_provider_api_key(config, provider)
     base_url = _resolve_base_url(config, config_manager, provider)
 
     kwargs = {
@@ -588,8 +649,8 @@ def get_model_client_snapshot(model_override: Optional[str] = None) -> dict:
 
 def is_native_openai_provider(model_override: Optional[str] = None) -> bool:
     """Check if the current provider should use native OpenAI client."""
-    config, config_manager, provider, raw_model, _ = _resolve_completion_settings(model_override)
-    api_key = _get_provider_api_key(config, config_manager, provider)
+    config, _, provider, raw_model, _ = _resolve_completion_settings(model_override)
+    api_key = _get_provider_api_key(config, provider)
 
     return (
         provider in ("openai", "custom")
@@ -656,7 +717,7 @@ async def llm_completion(
 
     # Get model name and API key
     model, use_native, api_key = _compute_effective_model(
-        config, config_manager, provider, raw_model, model_from_env
+        config, provider, raw_model, model_from_env
     )
 
     # When the model is OpenAI-native but llm_completion goes through litellm,
@@ -793,7 +854,7 @@ def setup_openai_client():
     _setup_provider_env_vars(config, provider)
 
     model, use_native, api_key = _compute_effective_model(
-        config, config_manager, provider, raw_model, model_from_env
+        config, provider, raw_model, model_from_env
     )
     base_url = _resolve_base_url(config, config_manager, provider)
 
