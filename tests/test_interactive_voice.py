@@ -18,8 +18,9 @@ class _UsageTracker:
         )()
 
 
-def test_status_line_can_show_transient_voice_notice():
+def test_status_line_can_show_transient_voice_notice(monkeypatch):
     status_line = StatusLine(usage_tracker=_UsageTracker(), session_id="voice-session")
+    monkeypatch.setattr(status_line, "_terminal_columns", lambda: 200)
     status_line.set_notice("Voice: recording")
     fragments = status_line.get_formatted_text()
     assert any("Voice: recording" in fragment for _, fragment in fragments)

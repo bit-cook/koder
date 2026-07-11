@@ -105,7 +105,10 @@ def test_tmux_interactive_history_up_arrow_resets_after_clear(tmp_path):
         _wait_for_prompt(session)
 
         _send(session, "!printf up_history_seed")
-        output = _wait_for_output(session, "up_history_seed")
+        output = _wait_for(
+            session,
+            lambda text: "Shell Mode" in text and "up_history_seed" in text,
+        )
         assert "Shell Mode" in output
 
         output = _send_keys(session, "Up")
@@ -142,7 +145,10 @@ def test_tmux_interactive_ctrl_r_replays_previous_command(tmp_path):
         _wait_for_prompt(session)
 
         _send(session, "!printf ctrlr_seed")
-        output = _wait_for_output(session, "ctrlr_seed")
+        output = _wait_for(
+            session,
+            lambda text: "Shell Mode" in text and "ctrlr_seed" in text,
+        )
         assert "Shell Mode" in output
         baseline_shell_mode_count = output.count("Shell Mode")
 

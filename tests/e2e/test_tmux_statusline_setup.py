@@ -77,8 +77,9 @@ def test_tmux_statusline_command_imports_shell_prompt(tmp_path):
         configured_output = _wait_for_output(session, "statusline: configured from", timeout=20.0)
         assert "statusline: configured from" in configured_output
 
-        prompt_output = _wait_for_output(session, "project:koder", timeout=20.0)
-        assert "project:koder" in prompt_output
+        expected_prompt = f"project:{PROJECT_ROOT.name}"
+        prompt_output = _wait_for_output(session, expected_prompt, timeout=20.0)
+        assert expected_prompt in prompt_output
 
         saved = json.loads((home / ".koder" / "settings.json").read_text(encoding="utf-8"))
         assert saved["statusLine"]["type"] == "command"
