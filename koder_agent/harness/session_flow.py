@@ -27,6 +27,7 @@ from koder_agent.harness.hooks.runtime import (
     update_watch_paths,
 )
 from koder_agent.harness.plugins.session_root import build_session_plugin_root, default_plugin_root
+from koder_agent.harness.session_env import load_session_env
 from koder_agent.harness.tools.shell_executor import execute_shell_command
 from koder_agent.litellm_cost_map import get_litellm_cost_map_debug_lines
 from koder_agent.utils.client import get_model_name
@@ -688,7 +689,9 @@ async def run_harness_session_flow(
         try:
             from koder_agent.harness.onboarding import check_onboarding_state, get_onboarding_steps
 
-            onboarding_state = check_onboarding_state(Path.cwd())
+            effective_env = os.environ.copy()
+            effective_env.update(load_session_env(args.session))
+            onboarding_state = check_onboarding_state(Path.cwd(), env=effective_env)
             if not onboarding_state.completed:
                 missing_steps = get_onboarding_steps(onboarding_state)
                 if missing_steps:
@@ -709,8 +712,11 @@ async def run_harness_session_flow(
                             border_style="yellow",
                         )
                     )
-        except Exception:
-            pass  # Onboarding check is best-effort
+        except Exception as error:
+            logger.debug(
+                "Startup onboarding check failed exception_type=%s",
+                type(error).__name__,
+            )
 
     streaming = config.cli.stream and not args.no_stream
     input_format = getattr(args, "input_format", "text")

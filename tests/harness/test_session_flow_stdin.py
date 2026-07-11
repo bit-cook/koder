@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from koder_agent.harness import session_flow
+from koder_agent.harness.onboarding import OnboardingState
 
 
 class _FakeStdin:
@@ -154,6 +155,123 @@ def test_run_harness_session_flow_combines_prompt_with_piped_stdin(monkeypatch):
             True,
         )
     ]
+
+
+def test_startup_onboarding_uses_persisted_session_env_without_mutating_process(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-unrelated-openai-key")
+    monkeypatch.delenv("KODER_MODEL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    captured_envs = []
+    events = []
+
+    monkeypatch.setattr(
+        session_flow,
+        "load_session_env",
+        lambda session_id: (
+            {
+                "KODER_MODEL": "openrouter/anthropic/claude-3-opus",
+                "OPENROUTER_API_KEY": "synthetic-session-openrouter-key",
+            }
+            if session_id == "test-session"
+            else {}
+        ),
+        raising=False,
+    )
+
+    def fake_check_onboarding_state(_project_dir, env=None):
+        captured_envs.append(None if env is None else dict(env))
+        return OnboardingState(
+            completed=True,
+            api_key_configured=True,
+            model_selected=True,
+            workspace_trusted=True,
+        )
+
+    def fake_dispatch_command_hooks(*, event_name, **_kwargs):
+        events.append(event_name)
+        return SimpleNamespace(blocked=False, block_reason=None, watch_paths=[])
+
+    monkeypatch.setattr(
+        "koder_agent.harness.onboarding.check_onboarding_state",
+        fake_check_onboarding_state,
+    )
+    monkeypatch.setattr(session_flow, "dispatch_command_hooks", fake_dispatch_command_hooks)
+    process_env_before = dict(session_flow.os.environ)
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=[]))
+
+    assert exit_code == 0
+    assert len(captured_envs) == 1
+    effective_env = captured_envs[0]
+    assert effective_env["KODER_MODEL"] == "openrouter/anthropic/claude-3-opus"
+    assert effective_env["OPENROUTER_API_KEY"] == "synthetic-session-openrouter-key"
+    assert effective_env["OPENAI_API_KEY"] == "synthetic-unrelated-openai-key"
+    assert dict(session_flow.os.environ) == process_env_before
+    assert "Setup" not in events
+
+
+def test_startup_missing_credentials_renders_panel_and_dispatches_setup_hook(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+    events = []
+    printed = []
+
+    monkeypatch.setattr(
+        session_flow,
+        "load_session_env",
+        lambda _session_id: {"KODER_MODEL": "openrouter/anthropic/claude-3-opus"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "koder_agent.harness.onboarding.check_onboarding_state",
+        lambda _project_dir, env=None: OnboardingState(
+            completed=False,
+            api_key_configured=False,
+            model_selected=True,
+            workspace_trusted=True,
+        ),
+    )
+
+    def fake_dispatch_command_hooks(*, event_name, payload=None, **_kwargs):
+        events.append((event_name, payload))
+        return SimpleNamespace(blocked=False, block_reason=None, watch_paths=[])
+
+    monkeypatch.setattr(session_flow, "dispatch_command_hooks", fake_dispatch_command_hooks)
+    monkeypatch.setattr(session_flow.console, "print", printed.append)
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=[]))
+
+    assert exit_code == 0
+    setup_events = [payload for event, payload in events if event == "Setup"]
+    assert setup_events == [
+        {
+            "event": "Setup",
+            "missing_steps": [
+                "Configure API key: Set KODER_API_KEY, OPENAI_API_KEY, "
+                "ANTHROPIC_API_KEY, or another provider's API key"
+            ],
+        }
+    ]
+    setup_panels = [item for item in printed if "Setup Recommended" in str(item.title)]
+    assert len(setup_panels) == 1
+    assert "synthetic" not in str(setup_panels[0].renderable)
+
+
+def test_bare_mode_skips_startup_onboarding_session_env(monkeypatch):
+    _patch_session_flow(monkeypatch, "", stdin_is_tty=True)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("bare mode must skip startup onboarding")
+
+    monkeypatch.setattr(session_flow, "load_session_env", fail_if_called, raising=False)
+    monkeypatch.setattr(
+        "koder_agent.harness.onboarding.check_onboarding_state",
+        fail_if_called,
+    )
+
+    exit_code = asyncio.run(session_flow.run_harness_session_flow(first_arg=None, argv=["--bare"]))
+
+    assert exit_code == 0
 
 
 def test_run_harness_session_flow_dispatches_session_end_when_cron_stop_fails(monkeypatch):
