@@ -1,10 +1,14 @@
+import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Literal, get_type_hints
 
 import pytest
 import yaml
 
 from koder_agent.config import reset_config_manager
 from koder_agent.config.manager import ConfigManager
+from koder_agent.utils import client as client_module
 from koder_agent.utils.client import (
     get_api_key,
     get_base_url,
@@ -20,6 +24,32 @@ def _write_config(tmp_path, data: dict) -> None:
     config_dir = tmp_path / ".koder"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "config.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+def test_auth_resolution_status_is_frozen():
+    assert hasattr(client_module, "AuthResolutionStatus")
+    status = client_module.AuthResolutionStatus(provider="openai", configured=False)
+
+    assert status.oauth_provider is None
+    assert status.credential_mode == "api_key"
+    with pytest.raises(FrozenInstanceError):
+        status.configured = True
+
+
+def test_auth_resolution_status_credential_mode_is_literal():
+    assert (
+        get_type_hints(client_module.AuthResolutionStatus)["credential_mode"]
+        == Literal["api_key", "provider_managed"]
+    )
+
+
+def test_auth_resolution_status_rejects_unconfigured_provider_managed():
+    with pytest.raises(ValueError, match="provider_managed.*configured"):
+        client_module.AuthResolutionStatus(
+            provider="ollama",
+            configured=False,
+            credential_mode="provider_managed",
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -439,6 +469,178 @@ def test_koder_api_key_overrides_config_api_key(monkeypatch, tmp_path):
     assert kwargs["api_key"] == "sk-koder-override"
 
 
+def test_injected_provider_env_does_not_mutate_process_environment(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "gpt-4o", "provider": "openai"}},
+    )
+    monkeypatch.setenv("KODER_API_KEY", "process-koder-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "process-provider-key")
+    original_env = {
+        "KODER_API_KEY": os.environ["KODER_API_KEY"],
+        "OPENAI_API_KEY": os.environ["OPENAI_API_KEY"],
+    }
+
+    assert get_api_key(env={"OPENAI_API_KEY": "injected-provider-key"}) == ("injected-provider-key")
+    assert {name: os.environ[name] for name in original_env} == original_env
+
+
+def test_resolve_auth_status_uses_injected_openrouter_env_without_mutating_environ(
+    monkeypatch, tmp_path
+):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "gpt-4o", "provider": "openai"}},
+    )
+    monkeypatch.setenv("KODER_MODEL", "openai/process-model")
+    monkeypatch.setenv("KODER_API_KEY", "process-koder-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "process-openrouter-key")
+    before = dict(os.environ)
+
+    status = client_module.resolve_auth_status(
+        env={
+            "KODER_MODEL": "openrouter/anthropic/claude-3-opus",
+            "OPENROUTER_API_KEY": "synthetic-openrouter-key",
+        }
+    )
+
+    assert status == client_module.AuthResolutionStatus(
+        provider="openrouter",
+        configured=True,
+    )
+    assert dict(os.environ) == before
+
+
+def test_injected_model_ignores_unrelated_provider_key(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {
+            "model": {
+                "name": "gpt-4o",
+                "provider": "openai",
+                "api_key": "config-openai-key",
+            }
+        },
+    )
+
+    def fail_if_effective_value_reads_process_env(*args, **kwargs):
+        raise AssertionError("injected model/key resolution must not read process env")
+
+    monkeypatch.setattr(
+        ConfigManager,
+        "get_effective_value",
+        fail_if_effective_value_reads_process_env,
+    )
+
+    assert (
+        get_api_key(
+            env={
+                "KODER_MODEL": "anthropic/claude-sonnet-4-6",
+                "OPENAI_API_KEY": "unrelated-openai-key",
+            }
+        )
+        is None
+    )
+
+
+def test_injected_koder_api_key_wins_without_oauth(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "claude-sonnet-4-6", "provider": "claude"}},
+    )
+
+    def fail_if_oauth_runs(provider):
+        raise AssertionError(f"OAuth should not run for {provider}")
+
+    monkeypatch.setattr(
+        "koder_agent.auth.client_integration.get_oauth_api_key",
+        fail_if_oauth_runs,
+    )
+
+    assert (
+        get_api_key(
+            env={
+                "KODER_API_KEY": "injected-koder-key",
+                "CLAUDE_API_KEY": "injected-provider-key",
+            }
+        )
+        == "injected-koder-key"
+    )
+
+
+def test_oauth_wins_over_injected_provider_env(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {
+            "model": {
+                "name": "claude-sonnet-4-6",
+                "provider": "claude",
+                "api_key": "config-provider-key",
+            }
+        },
+    )
+    oauth_calls = []
+
+    def resolve_oauth(provider):
+        oauth_calls.append(provider)
+        return "oauth-access-token"
+
+    monkeypatch.setattr(
+        "koder_agent.auth.client_integration.get_oauth_api_key",
+        resolve_oauth,
+    )
+
+    assert get_api_key(env={"CLAUDE_API_KEY": "injected-provider-key"}) == ("oauth-access-token")
+    assert oauth_calls == ["claude"]
+
+
+def test_oauth_failure_falls_back_to_injected_provider_env(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "claude-sonnet-4-6", "provider": "claude"}},
+    )
+    monkeypatch.setattr(
+        "koder_agent.auth.client_integration.get_oauth_api_key",
+        lambda provider: None,
+    )
+
+    assert get_api_key(env={"CLAUDE_API_KEY": "injected-provider-key"}) == ("injected-provider-key")
+
+
+def test_oauth_failure_falls_back_to_matching_config(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {
+            "model": {
+                "name": "claude-sonnet-4-6",
+                "provider": "claude",
+                "api_key": "config-provider-key",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "koder_agent.auth.client_integration.get_oauth_api_key",
+        lambda provider: None,
+    )
+
+    assert get_api_key(env={"CLAUDE_API_KEY": None}) == "config-provider-key"
+
+
+def test_injected_empty_provider_key_overrides_config(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {
+            "model": {
+                "name": "gpt-4o",
+                "provider": "openai",
+                "api_key": "config-provider-key",
+            }
+        },
+    )
+
+    assert get_api_key(env={"KODER_API_KEY": "", "OPENAI_API_KEY": ""}) == ""
+
+
 def test_koder_api_key_overrides_provider_env_var(monkeypatch, tmp_path):
     """KODER_API_KEY should take priority over provider-specific env vars like OPENAI_API_KEY."""
     _write_config(
@@ -480,6 +682,73 @@ def test_github_copilot_ignores_api_key_env_vars(monkeypatch, tmp_path):
     assert get_api_key() is None
     kwargs = get_litellm_model_kwargs()
     assert kwargs["api_key"] is None
+
+
+def test_resolve_auth_status_keeps_github_copilot_unconfigured(tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "gpt-5.1-codex", "provider": "github_copilot"}},
+    )
+
+    assert hasattr(client_module, "resolve_auth_status")
+    status = client_module.resolve_auth_status(env={"KODER_API_KEY": "ignored-koder-key"})
+
+    assert status == client_module.AuthResolutionStatus(
+        provider="github_copilot",
+        configured=False,
+    )
+
+
+def test_resolve_auth_status_contains_no_credential_value(tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "gpt-4o", "provider": "openai"}},
+    )
+    secret = "status-secret-canary"
+
+    status = client_module.resolve_auth_status(env={"OPENAI_API_KEY": secret})
+
+    assert status == client_module.AuthResolutionStatus(
+        provider="openai",
+        configured=True,
+    )
+    assert secret not in repr(status)
+    assert secret not in status.__dict__.values()
+
+
+def test_resolve_auth_status_reports_failed_oauth_provider(monkeypatch, tmp_path):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "claude-sonnet-4-6", "provider": "claude"}},
+    )
+    monkeypatch.setattr(
+        "koder_agent.auth.client_integration.get_oauth_api_key",
+        lambda provider: None,
+    )
+
+    status = client_module.resolve_auth_status(env={})
+
+    assert status == client_module.AuthResolutionStatus(
+        provider="claude",
+        configured=False,
+        oauth_provider="claude",
+    )
+
+
+@pytest.mark.parametrize("provider", ["ollama", "vertex_ai", "bedrock"])
+def test_resolve_auth_status_marks_provider_managed_auth_configured(tmp_path, provider):
+    _write_config(
+        tmp_path,
+        {"model": {"name": "gpt-4o", "provider": "openai"}},
+    )
+
+    status = client_module.resolve_auth_status(env={"KODER_MODEL": f"{provider}/test-model"})
+
+    assert status == client_module.AuthResolutionStatus(
+        provider=provider,
+        configured=True,
+        credential_mode="provider_managed",
+    )
 
 
 def test_provider_env_api_key_works_without_koder_api_key(monkeypatch, tmp_path):
