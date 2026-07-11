@@ -54,6 +54,7 @@ MIN_COMPLETION_MENU_COLUMNS = 50
 MIN_COMPLETION_MENU_ROWS_WITH_STATUS = 12
 MIN_COMPLETION_MENU_ROWS_NO_STATUS = 10
 MAX_COMPLETION_MENU_VISIBLE_ROWS = 8
+MAX_INPUT_VISIBLE_LINES = 30
 MIN_STATUS_LINE_ROWS = 7
 INPUT_FRAME_ROWS = 3
 STATUS_LINE_HEIGHT = 1
@@ -63,6 +64,16 @@ FULL_BUDDY_WIDTH = 38
 COMPACT_BUDDY_HEIGHT = 1
 VOICE_RECORDING_MESSAGE = "[voice] Recording... Press Space or Enter to stop."
 VOICE_TRANSCRIBING_MESSAGE = "[voice] Transcribing..."
+
+
+def _create_input_window(buffer_control: BufferControl) -> Window:
+    """Create the wrapping prompt input window with a bounded visible height."""
+    return Window(
+        content=buffer_control,
+        height=Dimension(min=1, max=MAX_INPUT_VISIBLE_LINES),
+        wrap_lines=True,
+        dont_extend_height=True,
+    )
 
 
 def _should_show_status_line(*, rows: int) -> bool:
@@ -668,12 +679,7 @@ class InteractivePrompt:
         )
 
         # Create input window with dynamic height
-        input_window = Window(
-            content=buffer_control,
-            height=Dimension(min=1, max=10),  # Allow 1-10 lines, auto-expand
-            wrap_lines=False,  # Keep single line behavior, expand vertically instead
-            dont_extend_height=True,
-        )
+        input_window = _create_input_window(buffer_control)
 
         # Create simple frame without heavy styling
         framed_input = Frame(
