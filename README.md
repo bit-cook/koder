@@ -185,7 +185,7 @@ Universal environment variables work across providers:
 | `KODER_API_KEY` | Universal API key | `sk-...` |
 | `KODER_MODEL` | Active model | `gpt-4o`, `claude-opus-4-20250514` |
 | `KODER_BASE_URL` | Custom OpenAI-compatible endpoint | `http://localhost:8080/v1` |
-| `KODER_REASONING_EFFORT` | Reasoning effort | `low`, `medium`, `high` |
+| `KODER_REASONING_EFFORT` | Reasoning effort | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `KODER_REASONING_DISPLAY` | Reasoning display mode | `off`, `summary`, `full` |
 | `KODER_ENFORCE_TOOL_APPROVAL` | Approval-required tool calls when no interactive approver is wired. Unset = TTY-aware (fail-closed when non-interactive, allow+log when a TTY is attached) | `1`/`true` (fail closed), `0`/`false` (allow+log) |
 | `KODER_GOAL_MAX_CONTINUATIONS` | Max hidden goal continuation turns per turn before the loop stops; `0` disables continuations | `25` (default), `0`, `10` |
@@ -230,7 +230,7 @@ Persistent defaults live in `~/.koder/config.yaml`:
 model:
   name: "gpt-4o"
   provider: "openai"
-  reasoning_effort: null
+  reasoning_effort: medium
 
 cli:
   session: null

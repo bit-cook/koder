@@ -1410,7 +1410,7 @@
         "config renders model, voice, skills, and harness sections",
         "/model changes are reflected in /config YAML",
         "/effort changes are reflected in /config YAML",
-        "resetting model and effort returns config to openai/gpt-4.1 with auto effort",
+        "resetting model and effort returns config to openai/gpt-4.1 with medium effort",
         "backing config.yaml contains the final persisted values"
       ],
       "acceptance_artifacts": [
@@ -1457,7 +1457,7 @@
         {
           "send": "/effort auto",
           "expect_all": [
-            "Effort level set to auto",
+            "Effort level reset to default: medium",
             "settings_path:"
           ]
         },
@@ -1474,7 +1474,7 @@
           "expect_all": [
             "name: gpt-4.1",
             "provider: openai",
-            "reasoning_effort: null"
+            "reasoning_effort: medium"
           ]
         }
       ],
@@ -1485,7 +1485,7 @@
             [
               "name: gpt-4.1",
               "provider: openai",
-              "reasoning_effort: null"
+              "reasoning_effort: medium"
             ]
           ]
         }
@@ -1994,11 +1994,11 @@
       "validation_level": "acceptance",
       "purpose": "Inspect, set, persist, inherit, reject invalid, and reset reasoning effort through the TUI.",
       "acceptance_criteria": [
-        "default effort renders as auto",
-        "setting high persists to config and process environment",
-        "a background subagent inherits the high reasoning effort",
+        "default effort renders as medium",
+        "setting xhigh and max persists to config and process environment",
+        "a background subagent inherits the max reasoning effort",
         "invalid effort values are rejected without changing state",
-        "resetting to auto clears the session env override and config value"
+        "resetting to auto clears the session env override and restores medium"
       ],
       "acceptance_artifacts": [
         "effort command captures",
@@ -2009,13 +2009,13 @@
         {
           "send": "/effort",
           "expect_all": [
-            "Effort level: auto"
+            "Current effort level: medium"
           ]
         },
         {
-          "send": "/effort high",
+          "send": "/effort xhigh",
           "expect_all": [
-            "Set effort level to high",
+            "Set effort level to xhigh",
             "settings_path:",
             "agent_reloaded:"
           ]
@@ -2023,7 +2023,21 @@
         {
           "send": "/effort",
           "expect_all": [
-            "Current effort level: high"
+            "Current effort level: xhigh"
+          ]
+        },
+        {
+          "send": "/effort max",
+          "expect_all": [
+            "Set effort level to max",
+            "settings_path:",
+            "agent_reloaded:"
+          ]
+        },
+        {
+          "send": "/effort",
+          "expect_all": [
+            "Current effort level: max"
           ]
         },
         {
@@ -2031,20 +2045,20 @@
           "expect_all": [
             "fork: launched background subagent",
             "model_config:",
-            "reasoning_effort: high"
+            "reasoning_effort: max"
           ]
         },
         {
           "send": "/effort impossible",
           "expect_all": [
             "Invalid argument: impossible",
-            "Valid options are: low, medium, high, auto"
+            "Valid options are: low, medium, high, xhigh, max, auto"
           ]
         },
         {
           "send": "/effort auto",
           "expect_all": [
-            "Effort level set to auto",
+            "Effort level reset to default: medium",
             "settings_path:",
             "agent_reloaded:"
           ]
@@ -2052,7 +2066,7 @@
         {
           "send": "/effort",
           "expect_all": [
-            "Effort level: auto"
+            "Current effort level: medium"
           ]
         }
       ],
@@ -2060,13 +2074,13 @@
         {
           "file_contains": [
             "$HOME/.koder/config.yaml",
-            "reasoning_effort: null"
+            "reasoning_effort: medium"
           ]
         },
         {
           "file_glob_contains": [
             "$HOME/.koder/agents/agent-*.json",
-            "\"reasoning_effort\": \"high\""
+            "\"reasoning_effort\": \"max\""
           ]
         }
       ]

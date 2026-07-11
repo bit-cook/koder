@@ -42,7 +42,8 @@ triggering event ("I prefer tabs") belong in memory instead.
 For `config.yaml`-backed values, precedence is **CLI arguments > environment
 variables > config file > defaults**. Key environment variables include
 `KODER_API_KEY` (universal, overrides provider keys), `KODER_BASE_URL`,
-`KODER_MODEL`, `KODER_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`),
+`KODER_MODEL`, `KODER_REASONING_EFFORT`
+(`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`),
 and `KODER_SMALL_MODEL`. If a config.yaml change "does not take effect", check
 whether an env var or CLI flag is shadowing it before editing anything.
 

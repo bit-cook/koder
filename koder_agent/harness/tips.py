@@ -79,7 +79,11 @@ TIPS = [
     ),
     TIP(
         id="reasoning_effort",
-        message="💡 Tip: For o1/o3 models, set KODER_REASONING_EFFORT (low/medium/high) to control thinking depth.",
+        message=(
+            "💡 Tip: Set KODER_REASONING_EFFORT "
+            "(none/minimal/low/medium/high/xhigh/max) to control thinking depth; "
+            "available levels vary by model."
+        ),
         relevance_check=lambda ctx: ctx.get("model", "").startswith(("o1", "o3", "gpt-5")),
     ),
     TIP(

@@ -273,4 +273,35 @@ def test_create_dev_agent_requests_reasoning_summary_when_display_enabled(monkey
 
     assert agent.model == "gpt-5"
     assert agent.model_settings.reasoning.summary == "detailed"
-    assert agent.model_settings.reasoning.effort is None
+    assert agent.model_settings.reasoning.effort == "medium"
+
+
+def test_create_dev_agent_passes_max_reasoning_effort_without_conversion(monkeypatch):
+    from koder_agent.harness.config.schema import RuntimeConfig
+
+    config = RuntimeConfig(
+        model={
+            "name": "gpt-5.6",
+            "provider": "openai",
+            "reasoning_effort": "max",
+        }
+    )
+
+    def fake_snapshot(_model_override):
+        return {
+            "model_name": "gpt-5.6",
+            "api_key": "sk-test",
+            "base_url": None,
+            "native_openai": True,
+            "litellm_kwargs": {},
+        }
+
+    monkeypatch.setenv("KODER_SIMPLE", "1")
+    monkeypatch.setattr("koder_agent.agentic.agent.get_config", lambda: config)
+    monkeypatch.setattr("koder_agent.agentic.agent.get_model_client_snapshot", fake_snapshot)
+    monkeypatch.setattr("koder_agent.agentic.agent.should_use_reasoning_param", lambda: True)
+
+    agent = asyncio.run(create_dev_agent([]))
+
+    assert agent.model_settings.reasoning.effort == "max"
+    assert agent.model_settings.to_json_dict()["reasoning"]["effort"] == "max"

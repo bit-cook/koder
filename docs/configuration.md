@@ -36,7 +36,7 @@ model:
   base_url: null               # Custom API endpoint (optional)
 
   # Reasoning effort for OpenAI reasoning models (o1, o3, gpt-5.1, etc.)
-  reasoning_effort: null       # none, minimal, low, medium, high, or null (default: null)
+  reasoning_effort: medium     # none, minimal, low, medium, high, xhigh, or max (default: medium)
 
 # CLI defaults
 cli:
@@ -83,7 +83,7 @@ These `KODER_*` variables work with any provider and override provider-specific 
 | `KODER_API_KEY` | Universal API key (works with all providers) | `sk-...`, `your-api-key` |
 | `KODER_BASE_URL` | Custom API endpoint | `http://localhost:8080/v1` |
 | `KODER_MODEL` | Model selection | `gpt-4o`, `claude-opus-4-20250514` |
-| `KODER_REASONING_EFFORT` | Reasoning effort for reasoning models | `medium`, `high`, `low` |
+| `KODER_REASONING_EFFORT` | Reasoning effort for reasoning models | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `KODER_REASONING_DISPLAY` | Reasoning display mode | `off`, `summary`, `full` |
 | `EDITOR` | Editor for `koder config edit` | `vim`, `code` |
 

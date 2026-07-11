@@ -3082,9 +3082,11 @@ def test_model_config_status_effort_and_env_scenarios_are_acceptance_backed():
     effort = manifest["slash_commands"]["effort"]
     assert any(
         turn.get("send") == "/fork general-purpose effort inheritance marker"
-        and "reasoning_effort: high" in turn.get("expect_all", [])
+        and "reasoning_effort: max" in turn.get("expect_all", [])
         for turn in effort["turns"]
     )
+    assert any(turn.get("send") == "/effort xhigh" for turn in effort["turns"])
+    assert any(turn.get("send") == "/effort max" for turn in effort["turns"])
     assert any(
         turn.get("send") == "/effort impossible"
         and "Invalid argument: impossible" in turn.get("expect_all", [])
@@ -3093,7 +3095,7 @@ def test_model_config_status_effort_and_env_scenarios_are_acceptance_backed():
     assert {
         "file_glob_contains": [
             "$HOME/.koder/agents/agent-*.json",
-            '"reasoning_effort": "high"',
+            '"reasoning_effort": "max"',
         ]
     } in effort["post_assertions"]
 
@@ -3114,7 +3116,7 @@ def test_model_config_status_effort_and_env_scenarios_are_acceptance_backed():
     assert {
         "file_contains": [
             "$HOME/.koder/config.yaml",
-            ["name: gpt-4.1", "provider: openai", "reasoning_effort: null"],
+            ["name: gpt-4.1", "provider: openai", "reasoning_effort: medium"],
         ]
     } in config["post_assertions"]
 

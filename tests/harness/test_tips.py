@@ -71,6 +71,12 @@ class TestTipManager:
         reasoning_tips2 = [t for t in tips2 if t and "reasoning" in t.lower()]
         assert len(reasoning_tips) >= len(reasoning_tips2)
 
+    def test_reasoning_effort_tip_lists_extended_levels(self):
+        message = next(tip.message for tip in TIPS if tip.id == "reasoning_effort")
+
+        assert "xhigh" in message
+        assert "max" in message
+
     def test_get_tip_returns_tips_from_list(self):
         """Verify returned tips are from the TIPS list."""
         manager = TipManager()

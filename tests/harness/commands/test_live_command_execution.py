@@ -1359,10 +1359,10 @@ def test_model_and_effort_commands_update_runtime_config_and_reset_agent(tmp_pat
         effort_status = _run_with_scheduler("/effort", handler=handler, scheduler=scheduler)
         config_output = _run_with_scheduler("/config", handler=handler, scheduler=scheduler)
 
-        assert "Effort level set to auto" in auto_output
+        assert "Effort level reset to default: medium" in auto_output
         assert "KODER_REASONING_EFFORT" not in os.environ
-        assert "Effort level: auto" == effort_status
-        assert "reasoning_effort: null" in config_output
+        assert "Current effort level: medium" == effort_status
+        assert "reasoning_effort: medium" in config_output
         assert scheduler.reset_count == 3
 
         reasoning_output = _run_with_scheduler(
@@ -1384,6 +1384,46 @@ def test_model_and_effort_commands_update_runtime_config_and_reset_agent(tmp_pat
 
         assert "Invalid argument: impossible" in invalid_output
         assert scheduler.reset_count == 4
+    finally:
+        reset_config_manager()
+
+
+def test_effort_command_supports_xhigh_max_and_resets_to_medium(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("KODER_REASONING_EFFORT", raising=False)
+    reset_config_manager()
+    try:
+        scheduler = _ResettableScheduler(
+            session=SimpleNamespace(session_id="extended-effort-session"),
+            dev_agent=object(),
+            _agent_initialized=True,
+            reset_count=0,
+        )
+        handler = HarnessInteractiveCommandHandler(emit_console=False)
+
+        assert (
+            _run_with_scheduler("/effort", handler=handler, scheduler=scheduler)
+            == "Current effort level: medium"
+        )
+
+        for effort in ("xhigh", "max"):
+            output = _run_with_scheduler(f"/effort {effort}", handler=handler, scheduler=scheduler)
+            status = _run_with_scheduler("/effort", handler=handler, scheduler=scheduler)
+            config_output = _run_with_scheduler("/config", handler=handler, scheduler=scheduler)
+
+            assert f"Set effort level to {effort}" in output
+            assert os.environ["KODER_REASONING_EFFORT"] == effort
+            assert status == f"Current effort level: {effort}"
+            assert f"reasoning_effort: {effort}" in config_output
+
+        auto_output = _run_with_scheduler("/effort auto", handler=handler, scheduler=scheduler)
+        status = _run_with_scheduler("/effort", handler=handler, scheduler=scheduler)
+        config_output = _run_with_scheduler("/config", handler=handler, scheduler=scheduler)
+
+        assert "Effort level reset to default: medium" in auto_output
+        assert "KODER_REASONING_EFFORT" not in os.environ
+        assert status == "Current effort level: medium"
+        assert "reasoning_effort: medium" in config_output
     finally:
         reset_config_manager()
 

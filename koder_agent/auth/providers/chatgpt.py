@@ -681,7 +681,7 @@ class ChatGPTOAuthLLM(CustomLLM):
                 reasoning_effort = "medium"
             elif reasoning_effort == "xhigh":
                 reasoning_effort = "high"
-            elif reasoning_effort not in ["medium", "high"]:
+            elif reasoning_effort not in ["medium", "high", "max"]:
                 reasoning_effort = "medium"
 
         if not supports_xhigh and reasoning_effort == "xhigh":

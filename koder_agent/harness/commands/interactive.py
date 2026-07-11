@@ -2618,24 +2618,29 @@ If verification fails because this skill's instructions are stale, ask before ed
 
         if args[0] in {"help", "-h", "--help"}:
             return (
-                "Usage: /effort [low|medium|high|auto]\n\n"
+                "Usage: /effort [low|medium|high|xhigh|max|auto]\n\n"
                 "Effort levels:\n"
                 "- low: Quick, straightforward implementation\n"
                 "- medium: Balanced approach with standard testing\n"
                 "- high: Comprehensive implementation with extensive testing\n"
-                "- auto: Use the default effort level for your model"
+                "- xhigh: Extra-high reasoning for especially difficult tasks\n"
+                "- max: Maximum reasoning for supported models\n"
+                "- auto: Reset to the default medium effort level"
             )
 
         desired = args[0]
         if desired == "auto":
-            config.model.reasoning_effort = None
+            config.model.reasoning_effort = "medium"
             manager.save(config)
             os.environ.pop("KODER_REASONING_EFFORT", None)
             agent_reloaded = await self._reset_scheduler_agent(_scheduler)
-            return f"Effort level set to auto\nsettings_path: {manager.config_path}\nagent_reloaded: {agent_reloaded}"
+            return f"Effort level reset to default: medium\nsettings_path: {manager.config_path}\nagent_reloaded: {agent_reloaded}"
 
-        if desired not in {"low", "medium", "high"}:
-            return f"Invalid argument: {desired}. Valid options are: low, medium, high, auto"
+        if desired not in {"low", "medium", "high", "xhigh", "max"}:
+            return (
+                f"Invalid argument: {desired}. "
+                "Valid options are: low, medium, high, xhigh, max, auto"
+            )
 
         config.model.reasoning_effort = desired
         manager.save(config)

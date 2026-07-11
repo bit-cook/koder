@@ -2,6 +2,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # Stub litellm before importing koder_agent to avoid optional dependency issues
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
@@ -12,6 +14,7 @@ project_root = Path(__file__).resolve().parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from koder_agent.harness.config.schema import RuntimeConfig
 from koder_agent.harness.config.service import RuntimeConfigService
 
 
@@ -49,3 +52,25 @@ def test_runtime_config_service_accepts_bare_yaml_off_for_reasoning_display(tmp_
     service = RuntimeConfigService(config_path)
 
     assert service.load().harness.reasoning_display == "off"
+
+
+def test_runtime_config_service_defaults_reasoning_effort_to_medium(tmp_path):
+    service = RuntimeConfigService(tmp_path / "missing.yaml")
+
+    assert service.load().model.reasoning_effort == "medium"
+
+
+def test_runtime_config_service_normalizes_null_reasoning_effort_to_medium(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model:\n  reasoning_effort: null\n", encoding="utf-8")
+
+    service = RuntimeConfigService(config_path)
+
+    assert service.load().model.reasoning_effort == "medium"
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_runtime_config_accepts_extended_reasoning_effort_levels(effort):
+    config = RuntimeConfig(model={"reasoning_effort": effort})
+
+    assert config.model.reasoning_effort == effort

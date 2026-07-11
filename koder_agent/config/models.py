@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ModelConfig(BaseModel):
@@ -43,14 +43,20 @@ class ModelConfig(BaseModel):
         default=None, description="Path to Vertex AI service account credentials JSON"
     )
 
-    # NEW: Reasoning effort setting
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = Field(
-        default=None,
+    # Reasoning effort setting
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = Field(
+        default="medium",
         description=(
-            "Reasoning effort for reasoning models (none, minimal, low, medium, high, or null to"
-            " not set)"
+            "Reasoning effort for reasoning models "
+            "(none, minimal, low, medium, high, xhigh, or max)"
         ),
     )
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _default_reasoning_effort(cls, value):
+        """Treat an explicit null the same as an omitted effort setting."""
+        return "medium" if value is None else value
 
 
 class CLIConfig(BaseModel):

@@ -187,7 +187,7 @@ Key environment variables:
 - `KODER_API_KEY` — Universal API key, overrides provider-specific keys.
 - `KODER_BASE_URL` — Custom API endpoint, overrides provider-specific base URLs.
 - `KODER_MODEL` — Model name, e.g. `gpt-4.1`, `claude-opus-4-20250514`, `github_copilot/gpt-5.1-codex`.
-- `KODER_REASONING_EFFORT` — Reasoning effort for reasoning models (`none`, `minimal`, `low`, `medium`, `high`).
+- `KODER_REASONING_EFFORT` — Reasoning effort for reasoning models (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 - `KODER_SMALL_MODEL` — Small/cheap model for auxiliary LLM calls (title generation, compaction).
 - `KODER_PERMISSION_MODE` — Permission mode override (`default`, `plan`, etc.).
 - Provider API keys: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`, `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, `OLLAMA_BASE_URL`, and other LiteLLM-supported provider variables.
