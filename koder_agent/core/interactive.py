@@ -23,7 +23,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import AppendAutoSuggestion, BeforeInput
@@ -70,9 +70,43 @@ VOICE_RECORDING_MESSAGE = "[voice] Recording... Press Space or Enter to stop."
 VOICE_TRANSCRIBING_MESSAGE = "[voice] Transcribing..."
 
 
+class _InputWindow(Window):
+    """Wrapping input window that keeps boundary cursors on screen."""
+
+    def _scroll_when_linewrapping(
+        self,
+        ui_content: UIContent,
+        width: int,
+        height: int,
+    ) -> None:
+        super()._scroll_when_linewrapping(ui_content, width, height)
+        if width <= 0 or height <= 0:
+            return
+
+        cursor = ui_content.cursor_position
+        line_height = ui_content.get_height_for_line(cursor.y, width, self.get_line_prefix)
+        if line_height <= height - self.scroll_offsets.top:
+            return
+
+        # prompt_toolkit 3.0.52 measures only text before the cursor. When the
+        # cursor starts a clipped wrapped row, that leaves vertical_scroll_2
+        # one row short and the renderer falls back to terminal coordinate 0,0.
+        cursor_height = ui_content.get_height_for_line(
+            cursor.y,
+            width,
+            self.get_line_prefix,
+            slice_stop=cursor.x + 1,
+        )
+        max_scroll = max(0, line_height - height)
+        self.vertical_scroll_2 = min(
+            max(self.vertical_scroll_2, cursor_height - height),
+            max_scroll,
+        )
+
+
 def _create_input_window(buffer_control: BufferControl) -> Window:
     """Create the wrapping prompt input window with a bounded visible height."""
-    return Window(
+    return _InputWindow(
         content=buffer_control,
         height=Dimension(min=1, max=MAX_INPUT_VISIBLE_LINES),
         wrap_lines=True,

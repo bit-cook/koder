@@ -15,6 +15,7 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit
 from prompt_toolkit.layout.controls import BufferControl
+from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.widgets import Frame
 
@@ -60,6 +61,7 @@ class _SizedDummyOutput(DummyOutput):
 class _RenderSnapshot:
     window_height: int
     cursor_y: int
+    screen_cursor_y: int
     displayed_lines: tuple[int, ...]
     vertical_scroll: int
     buffer_text: str
@@ -67,7 +69,9 @@ class _RenderSnapshot:
 
 async def _render_input(text: str, *, columns: int = 40) -> _RenderSnapshot:
     buffer = Buffer(document=Document(text=text, cursor_position=len(text)))
-    window = interactive._create_input_window(BufferControl(buffer=buffer))
+    window = interactive._create_input_window(
+        BufferControl(buffer=buffer, input_processors=[BeforeInput("> ")])
+    )
 
     with create_pipe_input() as pipe_input:
         with create_app_session(
@@ -85,9 +89,13 @@ async def _render_input(text: str, *, columns: int = 40) -> _RenderSnapshot:
                 else:
                     pytest.fail("input window did not render")
 
+                screen = app.renderer.last_rendered_screen
+                write_position = screen.visible_windows_to_write_positions[window]
+                screen_cursor = screen.get_cursor_position(window)
                 return _RenderSnapshot(
                     window_height=render_info.window_height,
                     cursor_y=render_info.cursor_position.y,
+                    screen_cursor_y=screen_cursor.y - write_position.ypos,
                     displayed_lines=tuple(render_info.displayed_lines),
                     vertical_scroll=render_info.vertical_scroll,
                     buffer_text=buffer.text,
@@ -147,6 +155,19 @@ async def test_long_logical_line_soft_wraps_without_changing_buffer_text() -> No
     assert set(snapshot.displayed_lines) == {0}
     assert snapshot.buffer_text == text
     assert "\n" not in snapshot.buffer_text
+
+
+@pytest.mark.asyncio
+async def test_capped_soft_wrap_keeps_cursor_visible_at_exact_boundary() -> None:
+    columns = 12
+    input_width = columns - 2  # Frame borders.
+    text = "x" * (input_width * interactive.MAX_INPUT_VISIBLE_LINES - len("> "))
+
+    snapshot = await _render_input(text, columns=columns)
+
+    assert snapshot.window_height == interactive.MAX_INPUT_VISIBLE_LINES
+    assert snapshot.cursor_y == snapshot.window_height - 1
+    assert snapshot.screen_cursor_y == snapshot.window_height - 1
 
 
 def _parsed_keys(sequence: str):
