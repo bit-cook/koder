@@ -1,6 +1,7 @@
 """Render-level tests for multiline interactive prompt input."""
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 
 import pytest
@@ -9,6 +10,8 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit
 from prompt_toolkit.layout.controls import BufferControl
@@ -16,6 +19,31 @@ from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.widgets import Frame
 
 from koder_agent.core import interactive
+from koder_agent.core.queued_input import QueuedInputManager
+
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _restore_prompt_toolkit_shift_enter_state():
+    """Keep prompt_toolkit's process-global parser tables isolated per test."""
+    from prompt_toolkit.input import ansi_escape_sequences, vt100_parser
+
+    sequence_table = ansi_escape_sequences.ANSI_SEQUENCES
+    prefix_cache = vt100_parser._IS_PREFIX_OF_LONGER_MATCH_CACHE
+    originals = {
+        sequence: sequence_table.get(sequence, _MISSING)
+        for sequence in interactive.SHIFT_ENTER_SEQUENCES
+    }
+    cached_prefixes = dict(prefix_cache)
+    yield
+    for sequence, original in originals.items():
+        if original is _MISSING:
+            sequence_table.pop(sequence, None)
+        else:
+            sequence_table[sequence] = original
+    prefix_cache.clear()
+    prefix_cache.update(cached_prefixes)
 
 
 class _SizedDummyOutput(DummyOutput):
@@ -119,3 +147,147 @@ async def test_long_logical_line_soft_wraps_without_changing_buffer_text() -> No
     assert set(snapshot.displayed_lines) == {0}
     assert snapshot.buffer_text == text
     assert "\n" not in snapshot.buffer_text
+
+
+def _parsed_keys(sequence: str):
+    key_presses = []
+    parser = Vt100Parser(key_presses.append)
+    parser.feed_and_flush(sequence)
+    return [key_press.key for key_press in key_presses]
+
+
+def test_shift_enter_registration_clears_cached_unknown_prefix() -> None:
+    from prompt_toolkit.input import ansi_escape_sequences, vt100_parser
+
+    csi_u = "\x1b[13;2u"
+    ansi_escape_sequences.ANSI_SEQUENCES.pop(csi_u, None)
+    vt100_parser._IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
+
+    assert _parsed_keys(csi_u) != [Keys.ControlJ]
+    assert vt100_parser._IS_PREFIX_OF_LONGER_MATCH_CACHE
+
+    assert interactive._register_shift_enter_sequences()
+    assert not vt100_parser._IS_PREFIX_OF_LONGER_MATCH_CACHE
+    assert _parsed_keys(csi_u) == [Keys.ControlJ]
+
+
+@pytest.mark.parametrize("sequence", interactive.SHIFT_ENTER_SEQUENCES)
+def test_shift_enter_sequences_map_to_existing_newline_chord(sequence: str) -> None:
+    assert interactive._register_shift_enter_sequences()
+    assert _parsed_keys(sequence) == [Keys.ControlJ]
+
+
+def test_shift_enter_registration_is_idempotent() -> None:
+    assert interactive._register_shift_enter_sequences()
+    assert interactive._register_shift_enter_sequences()
+
+
+def test_shift_enter_registration_fails_open_without_prefix_cache(monkeypatch) -> None:
+    from prompt_toolkit.input import vt100_parser
+
+    monkeypatch.delattr(vt100_parser, "_IS_PREFIX_OF_LONGER_MATCH_CACHE")
+    assert not interactive._register_shift_enter_sequences()
+
+
+def test_shift_enter_registration_rolls_back_when_cache_clear_fails(monkeypatch) -> None:
+    from prompt_toolkit.input import ansi_escape_sequences, vt100_parser
+
+    before = {
+        sequence: ansi_escape_sequences.ANSI_SEQUENCES.get(sequence, _MISSING)
+        for sequence in interactive.SHIFT_ENTER_SEQUENCES
+    }
+
+    class _FailingCache(dict):
+        def clear(self) -> None:
+            raise RuntimeError("cache clear failed")
+
+    monkeypatch.setattr(
+        vt100_parser,
+        "_IS_PREFIX_OF_LONGER_MATCH_CACHE",
+        _FailingCache(),
+    )
+
+    assert not interactive._register_shift_enter_sequences()
+    for sequence, original in before.items():
+        current = ansi_escape_sequences.ANSI_SEQUENCES.get(sequence, _MISSING)
+        if original is _MISSING:
+            assert current is _MISSING
+        else:
+            assert current == original
+
+
+async def _submit_prompt(*chunks: str, columns: int = 80) -> str:
+    prompt = interactive.InteractivePrompt(commands={})
+    output = _SizedDummyOutput(columns=columns)
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=output):
+            task = asyncio.create_task(prompt.get_input())
+            try:
+                await asyncio.sleep(0)
+                for chunk in chunks:
+                    pipe_input.send_text(chunk)
+                return await asyncio.wait_for(task, timeout=2)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+
+@pytest.mark.asyncio
+async def test_shift_enter_inserts_newline_and_plain_enter_submits() -> None:
+    result = await _submit_prompt(" first line", "\x1b[13;2u", "second line  \r")
+
+    assert result == "first line\nsecond line"
+
+
+@pytest.mark.asyncio
+async def test_plain_enter_still_submits_without_newline() -> None:
+    assert await _submit_prompt("single line\r") == "single line"
+
+
+@pytest.mark.asyncio
+async def test_soft_wrapped_submission_does_not_gain_newlines() -> None:
+    text = "soft-wrap-submit-" + "0123456789" * 12
+
+    result = await _submit_prompt(text + "\r", columns=24)
+
+    assert result == text
+    assert "\n" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newline_sequence", ("\n", "\x1b\r"))
+async def test_existing_newline_fallback_keys_still_work(newline_sequence: str) -> None:
+    result = await _submit_prompt("first", newline_sequence, "second\r")
+
+    assert result == "first\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_shift_enter_preserves_newline_in_streaming_queued_input() -> None:
+    prompt = interactive.InteractivePrompt(commands={})
+    manager = QueuedInputManager()
+    stop_event = asyncio.Event()
+
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=DummyOutput()):
+            task = asyncio.create_task(
+                prompt._run_input_app(queue_manager=manager, stop_event=stop_event)
+            )
+            try:
+                await asyncio.sleep(0)
+                pipe_input.send_text("queued first")
+                pipe_input.send_text("\x1b[27;2;13~")
+                pipe_input.send_text("queued second\r")
+
+                for _ in range(100):
+                    if manager.has_pending():
+                        break
+                    await asyncio.sleep(0.01)
+                assert manager.has_pending()
+            finally:
+                stop_event.set()
+                await asyncio.wait_for(task, timeout=2)
+
+    assert manager.drain_for_tool_result() == ["queued first\nqueued second"]

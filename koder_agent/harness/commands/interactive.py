@@ -618,7 +618,7 @@ Koder understands your codebase, edits files with your permission, and runs loca
 [bold]Shortcuts[/bold]
 ! for shell mode              Ctrl+C to cancel or exit          Ctrl+R for history search
 / for commands                Tab to cycle completions          Right/Tab to accept ghost text
-@ for file paths              Shift+Enter for newline           /keybindings to customize
+@ for file paths              Shift+Enter for newline           Ctrl+J/Alt+Enter fallback
 
 [bold]Available Slash Commands[/bold]
 /help      command guide        /status    runtime state        /skills    available skills

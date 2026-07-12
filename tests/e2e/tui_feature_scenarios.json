@@ -8666,6 +8666,172 @@
         }
       ]
     },
+    "multiline-input": {
+      "validation_level": "acceptance",
+      "purpose": "Validate soft-wrapped input and Shift+Enter newlines in idle and streaming queued-input modes.",
+      "env": {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19092/v1",
+        "KODER_API_KEY": "multiline-input-secret-token"
+      },
+      "fake_openai": {
+        "port": 19092,
+        "response": "multiline final response",
+        "log_file": "$HOME/fake-openai-multiline-input.log",
+        "ready_file": "$HOME/fake-openai-multiline-input.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.08,
+        "stream_lines": 160
+      },
+      "acceptance_criteria": [
+        "long idle and queued input visibly soft-wrap inside the prompt frame",
+        "both supported Shift+Enter encodings insert embedded newlines without early submission",
+        "plain Enter submits the complete idle or queued multiline prompt",
+        "slash completion still renders in the narrow viewport without a layout error"
+      ],
+      "acceptance_artifacts": [
+        "idle wrapped-input visible capture",
+        "queued wrapped-input visible capture",
+        "provider request log with adjacent escaped newline markers",
+        "narrow viewport slash-completion capture"
+      ],
+      "turns": [
+        {
+          "resize": {
+            "width": 72,
+            "height": 40
+          },
+          "capture": "visible",
+          "expect_all": [
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "Window too small",
+            "prompt_toolkit layout"
+          ]
+        },
+        {
+          "type": "idle-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-idle-wrap-omega",
+          "capture": "visible",
+          "expect_regex": [
+            "idle-wrap-alpha[^\\n]*\\n[^\\n]*idle-wrap-omega"
+          ],
+          "expect_not": [
+            "streaming fixture long line 001",
+            "Window too small"
+          ]
+        },
+        {
+          "raw_hex": "1b 5b 31 33 3b 32 75",
+          "capture": "visible",
+          "expect_all": [
+            "idle-wrap-alpha",
+            "idle-wrap-omega",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "streaming fixture long line 001",
+            "Window too small"
+          ]
+        },
+        {
+          "type": "idle-second-line",
+          "keys": [
+            "Enter"
+          ],
+          "capture": "visible",
+          "expect_all": [
+            "streaming fixture long line 050",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "Window too small",
+            "prompt_toolkit layout"
+          ],
+          "timeout": 8
+        },
+        {
+          "type": "queued-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-queued-wrap-omega",
+          "capture": "visible",
+          "expect_regex": [
+            "queued-wrap-alpha[^\\n]*\\n[^\\n]*queued-wrap-omega"
+          ],
+          "expect_not": [
+            "queued: queued-wrap-alpha",
+            "Window too small"
+          ],
+          "timeout": 4
+        },
+        {
+          "raw_hex": "1b 5b 32 37 3b 32 3b 31 33 7e",
+          "capture": "visible",
+          "expect_all": [
+            "queued-wrap-alpha",
+            "queued-wrap-omega",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "queued: queued-wrap-alpha",
+            "Window too small"
+          ]
+        },
+        {
+          "type": "queued-second-line",
+          "keys": [
+            "Enter"
+          ],
+          "capture": "visible",
+          "expect_all": [
+            "queued: queued-wrap-alpha",
+            "queued-second-line",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "Window too small",
+            "prompt_toolkit layout"
+          ],
+          "timeout": 8
+        },
+        {
+          "wait": 14,
+          "capture": "visible",
+          "expect_all": [
+            "multiline final response",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "queued: queued-wrap-alpha",
+            "Window too small"
+          ],
+          "timeout": 16
+        },
+        {
+          "type": "/sta",
+          "capture": "visible",
+          "expect_all": [
+            "/status",
+            "/statusline",
+            "| \u26a1 Koder |"
+          ],
+          "expect_not": [
+            "Window too small",
+            "prompt_toolkit layout"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$HOME/fake-openai-multiline-input.log",
+            [
+              "idle-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-idle-wrap-omega\\nidle-second-line",
+              "Queued user input",
+              "queued-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-queued-wrap-omega\\nqueued-second-line"
+            ]
+          ]
+        }
+      ]
+    },
     "terminal-resize-reflow": {
       "validation_level": "acceptance",
       "purpose": "Resize after Rich command output and while editing prompt input, verifying visible transcript reflow without layout errors.",

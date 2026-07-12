@@ -23,6 +23,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "tests" / "e2e" / "tui_feature_scenarios.json"
 VALIDATION_LEVELS = {"smoke", "workflow", "acceptance"}
+RAW_HEX_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2})(?:\s+[0-9a-fA-F]{2})*$")
 TURN_ASSERTION_KEYS = (
     "expect_any",
     "expect_all",
@@ -326,6 +327,10 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
             has_send = isinstance(turn.get("send"), str) and bool(turn["send"].strip())
             has_type = isinstance(turn.get("type"), str) and bool(turn["type"].strip())
             has_keys = isinstance(turn.get("keys"), list) and bool(turn["keys"])
+            raw_hex = turn.get("raw_hex")
+            has_raw_hex = isinstance(raw_hex, str) and bool(
+                RAW_HEX_PATTERN.fullmatch(raw_hex.strip())
+            )
             has_wait = isinstance(turn.get("wait"), (int, float))
             has_resize = isinstance(turn.get("resize"), dict)
             has_kill_tmux_pane = isinstance(turn.get("kill_tmux_pane_matching"), str) and bool(
@@ -336,6 +341,7 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                     has_send,
                     has_type,
                     has_keys,
+                    has_raw_hex,
                     has_wait,
                     has_resize,
                     has_kill_tmux_pane,
@@ -344,6 +350,11 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
             ):
                 errors.append(
                     f"{ref.suite}/{ref.name}: turn {index} needs an action or session-dead check"
+                )
+            if "raw_hex" in turn and not has_raw_hex:
+                errors.append(
+                    f"{ref.suite}/{ref.name}: turn {index} raw_hex needs space-separated "
+                    "two-digit hexadecimal octets"
                 )
             if has_resize:
                 resize = turn["resize"]
@@ -790,6 +801,24 @@ def _send_key_sequence(session: str, keys: list[str]) -> None:
         time.sleep(0.2)
 
 
+def _send_raw_hex(session: str, value: str) -> None:
+    """Send one uninterrupted sequence of hexadecimal terminal bytes."""
+    _tmux("send-keys", "-t", session, "-H", *value.split(), timeout=10)
+    time.sleep(0.2)
+
+
+def _dispatch_turn_input_actions(session: str, turn: dict[str, Any]) -> None:
+    """Dispatch text and key actions in deterministic terminal-input order."""
+    if turn.get("send"):
+        _send(session, turn["send"])
+    if turn.get("type"):
+        _type_text(session, turn["type"])
+    if turn.get("raw_hex"):
+        _send_raw_hex(session, turn["raw_hex"])
+    if turn.get("keys"):
+        _send_key_sequence(session, turn["keys"])
+
+
 def _resize_window(session: str, *, width: int, height: int) -> None:
     _tmux("resize-window", "-t", session, "-x", str(width), "-y", str(height), timeout=10)
     time.sleep(0.6)
@@ -874,12 +903,7 @@ def run_scenario(scenario: ScenarioRef, *, output_dir: Path) -> bool:
             fake_openai_proc = _start_fake_openai(scenario, home=home, repo=repo)
             session = _launch_session(home, repo, scenario)
             for index, turn in enumerate(scenario.payload["turns"], start=1):
-                if turn.get("send"):
-                    _send(session, turn["send"])
-                if turn.get("type"):
-                    _type_text(session, turn["type"])
-                if turn.get("keys"):
-                    _send_key_sequence(session, turn["keys"])
+                _dispatch_turn_input_actions(session, turn)
                 if turn.get("resize"):
                     resize = turn["resize"]
                     _resize_window(

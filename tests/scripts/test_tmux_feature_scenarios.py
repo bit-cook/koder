@@ -14,6 +14,16 @@ from scripts.tmux_feature_scenarios import (
     validate_manifest,
 )
 
+IDLE_FIRST = (
+    "idle-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-idle-wrap-omega"
+)
+IDLE_SECOND = "idle-second-line"
+QUEUED_FIRST = (
+    "queued-wrap-alpha-012345678901234567890123456789012345678901234567890123456789-"
+    "queued-wrap-omega"
+)
+QUEUED_SECOND = "queued-second-line"
+
 
 def test_tui_feature_scenario_manifest_covers_all_runtime_commands():
     manifest = _load_manifest(DEFAULT_MANIFEST)
@@ -30,6 +40,145 @@ def test_bottom_assertions_only_scan_the_visible_capture_tail():
 
     assert not _bottom_assertions_pass(capture, ["| ⚡ Koder |"], window=3)
     assert _bottom_assertions_pass(capture, ["status tail"], window=3)
+
+
+def test_raw_hex_turn_action_is_validated():
+    manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
+    turn = manifest["features"]["fixed-bottom-idle-tip"]["turns"][0]
+    turn.pop("send", None)
+    turn["raw_hex"] = "1b 5b 31 33 3b 32 75"
+
+    assert validate_manifest(manifest) == []
+
+    for invalid in ("", "1", "1b 5", 13):
+        invalid_manifest = copy.deepcopy(manifest)
+        invalid_manifest["features"]["fixed-bottom-idle-tip"]["turns"][0]["raw_hex"] = invalid
+        assert any("raw_hex" in error for error in validate_manifest(invalid_manifest))
+
+
+def test_send_raw_hex_uses_one_tmux_hex_call(monkeypatch):
+    calls = []
+
+    def fake_tmux(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(scenarios, "_tmux", fake_tmux)
+    monkeypatch.setattr(scenarios.time, "sleep", lambda _seconds: None)
+
+    scenarios._send_raw_hex("session", "1b 5b 31 33 3b 32 75")
+
+    assert calls == [
+        (
+            (
+                "send-keys",
+                "-t",
+                "session",
+                "-H",
+                "1b",
+                "5b",
+                "31",
+                "33",
+                "3b",
+                "32",
+                "75",
+            ),
+            {"timeout": 10},
+        )
+    ]
+
+
+def test_dispatch_turn_input_actions_orders_type_raw_hex_then_named_keys(monkeypatch):
+    actions = []
+    monkeypatch.setattr(
+        scenarios,
+        "_send",
+        lambda _session, value: actions.append(("send", value)),
+    )
+    monkeypatch.setattr(
+        scenarios,
+        "_type_text",
+        lambda _session, value: actions.append(("type", value)),
+    )
+    monkeypatch.setattr(
+        scenarios,
+        "_send_raw_hex",
+        lambda _session, value: actions.append(("raw_hex", value)),
+    )
+    monkeypatch.setattr(
+        scenarios,
+        "_send_key_sequence",
+        lambda _session, value: actions.append(("keys", value)),
+    )
+
+    scenarios._dispatch_turn_input_actions(
+        "session",
+        {
+            "type": "second line",
+            "raw_hex": "1b 5b 31 33 3b 32 75",
+            "keys": ["Enter"],
+        },
+    )
+
+    assert actions == [
+        ("type", "second line"),
+        ("raw_hex", "1b 5b 31 33 3b 32 75"),
+        ("keys", ["Enter"]),
+    ]
+
+
+def test_multiline_input_scenario_covers_idle_and_queued_shift_enter():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["multiline-input"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["env"] == {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19092/v1",
+        "KODER_API_KEY": "multiline-input-secret-token",
+    }
+    assert scenario["fake_openai"] == {
+        "port": 19092,
+        "response": "multiline final response",
+        "log_file": "$HOME/fake-openai-multiline-input.log",
+        "ready_file": "$HOME/fake-openai-multiline-input.ready",
+        "scenario": "streaming_tool_queue",
+        "stream_delay": 0.08,
+        "stream_lines": 160,
+    }
+    assert scenario["turns"][0]["resize"] == {"width": 72, "height": 40}
+    assert scenario["turns"][1]["type"] == IDLE_FIRST
+    assert scenario["turns"][1]["expect_regex"] == [
+        "idle-wrap-alpha[^\\n]*\\n[^\\n]*idle-wrap-omega"
+    ]
+    assert scenario["turns"][2]["raw_hex"] == "1b 5b 31 33 3b 32 75"
+    assert scenario["turns"][3]["type"] == IDLE_SECOND
+    assert scenario["turns"][3]["keys"] == ["Enter"]
+    assert scenario["turns"][4]["type"] == QUEUED_FIRST
+    assert scenario["turns"][4]["expect_regex"] == [
+        "queued-wrap-alpha[^\\n]*\\n[^\\n]*queued-wrap-omega"
+    ]
+    assert scenario["turns"][5]["raw_hex"] == "1b 5b 32 37 3b 32 3b 31 33 7e"
+    assert scenario["turns"][6]["type"] == QUEUED_SECOND
+    assert scenario["turns"][6]["keys"] == ["Enter"]
+    assert scenario["turns"][7]["wait"] == 14
+    assert "queued: queued-wrap-alpha" in scenario["turns"][7]["expect_not"]
+    assert scenario["turns"][8]["type"] == "/sta"
+    assert {"/status", "/statusline"} <= set(scenario["turns"][8]["expect_all"])
+    for turn in scenario["turns"]:
+        if turn.get("capture") == "visible":
+            assert "Window too small" in turn.get("expect_not", [])
+    assert scenario["post_assertions"] == [
+        {
+            "file_contains": [
+                "$HOME/fake-openai-multiline-input.log",
+                [
+                    f"{IDLE_FIRST}\\n{IDLE_SECOND}",
+                    "Queued user input",
+                    f"{QUEUED_FIRST}\\n{QUEUED_SECOND}",
+                ],
+            ]
+        }
+    ]
 
 
 def test_tui_feature_scenarios_are_multi_turn_and_not_placeholder_smoke_checks():

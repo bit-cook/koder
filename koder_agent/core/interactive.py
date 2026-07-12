@@ -55,6 +55,10 @@ MIN_COMPLETION_MENU_ROWS_WITH_STATUS = 12
 MIN_COMPLETION_MENU_ROWS_NO_STATUS = 10
 MAX_COMPLETION_MENU_VISIBLE_ROWS = 8
 MAX_INPUT_VISIBLE_LINES = 30
+SHIFT_ENTER_SEQUENCES = (
+    "\x1b[27;2;13~",  # xterm modifyOtherKeys.
+    "\x1b[13;2u",  # CSI-u / Kitty-style encoding.
+)
 MIN_STATUS_LINE_ROWS = 7
 INPUT_FRAME_ROWS = 3
 STATUS_LINE_HEIGHT = 1
@@ -74,6 +78,46 @@ def _create_input_window(buffer_control: BufferControl) -> Window:
         wrap_lines=True,
         dont_extend_height=True,
     )
+
+
+def _register_shift_enter_sequences() -> bool:
+    """Map distinguishable Shift+Enter encodings to the newline key action.
+
+    ``prompt_toolkit`` currently normalizes xterm's modified Enter sequence to
+    plain Enter and does not recognize the CSI-u form. Its sequence table and
+    prefix cache are internal APIs, so this compatibility hook must fail open:
+    Ctrl+J and Alt+Enter continue working even if those internals change.
+    """
+    try:
+        from prompt_toolkit.input import ansi_escape_sequences, vt100_parser
+        from prompt_toolkit.keys import Keys
+
+        sequence_table = ansi_escape_sequences.ANSI_SEQUENCES
+        prefix_cache = vt100_parser._IS_PREFIX_OF_LONGER_MATCH_CACHE
+        if not hasattr(sequence_table, "update") or not hasattr(prefix_cache, "clear"):
+            return False
+
+        missing = object()
+        originals = {
+            sequence: sequence_table.get(sequence, missing) for sequence in SHIFT_ENTER_SEQUENCES
+        }
+        replacement = Keys.ControlJ
+        try:
+            sequence_table.update({sequence: replacement for sequence in SHIFT_ENTER_SEQUENCES})
+            prefix_cache.clear()
+        except Exception:
+            try:
+                for sequence, original in originals.items():
+                    if original is missing:
+                        sequence_table.pop(sequence, None)
+                    else:
+                        sequence_table[sequence] = original
+            except Exception:
+                pass
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _should_show_status_line(*, rows: int) -> bool:
@@ -592,6 +636,7 @@ class InteractivePrompt:
         stream_output: StreamingOutputController | None = None,
     ) -> str | None:
         """Run the prompt application once, or continuously for queued input."""
+        _register_shift_enter_sequences()
         voice_message_visible = False
         queue_mode = queue_manager is not None
         initial_text = "" if queue_mode else self._next_input_text

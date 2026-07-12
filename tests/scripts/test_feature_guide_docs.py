@@ -6,6 +6,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FEATURES = ROOT / "docs" / "features.md"
 COMMANDS = ROOT / "docs" / "commands.md"
 README = ROOT / "README.md"
+INTERACTIVE_TUI = ROOT / "docs" / "interactive-tui.md"
+INTERACTIVE_COMMAND_SOURCE = ROOT / "koder_agent" / "harness" / "commands" / "interactive.py"
 
 TOPIC_GUIDES = [
     "docs/getting-started.md",
@@ -70,3 +72,12 @@ def test_command_reference_has_no_test_fixture_wording():
     for line in text.splitlines():
         if line.startswith("|"):
             assert not fixture_terms.search(line), line
+
+
+def test_multiline_shortcuts_name_shift_enter_and_fallbacks():
+    guide = INTERACTIVE_TUI.read_text(encoding="utf-8")
+    command_source = INTERACTIVE_COMMAND_SOURCE.read_text(encoding="utf-8")
+
+    assert "`Shift+Enter` (`Ctrl+J` or `Alt+Enter` fallback)" in guide
+    assert "Shift+Enter" in command_source
+    assert "Ctrl+J/Alt+Enter" in command_source

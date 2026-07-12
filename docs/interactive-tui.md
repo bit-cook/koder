@@ -15,7 +15,7 @@ Common controls:
 | Control | Action |
 |---|---|
 | `Enter` | Send the current prompt. |
-| `Ctrl+J` or `Alt+Enter` | Insert a newline for multi-line prompts. |
+| `Shift+Enter` (`Ctrl+J` or `Alt+Enter` fallback) | Insert a newline for multi-line prompts. |
 | `/` | Open slash-command completion. |
 | `@` | Mention files, agents, or MCP resources when available. |
 | `Ctrl+R` | Search prompt history. |
