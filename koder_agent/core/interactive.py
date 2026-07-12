@@ -28,6 +28,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import AppendAutoSuggestion, BeforeInput
 from prompt_toolkit.shortcuts import confirm
+from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame, SearchToolbar
 from rich.console import Console
 
@@ -73,6 +74,30 @@ VOICE_TRANSCRIBING_MESSAGE = "[voice] Transcribing..."
 class _InputWindow(Window):
     """Wrapping input window that keeps boundary cursors on screen."""
 
+    @staticmethod
+    def _wrapped_cursor_metrics(ui_content: UIContent, width: int) -> tuple[int, int]:
+        """Return the cursor row and rendered row count for its logical line."""
+        cursor = ui_content.cursor_position
+        cursor_row: int | None = None
+        row = 0
+        column = 0
+        x = 0
+
+        for style, text, *_ in ui_content.get_line(cursor.y):
+            if "[ZeroWidthEscape]" in style:
+                continue
+            for char in text:
+                char_width = get_cwidth(char)
+                if x + char_width > width:
+                    row += 1
+                    x = 0
+                if column == cursor.x:
+                    cursor_row = row
+                column += 1
+                x += char_width
+
+        return cursor_row if cursor_row is not None else row, row + 1
+
     def _scroll_when_linewrapping(
         self,
         ui_content: UIContent,
@@ -83,24 +108,24 @@ class _InputWindow(Window):
         if width <= 0 or height <= 0:
             return
 
-        cursor = ui_content.cursor_position
-        line_height = ui_content.get_height_for_line(cursor.y, width, self.get_line_prefix)
-        if line_height <= height - self.scroll_offsets.top:
+        # This input window uses BeforeInput for its prompt instead of a
+        # Window-level line prefix, so the transformed content contains every
+        # visible character needed to reproduce prompt_toolkit's copy loop.
+        if self.get_line_prefix is not None:
             return
 
-        # prompt_toolkit 3.0.52 measures only text before the cursor. When the
-        # cursor starts a clipped wrapped row, that leaves vertical_scroll_2
-        # one row short and the renderer falls back to terminal coordinate 0,0.
-        cursor_height = ui_content.get_height_for_line(
-            cursor.y,
-            width,
-            self.get_line_prefix,
-            slice_stop=cursor.x + 1,
-        )
-        max_scroll = max(0, line_height - height)
+        cursor_row, row_count = self._wrapped_cursor_metrics(ui_content, width)
+        if row_count <= height - self.scroll_offsets.top:
+            return
+
+        # prompt_toolkit 3.0.52 can under-scroll at an exact row boundary and
+        # under-count rows containing wide characters. Clamp its offset using
+        # the same character-by-character wrapping rule as Window._copy_body.
+        minimum_scroll = max(0, cursor_row - height + 1)
+        maximum_scroll = min(cursor_row, max(0, row_count - height))
         self.vertical_scroll_2 = min(
-            max(self.vertical_scroll_2, cursor_height - height),
-            max_scroll,
+            max(self.vertical_scroll_2, minimum_scroll),
+            maximum_scroll,
         )
 
 
