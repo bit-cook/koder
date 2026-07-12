@@ -179,6 +179,16 @@ async def test_capped_soft_wrap_keeps_wide_character_cursor_visible() -> None:
     assert snapshot.screen_cursor_y == snapshot.window_height - 1
 
 
+@pytest.mark.asyncio
+async def test_capped_wide_character_wrap_scrolls_past_prior_logical_line() -> None:
+    snapshot = await _render_input("x\n" + "a界" * 38, columns=6)
+
+    assert snapshot.window_height == interactive.MAX_INPUT_VISIBLE_LINES
+    assert snapshot.vertical_scroll == 1
+    assert snapshot.cursor_y == snapshot.window_height - 1
+    assert snapshot.screen_cursor_y == snapshot.window_height - 1
+
+
 def _parsed_keys(sequence: str):
     key_presses = []
     parser = Vt100Parser(key_presses.append)

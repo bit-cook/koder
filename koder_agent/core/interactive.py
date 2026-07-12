@@ -75,15 +75,19 @@ class _InputWindow(Window):
     """Wrapping input window that keeps boundary cursors on screen."""
 
     @staticmethod
-    def _wrapped_cursor_metrics(ui_content: UIContent, width: int) -> tuple[int, int]:
-        """Return the cursor row and rendered row count for its logical line."""
-        cursor = ui_content.cursor_position
+    def _wrapped_line_metrics(
+        ui_content: UIContent,
+        width: int,
+        lineno: int,
+        cursor_column: int | None = None,
+    ) -> tuple[int | None, int]:
+        """Return an optional cursor row and rendered rows for one logical line."""
         cursor_row: int | None = None
         row = 0
         column = 0
         x = 0
 
-        for style, text, *_ in ui_content.get_line(cursor.y):
+        for style, text, *_ in ui_content.get_line(lineno):
             if "[ZeroWidthEscape]" in style:
                 continue
             for char in text:
@@ -91,12 +95,12 @@ class _InputWindow(Window):
                 if x + char_width > width:
                     row += 1
                     x = 0
-                if column == cursor.x:
+                if cursor_column is not None and column == cursor_column:
                     cursor_row = row
                 column += 1
                 x += char_width
 
-        return cursor_row if cursor_row is not None else row, row + 1
+        return cursor_row, row + 1
 
     def _scroll_when_linewrapping(
         self,
@@ -114,19 +118,85 @@ class _InputWindow(Window):
         if self.get_line_prefix is not None:
             return
 
-        cursor_row, row_count = self._wrapped_cursor_metrics(ui_content, width)
-        if row_count <= height - self.scroll_offsets.top:
+        cursor = ui_content.cursor_position
+        metrics_cache: dict[int, tuple[int | None, int]] = {}
+
+        def line_metrics(lineno: int) -> tuple[int | None, int]:
+            if lineno not in metrics_cache:
+                metrics_cache[lineno] = self._wrapped_line_metrics(
+                    ui_content,
+                    width,
+                    lineno,
+                    cursor.x if lineno == cursor.y else None,
+                )
+            return metrics_cache[lineno]
+
+        cursor_row, cursor_line_height = line_metrics(cursor.y)
+        if cursor_row is None:
             return
 
         # prompt_toolkit 3.0.52 can under-scroll at an exact row boundary and
         # under-count rows containing wide characters. Clamp its offset using
         # the same character-by-character wrapping rule as Window._copy_body.
-        minimum_scroll = max(0, cursor_row - height + 1)
-        maximum_scroll = min(cursor_row, max(0, row_count - height))
-        self.vertical_scroll_2 = min(
-            max(self.vertical_scroll_2, minimum_scroll),
-            maximum_scroll,
+        if cursor_line_height > height - self.scroll_offsets.top:
+            self.vertical_scroll = cursor.y
+            minimum_scroll = max(0, cursor_row - height + 1)
+            maximum_scroll = min(cursor_row, max(0, cursor_line_height - height))
+            self.vertical_scroll_2 = min(
+                max(self.vertical_scroll_2, minimum_scroll),
+                maximum_scroll,
+            )
+            return
+
+        self.vertical_scroll_2 = 0
+
+        def line_height(lineno: int) -> int:
+            return line_metrics(lineno)[1]
+
+        used_height = 0
+        previous_lineno = cursor.y
+        minimum_vertical_scroll = cursor.y
+        for lineno in range(cursor.y, -1, -1):
+            used_height += line_height(lineno)
+            if used_height > height - self.scroll_offsets.bottom:
+                minimum_vertical_scroll = previous_lineno
+                break
+            previous_lineno = lineno
+        else:
+            minimum_vertical_scroll = 0
+
+        used_height = 0
+        previous_lineno = cursor.y
+        maximum_vertical_scroll = cursor.y
+        for lineno in range(cursor.y - 1, -1, -1):
+            used_height += line_height(lineno)
+            if used_height > self.scroll_offsets.top:
+                maximum_vertical_scroll = previous_lineno
+                break
+            previous_lineno = lineno
+        else:
+            maximum_vertical_scroll = previous_lineno
+
+        used_height = 0
+        previous_lineno = ui_content.line_count - 1
+        topmost_visible = previous_lineno
+        for lineno in range(ui_content.line_count - 1, -1, -1):
+            used_height += line_height(lineno)
+            if used_height > height:
+                topmost_visible = previous_lineno
+                break
+            previous_lineno = lineno
+        else:
+            topmost_visible = previous_lineno
+
+        self.vertical_scroll = max(
+            self.vertical_scroll,
+            min(topmost_visible, minimum_vertical_scroll),
         )
+        self.vertical_scroll = min(self.vertical_scroll, maximum_vertical_scroll)
+        if not self.allow_scroll_beyond_bottom():
+            self.vertical_scroll = min(self.vertical_scroll, topmost_visible)
+        self.vertical_scroll = max(0, self.vertical_scroll)
 
 
 def _create_input_window(buffer_control: BufferControl) -> Window:
