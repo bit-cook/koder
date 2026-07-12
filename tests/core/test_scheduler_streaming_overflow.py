@@ -16,10 +16,15 @@ streaming UI (which avoids Rich Live), asserting:
 * end-to-end, a streaming turn that overflows once compacts and re-runs once.
 """
 
+import io
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from agents import RawResponsesStreamEvent
+from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
+from rich.console import Console
+from rich.text import Text
 
 from koder_agent.harness.memory.auto_compact import AutoCompactManager
 
@@ -55,17 +60,38 @@ class _FakeStreamResult:
         return _gen()
 
 
+class _PartialThenErrorStreamResult:
+    """Stream one visible text delta before surfacing a provider error."""
+
+    final_output = None
+
+    async def stream_events(self):
+        yield RawResponsesStreamEvent(
+            data=ResponseTextDeltaEvent(
+                content_index=0,
+                delta="partial output before failure",
+                item_id="msg_1",
+                logprobs=[],
+                output_index=0,
+                sequence_number=1,
+                type="response.output_text.delta",
+            )
+        )
+        raise _GenericError("boom")
+
+
 class _FakeStreamingUI:
     """Minimal StreamingOutputUI so _handle_streaming avoids Rich Live."""
 
     def __init__(self):
         self.final_text = None
+        self.final_content = None
 
     def update_output(self, _renderable) -> None:
         pass
 
-    def set_final_content(self, _renderable) -> None:
-        pass
+    def set_final_content(self, renderable) -> None:
+        self.final_content = renderable
 
     def set_final_text(self, text: str) -> None:
         self.final_text = text
@@ -138,6 +164,35 @@ class TestHandleStreamingReRaisesOverflow:
                 result = await scheduler._handle_streaming("hi", streaming_ui=ui)
         assert "Execution error" in result
         assert scheduler._last_turn_errored is True
+
+    @pytest.mark.asyncio
+    async def test_non_overflow_error_preserves_partial_output_in_final_content(self):
+        """The fixed-bottom TUI must commit streamed output before the red error."""
+        with _patched_scheduler_env():
+            scheduler = _make_streaming_scheduler()
+            ui = _FakeStreamingUI()
+            with patch(
+                "koder_agent.core.scheduler.Runner.run_streamed",
+                return_value=_PartialThenErrorStreamResult(),
+            ):
+                result = await scheduler._handle_streaming("hi", streaming_ui=ui)
+
+        assert "Execution error: boom" in result
+        assert ui.final_content is not None
+
+        rendered = io.StringIO()
+        Console(file=rendered, force_terminal=False, width=120).print(ui.final_content)
+        assert "partial output before failure" in rendered.getvalue()
+        assert "Execution error: boom" in rendered.getvalue()
+        assert "Please provide new instructions." in rendered.getvalue()
+
+        error_lines = [
+            renderable
+            for renderable in ui.final_content.renderables
+            if isinstance(renderable, Text) and "Execution error: boom" in renderable.plain
+        ]
+        assert len(error_lines) == 1
+        assert error_lines[0].style == "red"
 
 
 class TestStreamingOverflowEndToEnd:

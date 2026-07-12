@@ -1255,12 +1255,24 @@ class AgentScheduler:
             # so automatic continuation cannot loop on the same failure.
             self._last_turn_errored = True
             error_msg = f"Execution error: {_format_execution_error(execution_error)}"
+            partial_content = display_manager.get_display_content()
+            error_renderables: list[Any] = []
+            if self._has_content(partial_content):
+                error_renderables.extend([partial_content, Text()])
+            error_renderables.extend(
+                [
+                    Text(error_msg, style="red"),
+                    Text(),
+                    Text("Please provide new instructions."),
+                ]
+            )
+            final_content = Group(*error_renderables)
             if streaming_ui is None:
-                console.print(f"[red]{error_msg}[/red]")
+                print()
+                print_reflowable(console, final_content)
+                print()
             else:
-                streaming_ui.set_final_text(
-                    f"[red]{error_msg}[/red]\n\nPlease provide new instructions."
-                )
+                streaming_ui.set_final_content(final_content)
             return f"{error_msg}\n\nPlease provide new instructions."
 
         # Handle cancellation case

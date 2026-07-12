@@ -288,11 +288,12 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                 scenario_name = fake_openai.get("scenario")
                 if scenario_name is not None and scenario_name not in {
                     "single",
+                    "streaming_tool_error",
                     "streaming_tool_queue",
                 }:
                     errors.append(
                         f"{ref.suite}/{ref.name}: fake_openai.scenario must be single "
-                        "or streaming_tool_queue"
+                        "or a supported streaming tool scenario"
                     )
                 stream_delay = fake_openai.get("stream_delay")
                 if stream_delay is not None and not isinstance(stream_delay, (int, float)):

@@ -8605,6 +8605,78 @@
         }
       ]
     },
+    "fixed-bottom-error-history": {
+      "validation_level": "acceptance",
+      "purpose": "Verify that a provider error after streamed text and a tool call preserves the completed TUI output above the returned prompt.",
+      "env": {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19093/v1",
+        "KODER_API_KEY": "fixed-bottom-error-secret-token"
+      },
+      "fake_openai": {
+        "port": 19093,
+        "response": "fixture stream failure",
+        "log_file": "$HOME/fake-openai-fixed-bottom-error.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-error.ready",
+        "scenario": "streaming_tool_error",
+        "stream_delay": 0.01,
+        "stream_lines": 2
+      },
+      "acceptance_criteria": [
+        "streamed assistant text remains visible after the provider error",
+        "the completed tool call remains visible before the error message",
+        "the execution error and recovery instruction render after prior output",
+        "the bottom prompt remains usable without clearing the failed turn"
+      ],
+      "acceptance_artifacts": [
+        "post-error visible capture containing streamed text, tool activity, error, and prompt",
+        "follow-up shell capture retaining the failed turn",
+        "fake provider request log proving the tool continuation reached the injected 400 response"
+      ],
+      "turns": [
+        {
+          "send": "Use the sample file tool before answering, then continue.",
+          "capture": "visible",
+          "expect_all": [
+            "streaming fixture line 1",
+            "streaming fixture line 2",
+            "read_file",
+            "Execution error",
+            "fixture stream failure",
+            "Please provide new instructions.",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ],
+          "timeout": 15
+        },
+        {
+          "send": "!echo tui-still-usable-after-error",
+          "capture": "visible",
+          "expect_all": [
+            "streaming fixture line 1",
+            "Execution error",
+            "tui-still-usable-after-error",
+            "| \u26a1 Koder |"
+          ],
+          "expect_bottom_all": [
+            "| \u26a1 Koder |"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_contains": [
+            "$HOME/fake-openai-fixed-bottom-error.log",
+            [
+              "Use the sample file tool before answering, then continue.",
+              "sample.txt"
+            ]
+          ]
+        }
+      ]
+    },
     "fixed-bottom-idle-tip": {
       "validation_level": "acceptance",
       "purpose": "Validate that a short response leaves the tip, input frame, and status line together at the bottom of the visible terminal.",

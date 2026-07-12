@@ -32,9 +32,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._write_log(body)
 
-        if self.scenario == "streaming_tool_queue":
+        if self.scenario in {"streaming_tool_queue", "streaming_tool_error"}:
             if not body.get("tools"):
                 self._send_json(self._chat_completion(body, self.response_text))
+                return
+            if self.scenario == "streaming_tool_error" and self._request_has_tool_output(body):
+                self._send_error(self.response_text)
                 return
             if body.get("stream"):
                 if self._request_has_tool_output(body):
@@ -208,6 +211,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_error(self, message: str) -> None:
+        encoded = json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": "input",
+                    "code": None,
+                }
+            }
+        ).encode("utf-8")
+        self.send_response(400)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def log_message(self, _format: str, *_args: Any) -> None:
         return
 
@@ -218,7 +238,11 @@ def main() -> None:
     parser.add_argument("--response", required=True)
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path, required=True)
-    parser.add_argument("--scenario", default="single", choices=["single", "streaming_tool_queue"])
+    parser.add_argument(
+        "--scenario",
+        default="single",
+        choices=["single", "streaming_tool_queue", "streaming_tool_error"],
+    )
     parser.add_argument("--stream-delay", type=float, default=0.0)
     parser.add_argument("--stream-lines", type=int, default=2)
     args = parser.parse_args()

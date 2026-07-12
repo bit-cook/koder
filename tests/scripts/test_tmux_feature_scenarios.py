@@ -4220,6 +4220,41 @@ def test_fixed_bottom_queued_input_scenario_uses_streaming_tool_fixture():
     ]
 
 
+def test_fixed_bottom_error_history_scenario_uses_failing_stream_fixture():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["fixed-bottom-error-history"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["env"] == {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19093/v1",
+        "KODER_API_KEY": "fixed-bottom-error-secret-token",
+    }
+    assert scenario["fake_openai"] == {
+        "port": 19093,
+        "response": "fixture stream failure",
+        "log_file": "$HOME/fake-openai-fixed-bottom-error.log",
+        "ready_file": "$HOME/fake-openai-fixed-bottom-error.ready",
+        "scenario": "streaming_tool_error",
+        "stream_delay": 0.01,
+        "stream_lines": 2,
+    }
+    first_turn = scenario["turns"][0]
+    assert first_turn["capture"] == "visible"
+    assert {
+        "streaming fixture line 1",
+        "streaming fixture line 2",
+        "read_file",
+        "Execution error",
+        "fixture stream failure",
+        "Please provide new instructions.",
+        "| ⚡ Koder |",
+    } <= set(first_turn["expect_all"])
+    second_turn = scenario["turns"][1]
+    assert second_turn["send"] == "!echo tui-still-usable-after-error"
+    assert {"streaming fixture line 1", "Execution error"} <= set(second_turn["expect_all"])
+
+
 def test_fixed_bottom_idle_tip_scenario_checks_tip_with_prompt():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["features"]["fixed-bottom-idle-tip"]
