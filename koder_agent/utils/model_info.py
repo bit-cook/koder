@@ -5,8 +5,18 @@ from typing import Optional
 
 import litellm
 
-# Default fallback context window size
-FALLBACK_CONTEXT_WINDOW_SIZE = 32000
+
+class UnknownModelContextWindowError(ValueError):
+    """Raised when no authoritative model context window is available."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        super().__init__(
+            f"Unknown context window for model '{model}'. Configure model.context_window "
+            "(or KODER_CONTEXT_WINDOW); auxiliary small models can use "
+            "model.small_model_context_window (or KODER_SMALL_MODEL_CONTEXT_WINDOW)."
+        )
+
 
 # Model aliases: short names → full model IDs
 # Updated to latest models as of 2026-04
@@ -92,7 +102,7 @@ def get_context_window_size(model: str, max_context_size: Optional[int] = None) 
     Priority:
     1. Custom max_context_size argument (if provided)
     2. LiteLLM's model registry (litellm.model_cost)
-    3. Fallback default (32000)
+    3. Fail closed for unknown/custom models
 
     Args:
         model: The model name/identifier
@@ -109,16 +119,17 @@ def get_context_window_size(model: str, max_context_size: Optional[int] = None) 
     for name in name_variants:
         try:
             context_size = litellm.model_cost[name]["max_input_tokens"]
-            return context_size
+            if isinstance(context_size, int) and context_size > 0:
+                return context_size
         except KeyError:
             continue
         except Exception:
             continue
 
-    return FALLBACK_CONTEXT_WINDOW_SIZE
+    raise UnknownModelContextWindowError(model)
 
 
-def get_maximum_output_tokens(model: str) -> int:
+def get_maximum_output_tokens(model: str, max_context_size: Optional[int] = None) -> int:
     """
     Get the maximum output tokens for a model.
 
@@ -131,7 +142,7 @@ def get_maximum_output_tokens(model: str) -> int:
     Returns:
         Maximum output tokens
     """
-    context_size = get_context_window_size(model)
+    context_size = get_context_window_size(model, max_context_size=max_context_size)
     max_output_tokens = floor(min(64000, context_size / 5))
 
     name_variants = get_model_name_variants_for_lookup(model)
@@ -147,7 +158,11 @@ def get_maximum_output_tokens(model: str) -> int:
     return max_output_tokens
 
 
-def get_summarization_threshold(model: str, threshold_ratio: float = 0.8) -> int:
+def get_summarization_threshold(
+    model: str,
+    threshold_ratio: float = 0.8,
+    max_context_size: Optional[int] = None,
+) -> int:
     """
     Get the token threshold at which context summarization should be triggered.
 
@@ -158,7 +173,7 @@ def get_summarization_threshold(model: str, threshold_ratio: float = 0.8) -> int
     Returns:
         Token count threshold for triggering summarization
     """
-    context_size = get_context_window_size(model)
+    context_size = get_context_window_size(model, max_context_size=max_context_size)
     return int(context_size * threshold_ratio)
 
 

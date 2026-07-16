@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -331,22 +332,6 @@ def _expand_path(value: str | Path) -> Path:
     return Path(text).expanduser().resolve()
 
 
-def _load_plugin_name(plugin_dir: Path) -> str | None:
-    from koder_agent.harness.plugins.manifest import find_manifest
-
-    manifest_path = find_manifest(plugin_dir)
-    if manifest_path is None:
-        return None
-    try:
-        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return None
-    name = manifest.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    return None
-
-
 class SkillLoader:
     """Loader for discovering and parsing skill definitions from SKILL.md files."""
 
@@ -430,6 +415,13 @@ class SkillLoader:
         body = body.lstrip("\n")
         base_dir = skill_path.parent
         body = self._resolve_paths(body, base_dir)
+        argument_hint_value = meta.get("argument-hint")
+        if isinstance(argument_hint_value, list):
+            argument_hint = "[" + " ".join(str(item) for item in argument_hint_value) + "]"
+        elif argument_hint_value is not None:
+            argument_hint = str(argument_hint_value)
+        else:
+            argument_hint = None
 
         return Skill(
             name=resolved_name,
@@ -443,13 +435,7 @@ class SkillLoader:
                 meta.get("disable-model-invocation"), default=False
             ),
             user_invocable=_parse_bool(meta.get("user-invocable"), default=True),
-            argument_hint=(
-                "[" + " ".join(str(item) for item in meta["argument-hint"]) + "]"
-                if isinstance(meta.get("argument-hint"), list)
-                else str(meta["argument-hint"])
-                if meta.get("argument-hint") is not None
-                else None
-            ),
+            argument_hint=argument_hint,
             argument_names=_parse_list(meta.get("arguments")),
             model=(
                 (
@@ -612,31 +598,49 @@ def _project_skill_dirs(cwd: Path) -> list[Path]:
     return dirs
 
 
-def _plugin_skill_dirs(plugin_root: Path) -> list[tuple[Path, str]]:
+@contextmanager
+def _plugin_skill_dirs(plugin_root: Path):
     """Return (dir, plugin_name) pairs for plugin skills and commands.
 
     Both ``skills/`` (SKILL.md inside subdirs) and ``commands/``
     (plain .md files — legacy format) are scanned.
     """
-    from koder_agent.harness.plugins.state import PluginStateStore
+    from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
+    from koder_agent.harness.plugins.path_safety import (
+        PluginPathError,
+        open_plugin_component,
+    )
 
     dirs: list[tuple[Path, str]] = []
-    if not plugin_root.exists():
-        return dirs
-    state_store = PluginStateStore(plugin_root / "state.json")
-    for plugin_dir in sorted(path for path in plugin_root.iterdir() if path.is_dir()):
-        plugin_name = _load_plugin_name(plugin_dir)
-        if not plugin_name:
-            continue
-        if not state_store.is_enabled(plugin_name):
-            continue
-        skills_dir = plugin_dir / "skills"
-        if skills_dir.is_dir():
-            dirs.append((skills_dir, plugin_name))
-        commands_dir = plugin_dir / "commands"
-        if commands_dir.is_dir():
-            dirs.append((commands_dir, plugin_name))
-    return dirs
+    try:
+        lifecycle = PluginLifecycleService(plugin_root)
+    except (OSError, ValueError):
+        yield dirs
+        return
+    with ExitStack() as stack:
+        for manifest, state in lifecycle.installed_plugins():
+            if not state.enabled:
+                continue
+            plugin_dir = lifecycle.resolve_plugin_target(manifest.name)
+            for declared, default, field_name in (
+                (manifest.skills, "skills", "skills"),
+                (manifest.commands, "commands", "commands"),
+            ):
+                try:
+                    component = stack.enter_context(
+                        open_plugin_component(
+                            plugin_dir,
+                            declared,
+                            default=default,
+                            field_name=field_name,
+                            expect="directory",
+                        )
+                    )
+                except PluginPathError:
+                    continue
+                if component is not None:
+                    dirs.append((component, manifest.name))
+        yield dirs
 
 
 def _additional_skill_dirs(additional_dirs: list[Path]) -> list[Path]:
@@ -796,11 +800,12 @@ def discover_merged_skills(
         for skill in SkillLoader(extra_dir).discover_skills(source="additional"):
             _merge_skill(merged, skill)
 
-    for skills_dir, plugin_name in _plugin_skill_dirs(resolved_plugin_root):
-        for skill in SkillLoader(skills_dir).discover_skills(
-            source="plugin", plugin_name=plugin_name
-        ):
-            _merge_skill(merged, skill)
+    with _plugin_skill_dirs(resolved_plugin_root) as plugin_skill_dirs:
+        for skills_dir, plugin_name in plugin_skill_dirs:
+            for skill in SkillLoader(skills_dir).discover_skills(
+                source="plugin", plugin_name=plugin_name
+            ):
+                _merge_skill(merged, skill)
 
     return merged
 
@@ -915,7 +920,7 @@ def _get_merged_skills() -> dict[str, Skill]:
 
 
 def _apply_skill_restrictions(skill: Skill) -> None:
-    """Apply a loaded skill's tool restrictions.
+    """Apply a loaded skill's turn-scoped tool and hook policy.
 
     Loading a skill only ADDS its restrictions (when it declares
     ``allowed_tools``). Loading an unrestricted skill is a NO-OP for
@@ -924,10 +929,9 @@ def _apply_skill_restrictions(skill: Skill) -> None:
     own sandbox just by loading any benign skill. ``clear_restrictions()``
     remains an explicit API for callers that genuinely need to reset state.
     """
-    from .skill_context import add_skill_restrictions
+    from .skill_context import activate_skill_policy
 
-    if skill.allowed_tools:
-        add_skill_restrictions(skill)
+    activate_skill_policy(skill)
 
 
 @function_tool

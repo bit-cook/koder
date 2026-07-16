@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,8 +20,13 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from koder_agent.harness.agents.definitions import AgentDefinition  # noqa: E402
-from koder_agent.harness.agents.service import AgentService  # noqa: E402
+from koder_agent.harness.agents.service import (  # noqa: E402
+    AgentService,
+    agent_definition_matches_record,
+    resolve_agent_record_origin,
+)
 from koder_agent.tools.plan_mode import _get_plan_service, _set_plan_service  # noqa: E402
+from koder_agent.tools.todo import get_todo_store  # noqa: E402
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -249,9 +255,16 @@ def test_agent_service_records_failure_summary(tmp_path, monkeypatch):
 
 def test_agent_service_can_resume_background_agent_with_same_session(tmp_path, monkeypatch):
     seen_session_ids: list[str] = []
+    seen_stores = []
 
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_session_ids.append(session_id)
+        store = get_todo_store()
+        seen_stores.append(store)
+        if prompt == "first task":
+            store.todos = [{"content": "persisted", "status": "pending", "id": "todo-1"}]
+        else:
+            assert store.todos[0]["content"] == "persisted"
         return f"result for {prompt}"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -279,6 +292,81 @@ def test_agent_service_can_resume_background_agent_with_same_session(tmp_path, m
         await service.wait(resumed.id)
         assert len(seen_session_ids) == 2
         assert seen_session_ids[0] == seen_session_ids[1]
+        assert seen_stores[0] is seen_stores[1]
+        assert seen_stores[0].identity.agent_id == record.id
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_isolates_concurrent_agents_with_same_definition(tmp_path, monkeypatch):
+    stores = {}
+
+    async def fake_execute(*, prompt, **_kwargs):
+        store = get_todo_store()
+        store.todos = [{"content": prompt, "status": "pending", "id": prompt}]
+        stores[prompt] = store
+        await asyncio.sleep(0)
+        assert store.todos[0]["content"] == prompt
+        return prompt
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+    )
+
+    async def run_case():
+        first, second = await asyncio.gather(
+            service.launch_background(
+                agent_definition=definition,
+                prompt="first",
+                description="First",
+            ),
+            service.launch_background(
+                agent_definition=definition,
+                prompt="second",
+                description="Second",
+            ),
+        )
+        await asyncio.gather(service.wait(first.id), service.wait(second.id))
+        assert stores["first"] is not stores["second"]
+        assert stores["first"].identity.agent_id == first.id
+        assert stores["second"].identity.agent_id == second.id
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_releases_todo_store_on_explicit_cleanup(tmp_path, monkeypatch):
+    seen_stores = []
+
+    async def fake_execute(**_kwargs):
+        seen_stores.append(get_todo_store())
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+    )
+
+    async def run_case():
+        record = await service.launch_background(
+            agent_definition=definition,
+            prompt="first",
+            description="First",
+        )
+        await service.wait(record.id)
+        original = seen_stores[0]
+        service.release_agent(record.id)
+        replacement = service._get_or_create_todo_store(record.id, record.session_id)
+        assert replacement is not original
+        assert replacement.todos == []
 
     asyncio.run(run_case())
 
@@ -511,8 +599,61 @@ def test_agent_service_can_reload_agent_record_from_disk(tmp_path, monkeypatch):
         )
         await service.wait(record.id)
         reloaded = AgentService.for_test(tmp_path)
-        assert reloaded.get(record.id).output_path == record.output_path
+        reloaded_record = reloaded.get(record.id)
+        assert reloaded_record.output_path == record.output_path
+        assert reloaded_record.origin_cwd == str(Path.cwd().resolve())
+        assert agent_definition_matches_record(reloaded_record, definition)
         assert Path(record.output_path).read_text(encoding="utf-8") == "persisted result"
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_rejects_tampered_origin_and_definition_on_resume(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    async def fake_execute(**_kwargs):
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="worker",
+        when_to_use="Does work",
+        system_prompt="Original worker.",
+        source="projectSettings",
+        filename="worker",
+        base_dir=str(project / ".koder" / "agents"),
+    )
+
+    async def run_case():
+        record = await service.launch_background(
+            agent_definition=definition,
+            prompt="first",
+            description="First",
+            cwd=project,
+        )
+        await service.wait(record.id)
+
+        changed_definition = AgentDefinition(
+            agent_type="worker",
+            when_to_use="Does work",
+            system_prompt="Malicious replacement.",
+            source="projectSettings",
+            filename="worker",
+            base_dir=str(project / ".koder" / "agents"),
+        )
+        with pytest.raises(ValueError, match="definition provenance"):
+            await service.resume_background(
+                agent_id=record.id,
+                agent_definition=changed_definition,
+                prompt="continue",
+                cwd=project,
+            )
+
+        service._agents[record.id] = replace(record, origin_cwd="../../tmp")
+        with pytest.raises(ValueError, match="must be absolute"):
+            resolve_agent_record_origin(service.get(record.id))
 
     asyncio.run(run_case())
 

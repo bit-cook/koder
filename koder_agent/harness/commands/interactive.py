@@ -28,7 +28,12 @@ from koder_agent.harness.add_dir_validation import (
     validate_directory_for_workspace,
 )
 from koder_agent.harness.agents.definitions import get_agent_definitions, resolve_agent_model
-from koder_agent.harness.agents.service import AgentService
+from koder_agent.harness.agents.service import (
+    AgentService,
+    agent_definition_matches_record,
+    resolve_agent_record_execution_cwd,
+    resolve_agent_record_origin,
+)
 from koder_agent.harness.agents.teams.context import TeamToolContext
 from koder_agent.harness.agents.teams.in_process import InProcessTeammateRunner
 from koder_agent.harness.agents.teams.runtime import (
@@ -59,12 +64,16 @@ from koder_agent.harness.commands.workflow_helpers import (
 )
 from koder_agent.harness.config.service import RuntimeConfigService
 from koder_agent.harness.hooks.runtime import (
-    active_skill_hooks,
     dispatch_command_hooks,
     list_configured_hooks,
+    resolve_hook_project_root,
 )
 from koder_agent.harness.memory.budget import estimate_messages_tokens, estimate_text_tokens
-from koder_agent.harness.memory.compact import compactable_session_items, llm_compact_messages
+from koder_agent.harness.memory.compact import (
+    build_compacted_session_items,
+    compactable_session_items,
+    llm_compact_messages,
+)
 from koder_agent.harness.output_styles import (
     discover_output_styles,
     find_output_style,
@@ -78,6 +87,12 @@ from koder_agent.harness.paths import (
 )
 from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.service import PermissionService
+from koder_agent.harness.permissions.tool_arguments import (
+    ToolArgumentError,
+    extract_canonical_tool_target,
+    normalize_tool_arguments,
+    permission_arguments_for_target,
+)
 from koder_agent.harness.plan.mode import PlanModeService
 from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
 from koder_agent.harness.plugins.registry import PluginRegistry
@@ -104,6 +119,7 @@ from koder_agent.harness.session_env import (
     load_session_env,
     set_session_env_var,
 )
+from koder_agent.harness.skills.bundled import is_trusted_bundled_skill
 from koder_agent.harness.statusline_settings import (
     resolve_statusline_config,
     update_user_statusline_config,
@@ -119,6 +135,7 @@ from koder_agent.harness.voice.service import (
 )
 from koder_agent.mcp.server_manager import MCPServerManager
 from koder_agent.tools.skill import SKILL_ADDITIONAL_DIRS_ENV, Skill, discover_merged_skills
+from koder_agent.tools.skill_context import skill_invocation_scope
 from koder_agent.utils import parse_session_dt
 from koder_agent.utils.client import get_model_name, get_provider_api_env_var, llm_completion
 from koder_agent.utils.model_info import get_context_window_size, resolve_model_alias
@@ -264,6 +281,7 @@ class HarnessInteractiveCommandHandler:
         teammate_mode: str | None = None,
         emit_console: bool = True,
         interactive_prompt=None,
+        mcp_owner_provider: Callable[[], object | None] | None = None,
     ):
         self.registry = registry or CommandRegistry.with_all_commands()
         self.task_service = task_service or TaskService.in_memory()
@@ -322,6 +340,7 @@ class HarnessInteractiveCommandHandler:
         self.emit_console = emit_console
         self._pending_input_text: str | None = None
         self.interactive_prompt = interactive_prompt
+        self._mcp_owner_provider = mcp_owner_provider
         self.commands: Dict[str, InteractiveCommand] = {
             "help": self._execute_help,
             "init": self._execute_init,
@@ -473,7 +492,9 @@ class HarnessInteractiveCommandHandler:
         # Add MCP prompt commands
         from koder_agent.mcp.prompts import get_prompt_registry
 
-        for prompt in get_prompt_registry().list_prompts():
+        owner = self._mcp_owner_provider() if self._mcp_owner_provider is not None else None
+        prompts = get_prompt_registry(owner).list_prompts() if owner is not None else []
+        for prompt in prompts:
             command_list.append(
                 (
                     prompt.command_name,
@@ -520,14 +541,27 @@ class HarnessInteractiveCommandHandler:
             return await self._show_command_selection()
 
         raw_command_name = parts[0]
+        exact_mcp_prompt = None
+        prompt_registry = None
+        if raw_command_name.startswith("mcp__"):
+            from koder_agent.mcp.prompts import get_prompt_registry
+
+            owner = getattr(scheduler, "_mcp_servers", None) if scheduler else None
+            if owner is not None:
+                prompt_registry = get_prompt_registry(owner)
+                exact_mcp_prompt = prompt_registry.get(raw_command_name)
         command_name = (
-            raw_command_name if raw_command_name in self.commands else raw_command_name.lower()
+            raw_command_name
+            if raw_command_name in self.commands or exact_mcp_prompt is not None
+            else raw_command_name.lower()
         )
-        if command_name not in self.commands:
+        if command_name not in self.commands and exact_mcp_prompt is None:
             command_name = self.command_aliases.get(command_name, command_name)
         args = parts[1:]
 
         if command_name not in self.commands:
+            if exact_mcp_prompt is not None:
+                return await self._execute_mcp_prompt(exact_mcp_prompt, scheduler, args)
             skills = self._user_visible_skills()
             if command_name in skills:
                 return await self._execute_dynamic_skill(skills[command_name], scheduler, args)
@@ -541,7 +575,10 @@ class HarnessInteractiveCommandHandler:
             if command_name.startswith("mcp__"):
                 from koder_agent.mcp.prompts import get_prompt_registry
 
-                prompt = get_prompt_registry().get(command_name)
+                owner = getattr(scheduler, "_mcp_servers", None) if scheduler else None
+                if prompt_registry is None and owner is not None:
+                    prompt_registry = get_prompt_registry(owner)
+                prompt = prompt_registry.get(command_name) if prompt_registry is not None else None
                 if prompt is not None:
                     return await self._execute_mcp_prompt(prompt, scheduler, args)
             available = ", ".join(self.commands.keys())
@@ -898,9 +935,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
             return None
         if hasattr(session, "get_color"):
             return await session.get_color()
-        session_id = getattr(session, "session_id", None)
-        if session_id is not None:
-            return await EnhancedSQLiteSession(session_id=str(session_id)).get_color()
         return None
 
     async def _set_session_color(self, scheduler, color: Optional[str]) -> None:
@@ -909,10 +943,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
             return
         if hasattr(session, "set_color"):
             await session.set_color(color)
-            return
-        session_id = getattr(session, "session_id", None)
-        if session_id is not None:
-            await EnhancedSQLiteSession(session_id=str(session_id)).set_color(color)
 
     async def _get_session_cwd(self, scheduler) -> Optional[str]:
         session = getattr(scheduler, "session", None) if scheduler is not None else None
@@ -920,9 +950,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
             return None
         if hasattr(session, "get_cwd"):
             return await session.get_cwd()
-        session_id = getattr(session, "session_id", None)
-        if session_id is not None:
-            return await EnhancedSQLiteSession(session_id=str(session_id)).get_cwd()
         return None
 
     async def _execute_session(self, scheduler, _args: list[str]) -> str:
@@ -938,8 +965,6 @@ Koder understands your codebase, edits files with your permission, and runs loca
         current_tag = None
         if hasattr(session, "get_tag"):
             current_tag = await session.get_tag()
-        elif getattr(session, "session_id", None) is not None:
-            current_tag = await EnhancedSQLiteSession(session_id=str(session.session_id)).get_tag()
         if current_tag:
             lines.append(f"tag: {current_tag}")
         current_color = await self._get_session_color(scheduler)
@@ -1268,39 +1293,57 @@ Koder understands your codebase, edits files with your permission, and runs loca
         return f"Reloaded {len(registry.list_names())} plugins."
 
     @staticmethod
-    def _extract_tool_argument_path(payload: object) -> str | None:
+    def _extract_tool_argument_path(tool_name: str, payload: object) -> str | None:
+        """Return a persisted call's canonical path, or ignore it fail-closed.
+
+        Transcript entries are untrusted persisted data. Malformed JSON,
+        non-object arguments, and ambiguous/wrong aliases contribute no path,
+        preventing a decoy alias from being displayed or read for token estimates.
+        """
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 return None
         if not isinstance(payload, dict):
             return None
-        for key in ("path", "file_path"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
+        try:
+            normalized = normalize_tool_arguments(tool_name, payload)
+        except ToolArgumentError:
+            return None
+        target = extract_canonical_tool_target(tool_name, normalized)
+        return target.strip() if isinstance(target, str) and target.strip() else None
 
     def _collect_context_file_paths_from_item(self, item: object) -> list[str]:
         if not isinstance(item, dict):
             return []
 
-        tracked_tools = {"read_file", "write_file", "edit_file"}
+        tracked_tools = {"read_file", "write_file", "edit_file", "notebook_edit"}
         collected: list[str] = []
+
+        def collect_path(tool_name: str, payload: object) -> None:
+            path = self._extract_tool_argument_path(tool_name, payload)
+            if path:
+                collected.append(path)
 
         item_type = item.get("type")
         item_name = item.get("name")
-        if item_type in {"function_call", "tool_called"} and item_name in tracked_tools:
-            path = self._extract_tool_argument_path(item.get("arguments") or item.get("tool_input"))
-            if path:
-                collected.append(path)
+        if (
+            item_type in {"function_call", "tool_called"}
+            and isinstance(item_name, str)
+            and item_name in tracked_tools
+        ):
+            collect_path(
+                item_name,
+                item["arguments"] if "arguments" in item else item.get("tool_input"),
+            )
 
         tool_name = item.get("tool_name")
         if isinstance(tool_name, str) and tool_name in tracked_tools:
-            path = self._extract_tool_argument_path(item.get("tool_input") or item.get("arguments"))
-            if path:
-                collected.append(path)
+            collect_path(
+                tool_name,
+                item["tool_input"] if "tool_input" in item else item.get("arguments"),
+            )
 
         tool_calls = item.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -1310,17 +1353,14 @@ Koder understands your codebase, edits files with your permission, and runs loca
                 function_payload = call.get("function")
                 if isinstance(function_payload, dict):
                     function_name = function_payload.get("name")
-                    if function_name in tracked_tools:
-                        path = self._extract_tool_argument_path(function_payload.get("arguments"))
-                        if path:
-                            collected.append(path)
+                    if isinstance(function_name, str) and function_name in tracked_tools:
+                        collect_path(function_name, function_payload.get("arguments"))
                 call_name = call.get("name")
-                if call_name in tracked_tools:
-                    path = self._extract_tool_argument_path(
-                        call.get("arguments") or call.get("tool_input")
+                if isinstance(call_name, str) and call_name in tracked_tools:
+                    collect_path(
+                        call_name,
+                        call["arguments"] if "arguments" in call else call.get("tool_input"),
                     )
-                    if path:
-                        collected.append(path)
 
         return collected
 
@@ -1904,7 +1944,84 @@ Koder understands your codebase, edits files with your permission, and runs loca
     async def _execute_memory(self, _scheduler, _args: list[str]) -> str:
         from pathlib import Path
 
+        from koder_agent.harness.memory.candidates import (
+            approve_candidate,
+            default_memory_candidate_store,
+            default_skill_candidate_store,
+            reject_candidate,
+        )
+        from koder_agent.harness.memory.governance import sanitize_text
         from koder_agent.harness.memory.memory_files import parse_memory_file
+
+        candidate_args = list(_args)
+        candidate_command = bool(candidate_args) and candidate_args[0] in {
+            "candidates",
+            "list",
+            "show",
+            "approve",
+            "reject",
+        }
+        if candidate_command:
+            if candidate_args[0] == "candidates":
+                candidate_args = candidate_args[1:]
+            memory_store = default_memory_candidate_store()
+            skill_store = default_skill_candidate_store()
+            action = candidate_args[0] if candidate_args else "list"
+            if action == "list":
+                candidates = memory_store.list() + skill_store.list()
+                if not candidates:
+                    return "memory candidates: none pending"
+                lines = [f"memory candidates: {len(candidates)} pending"]
+                for candidate in sorted(candidates, key=lambda item: (item.created_at, item.id)):
+                    description = sanitize_text(candidate.payload.get("description") or "")
+                    lines.append(
+                        f"- {candidate.id} kind={candidate.kind} state={candidate.state} "
+                        f"scope={candidate.storage_scope} "
+                        f"origin_project={sanitize_text(candidate.origin_project_root)} "
+                        f"origin_session={sanitize_text(candidate.origin_session_id)} "
+                        f"description={description}"
+                    )
+                return "\n".join(lines)
+            if len(candidate_args) != 2:
+                return "Usage: /memory candidates | /memory show|approve|reject <candidate-id>"
+            candidate_id = candidate_args[1]
+            try:
+                if action == "show":
+                    candidate = memory_store.get(candidate_id) or skill_store.get(candidate_id)
+                    if candidate is None:
+                        return f"memory candidate not found: {candidate_id}"
+                    return (
+                        f"memory candidate {candidate.id}\n"
+                        f"kind: {candidate.kind}\n"
+                        f"state: {candidate.state}\n"
+                        f"storage_scope: {candidate.storage_scope}\n"
+                        f"origin_project_root: {sanitize_text(candidate.origin_project_root)}\n"
+                        f"origin_session_id: {sanitize_text(candidate.origin_session_id)}\n"
+                        + json.dumps(
+                            candidate.payload, indent=2, sort_keys=True, ensure_ascii=False
+                        )
+                    )
+                if action == "approve":
+                    result = approve_candidate(
+                        candidate_id,
+                        memory_store=memory_store,
+                        skill_store=skill_store,
+                        skill_draft_dir=Path.home() / ".koder" / "skill-drafts",
+                    )
+                    noun = "memory candidate" if result.kind == "memory" else "skill draft"
+                    return f"{noun} approved\nstatus: {result.status}\npath: {result.output_path}"
+                if reject_candidate(
+                    candidate_id,
+                    memory_store=memory_store,
+                    skill_store=skill_store,
+                ):
+                    return f"candidate rejected: {candidate_id}"
+                return f"memory candidate not pending: {candidate_id}"
+            except (KeyError, ValueError) as exc:
+                return f"memory candidate error: {exc}"
+
+        if _args:
+            return "Usage: /memory [candidates|show|approve|reject <candidate-id>]"
 
         memory_dirs = [
             Path.cwd() / ".koder" / "memory",
@@ -2328,6 +2445,12 @@ If verification fails because this skill's instructions are stale, ask before ed
             memories = metadata.get("memories_written")
             if memories is not None:
                 parts.append(f"memories={memories}")
+            memory_candidates = metadata.get("memory_candidates_staged")
+            if memory_candidates is not None:
+                parts.append(f"memory_candidates={memory_candidates}")
+            skill_candidates = metadata.get("skill_candidates_staged")
+            if skill_candidates is not None:
+                parts.append(f"skill_candidates={skill_candidates}")
             errors = metadata.get("errors")
             if isinstance(errors, list) and errors:
                 parts.append(f"errors={len(errors)}")
@@ -2345,12 +2468,7 @@ If verification fails because this skill's instructions are stale, ask before ed
             target = " ".join(_args[2:]).strip()
             if len(target) >= 2 and target[0] == target[-1] and target[0] in {'"', "'"}:
                 target = target[1:-1]
-            if tool_name in {"run_shell", "run_powershell"}:
-                arguments = {"command": target}
-            elif tool_name in {"read_file", "write_file", "edit_file"}:
-                arguments = {"path": target}
-            else:
-                arguments = {"target": target}
+            arguments = permission_arguments_for_target(tool_name, target)
             result = await self.permission_service.evaluate_tool_call_async(
                 tool_name,
                 arguments,
@@ -2813,6 +2931,21 @@ If verification fails because this skill's instructions are stale, ask before ed
             action=action,
         )
 
+    @staticmethod
+    async def _replace_runtime_session_items(scheduler, session, items: list[dict]) -> None:
+        """Await an exact history replacement for the passed runtime session."""
+        scheduler_replace = getattr(scheduler, "_replace_session_items", None)
+        if callable(scheduler_replace):
+            await scheduler_replace(items)
+            return
+
+        session_replace = getattr(session, "replace_items", None)
+        if callable(session_replace):
+            await session_replace(items)
+            return
+
+        raise RuntimeError("Session does not support exact history replacement")
+
     async def _execute_compact(self, scheduler, _args: list[str]) -> str:
         if _args:
             return "Usage: /compact"
@@ -2846,31 +2979,21 @@ If verification fails because this skill's instructions are stale, ask before ed
         final_count = len(items)
         context_after = context_before
         original_dict_items = [item for item in items if isinstance(item, dict)]
-        compacted_items = (
-            [
-                {
-                    "role": "user",
-                    "content": f"[Conversation compacted]\n\n{result.summary}",
-                },
-                *result.kept_messages,
-            ]
-            if result.summary
-            else result.kept_messages
-        )
+        compacted_items = build_compacted_session_items(result)
         should_persist = bool(result.summary) or compacted_items != original_dict_items
-        if should_persist and hasattr(session, "clear_session") and hasattr(session, "add_items"):
-            cleared_session = False
+        if should_persist and hasattr(scheduler, "_active_todo_preserved_message"):
+            todo_message = scheduler._active_todo_preserved_message()
+            if todo_message is not None:
+                instruction_count = sum(
+                    item.get("role") in {"system", "developer"} for item in result.kept_messages
+                )
+                insert_at = instruction_count + (1 if result.summary else 0)
+                compacted_items = (
+                    compacted_items[:insert_at] + [todo_message] + compacted_items[insert_at:]
+                )
+        if should_persist:
             try:
-                await session.clear_session()
-                cleared_session = True
-                saved_threshold = getattr(session, "summarization_threshold", None)
-                if hasattr(session, "summarization_threshold"):
-                    session.summarization_threshold = 2**31
-                try:
-                    await session.add_items(compacted_items)
-                finally:
-                    if hasattr(session, "summarization_threshold"):
-                        session.summarization_threshold = saved_threshold
+                await self._replace_runtime_session_items(scheduler, session, compacted_items)
                 final_count = len(await session.get_items())
                 if hasattr(scheduler, "refresh_context_usage_from_session"):
                     context_after = await scheduler.refresh_context_usage_from_session(
@@ -2881,19 +3004,6 @@ If verification fails because this skill's instructions are stale, ask before ed
                 persisted = True
             except Exception as exc:
                 persistence_error = str(exc)
-                if cleared_session:
-                    try:
-                        await session.clear_session()
-                        await session.add_items(compactable_items)
-                        final_count = len(await session.get_items())
-                        if hasattr(scheduler, "refresh_context_usage_from_session"):
-                            context_after = await scheduler.refresh_context_usage_from_session(
-                                compactable_items
-                            )
-                        else:
-                            context_after = estimate_messages_tokens(compactable_items)
-                    except Exception as restore_exc:
-                        persistence_error = f"{persistence_error}; restore_error: {restore_exc}"
         dispatch_command_hooks(
             cwd=Path.cwd(),
             event_name="PostCompact",
@@ -2974,7 +3084,7 @@ If verification fails because this skill's instructions are stale, ask before ed
     _REWIND_MODES = {"conversation", "code", "both"}
     _REWIND_USAGE = "Usage: /rewind [number] [conversation|code|both]"
 
-    async def _execute_rewind(self, _scheduler, _args: list[str]) -> str:
+    async def _execute_rewind(self, scheduler, _args: list[str]) -> str:
         self._pending_input_text = None
 
         # Parse optional [number] and [mode] in any order.
@@ -2994,9 +3104,9 @@ If verification fails because this skill's instructions are stale, ask before ed
             except ValueError:
                 return self._REWIND_USAGE
 
-        if _scheduler is None or not hasattr(_scheduler, "session"):
+        if scheduler is None or not hasattr(scheduler, "session"):
             return "Rewind requires an active session."
-        session = _scheduler.session
+        session = scheduler.session
         if not hasattr(session, "get_items"):
             return "Rewind requires a session with stored conversation history."
 
@@ -3047,9 +3157,7 @@ If verification fails because this skill's instructions are stale, ask before ed
         if mode in {"conversation", "both"}:
             kept_items = items[:selected_index]
             removed_count = len(items) - selected_index
-            await session.clear_session()
-            if kept_items:
-                await session.add_items(kept_items)
+            await self._replace_runtime_session_items(scheduler, session, kept_items)
             self._pending_input_text = selected_prompt
             result_lines.append(f"Rewound conversation to prompt {selection}.")
             result_lines.append(f"Removed transcript items: {removed_count}")
@@ -3134,6 +3242,119 @@ If verification fails because this skill's instructions are stale, ask before ed
         return "\n".join(lines)
 
     async def _execute_hooks(self, scheduler, _args: list[str]) -> str:
+        from koder_agent.harness.hooks.project_approval import (
+            approve_project_hooks,
+            canonical_project_hooks_payload,
+            load_project_hook_settings,
+            project_hooks_approval_error,
+            project_hooks_digest,
+            revoke_project_hooks,
+        )
+
+        project_root = resolve_hook_project_root(Path.cwd())
+        action = _args[0].lower() if _args else "list"
+        if action in {"review", "approve", "revoke"}:
+            settings_by_source = load_project_hook_settings(project_root)
+            payload = canonical_project_hooks_payload(settings_by_source)
+            payload_data = json.loads(payload)
+            digest = project_hooks_digest(settings_by_source)
+            approval_error = project_hooks_approval_error(project_root, settings_by_source)
+            status = "approved" if approval_error is None else f"not approved: {approval_error}"
+            source_paths = {
+                "project_settings": project_root / ".koder" / "settings.json",
+                "local_settings": project_root / ".koder" / "settings.local.json",
+            }
+            has_executable_payload = bool(payload_data.get("sources"))
+
+            def review_lines(*, heading: str = "Project hook approval review") -> list[str]:
+                lines = [
+                    heading,
+                    f"project: {project_root}",
+                    f"status: {status}",
+                    f"digest: {digest}",
+                    "sources:",
+                ]
+                present_sources = [
+                    source for source in source_paths if source in settings_by_source
+                ]
+                if present_sources:
+                    lines.extend(
+                        f"  - {source}: {source_paths[source]}" for source in present_sources
+                    )
+                else:
+                    lines.append("  - none")
+                lines.extend(
+                    [
+                        "exact executable payload:",
+                        json.dumps(payload_data, ensure_ascii=False, indent=2, sort_keys=True),
+                    ]
+                )
+                return lines
+
+            if action == "review":
+                if len(_args) != 1:
+                    return "Usage: /hooks review"
+                lines = review_lines()
+                if has_executable_payload:
+                    lines.extend(
+                        [
+                            "",
+                            "Approve this exact payload from an interactive Koder session with:",
+                            f"/hooks approve {digest}",
+                            "The full digest is required; hook changes require a new review and approval.",
+                        ]
+                    )
+                else:
+                    lines.extend(["", "No project or local executable hook payload to approve."])
+                return "\n".join(lines)
+
+            if action == "approve":
+                if len(_args) != 2:
+                    return "Usage: /hooks approve <full-sha256-from-/hooks-review>"
+                if scheduler is None or self.interactive_prompt is None:
+                    return "\n".join(
+                        [
+                            "Hook approval denied: approval is only available in a live interactive Koder session.",
+                            "Run `uv run koder`, then use `/hooks review` and `/hooks approve <full-sha256>`.",
+                        ]
+                    )
+                if not has_executable_payload:
+                    return "No project or local executable hook payload to approve."
+                requested_digest = _args[1]
+                if requested_digest != digest:
+                    return "\n".join(
+                        [
+                            "Hook approval denied: the supplied digest does not match the current payload.",
+                            f"current_digest: {digest}",
+                            "Run /hooks review and approve the full current digest.",
+                        ]
+                    )
+                approve_project_hooks(
+                    project_root,
+                    settings_by_source,
+                    expected_digest=requested_digest,
+                )
+                lines = review_lines(heading="Project hook payload approved")
+                lines[2] = "status: approved"
+                lines.append("Future executable hook changes will require reapproval.")
+                return "\n".join(lines)
+
+            if len(_args) != 1:
+                return "Usage: /hooks revoke"
+            removed = revoke_project_hooks(project_root)
+            if removed:
+                return "\n".join(
+                    [
+                        "Project hook approval revoked.",
+                        f"project: {project_root}",
+                        "Project and local hooks are now blocked until explicitly reapproved.",
+                    ]
+                )
+            return f"No project hook approval existed for {project_root}."
+
+        if action != "list" or len(_args) > 1:
+            return "Usage: /hooks [review|approve <full-sha256>|revoke]"
+
         listings = list_configured_hooks(Path.cwd())
         lines = []
         if scheduler is not None and hasattr(scheduler, "hooks"):
@@ -3142,6 +3363,7 @@ If verification fails because this skill's instructions are stale, ask before ed
             lines.append("hooks: configured")
         if not listings:
             lines.append("No hooks configured.")
+            lines.append("Use /hooks review to inspect project/local hook trust payloads.")
             return "\n".join(lines)
         lines.append(f"count: {len(listings)}")
         for listing in listings:
@@ -3154,6 +3376,7 @@ If verification fails because this skill's instructions are stale, ask before ed
                 f"- {listing.event}: {listing.command or '(non-command hook)'} "
                 f"[{', '.join(suffix)}]"
             )
+        lines.append("Use /hooks review to inspect the exact project/local approval payload.")
         return "\n".join(lines)
 
     async def _execute_vim(self, _scheduler, _args: list[str]) -> str:
@@ -4577,27 +4800,36 @@ If verification fails because this skill's instructions are stale, ask before ed
                 return "fork: usage /fork --resume <agent_id> <prompt>"
             agent_id = args[1]
             prompt = " ".join(args[2:]).strip()
-            definitions = getattr(_scheduler, "agent_definitions", None) or get_agent_definitions(
-                cwd=Path.cwd(),
+            record = self.agent_service.get(agent_id)
+            try:
+                origin_cwd = resolve_agent_record_origin(record)
+                execution_cwd = resolve_agent_record_execution_cwd(record)
+            except ValueError as exc:
+                return f"fork: cannot resume {agent_id}: {exc}"
+            definitions = get_agent_definitions(
+                cwd=origin_cwd,
                 plugin_root=self.plugin_root,
                 cli_agents_json=self.cli_agents_json,
             )
-            record = self.agent_service.get(agent_id)
             selected = next(
                 (
                     candidate
                     for candidate in definitions.active_agents
                     if candidate.agent_type == record.profile
+                    and agent_definition_matches_record(record, candidate)
                 ),
                 None,
             )
             if selected is None:
-                return f"fork: cannot resume unknown agent type {record.profile}"
+                return (
+                    "fork: cannot resume because the original agent definition "
+                    f"is missing or changed: {record.profile}"
+                )
             resumed = await self.agent_service.resume_background(
                 agent_id=agent_id,
                 agent_definition=selected,
                 prompt=prompt,
-                cwd=record.worktree_path or Path.cwd(),
+                cwd=execution_cwd,
             )
             effective_permission_mode = (
                 record.permission_mode or selected.permission_mode or "default"
@@ -5306,8 +5538,8 @@ If verification fails because this skill's instructions are stale, ask before ed
         )
         prompt = skill.render_prompt(args, session_id=session_id)
 
-        with active_skill_hooks(skill.name, skill.hooks, skill.base_dir):
-            if skill.name == "remember":
+        with skill_invocation_scope(skill):
+            if is_trusted_bundled_skill(skill, "remember"):
                 return await self._execute_remember_skill(arguments_text)
             if skill.execution_context == "fork":
                 definitions = get_agent_definitions(

@@ -69,9 +69,9 @@ class ConfigManager:
             with open(self.config_path, "r") as f:
                 data = yaml.safe_load(f) or {}
             data = _migrate_legacy_voice_fields(data)
-            from koder_agent.harness.config.schema import RuntimeConfig
+            from koder_agent.harness.config.schema import parse_runtime_config_source
 
-            self._config = RuntimeConfig(**data)
+            self._config = parse_runtime_config_source(data)
         else:
             from koder_agent.harness.config.schema import RuntimeConfig
 

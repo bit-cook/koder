@@ -1,8 +1,13 @@
+import os
 import types
+from pathlib import Path
 
 import pytest
 
-from koder_agent.harness.sandbox.backend import SandboxExecutionContext
+from koder_agent.harness.sandbox.backend import (
+    SandboxBackendCapabilities,
+    SandboxExecutionContext,
+)
 from koder_agent.harness.sandbox.policy import SandboxPolicy
 from koder_agent.harness.sandbox.registry import (
     BACKEND_IDS,
@@ -153,7 +158,7 @@ def test_hosted_backend_status_reports_missing_credentials(backend_id, monkeypat
             "e2b",
             {"E2B_API_KEY": "e2b-token", "KODER_SANDBOX_E2B_TYPE": "custom-type"},
             {},
-            {"sandbox_type": "custom-type"},
+            {"sandbox_type": "custom-type", "allow_internet_access": True},
         ),
         (
             "modal",
@@ -196,6 +201,45 @@ def test_docker_backend_options_are_constructed(monkeypatch):
     assert options.kwargs == {"image": "python:test"}
 
 
+@pytest.mark.parametrize(
+    ("network_access", "expected"),
+    ((False, False), (True, True)),
+)
+def test_e2b_network_access_is_wired_to_sdk_option(network_access, expected, monkeypatch):
+    _patch_backend_module(monkeypatch, "e2b")
+    policy = SandboxPolicy(
+        mode="workspace-write",
+        backend="e2b",
+        network_access=network_access,
+    )
+
+    _, options = create_backend_client_and_options("e2b", policy=policy)
+
+    assert options.kwargs["allow_internet_access"] is expected
+
+
+def test_e2b_capabilities_do_not_claim_domain_filtering(monkeypatch):
+    from koder_agent.harness.sandbox import registry
+
+    _patch_backend_module(monkeypatch, "e2b")
+    monkeypatch.setenv("E2B_API_KEY", "e2b-token")
+
+    status = registry.get_backend_status("e2b")
+
+    assert status.capabilities.supports_network_policy == "enforced"
+    assert status.capabilities.supports_domain_policy == "unsupported"
+
+
+@pytest.mark.parametrize("backend_id", ("docker", *HOSTED_BACKENDS))
+def test_current_backends_do_not_claim_workspace_sync_for_autoapproval(backend_id):
+    spec = get_backend_spec(backend_id)
+    assert spec is not None
+
+    assert spec.capabilities.supports_workspace_isolation != "enforced"
+    assert spec.capabilities.supports_repository_sync != "enforced"
+    assert spec.capabilities.supports_protected_paths != "enforced"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend_id", HOSTED_BACKENDS)
 async def test_hosted_backend_uses_generic_sdk_adapter(backend_id, tmp_path, monkeypatch):
@@ -207,6 +251,7 @@ async def test_hosted_backend_uses_generic_sdk_adapter(backend_id, tmp_path, mon
         available = True
         reason = "available"
         unavailable_reasons = ()
+        capabilities = SandboxBackendCapabilities()
 
     class FakeExecResult:
         stdout = b"hosted-ok"
@@ -237,7 +282,7 @@ async def test_hosted_backend_uses_generic_sdk_adapter(backend_id, tmp_path, mon
     monkeypatch.setattr(
         sdk_backend,
         "create_backend_client_and_options",
-        lambda requested: (FakeClient(), f"options:{requested}"),
+        lambda requested, *, policy: (FakeClient(), f"options:{requested}"),
     )
 
     result = await sdk_backend.execute_with_sdk_backend(
@@ -250,17 +295,71 @@ async def test_hosted_backend_uses_generic_sdk_adapter(backend_id, tmp_path, mon
             background=False,
             session_id=None,
             policy=SandboxPolicy(mode="workspace-write", backend=backend_id),
+            degradation_approved=True,
         )
     )
 
     assert result.sandboxed is True
+    assert result.created is True
+    assert result.executed is True
     assert result.backend_id == backend_id
     assert result.stdout == "hosted-ok"
+    expected_root = "/workspace" if backend_id == "cloudflare" else str(tmp_path)
     assert calls == [
-        f"create:{tmp_path}:options:{backend_id}",
+        f"create:{expected_root}:options:{backend_id}",
         "exec:printf hosted-ok:5:True",
         "delete:FakeSession",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_id", ("docker", *HOSTED_BACKENDS))
+async def test_live_backend_workspace_scope_and_repository_sync_contract(backend_id, tmp_path):
+    """Any future capability claim must pass the live workspace contract."""
+
+    spec = get_backend_spec(backend_id)
+    assert spec is not None
+    capabilities = spec.capabilities
+    if not (
+        capabilities.supports_workspace_isolation == "enforced"
+        and capabilities.supports_repository_sync == "enforced"
+    ):
+        pytest.skip(f"{backend_id} is intentionally ineligible for auto-approval")
+    if os.environ.get("KODER_RUN_LIVE_SANDBOX_TESTS") != "1":
+        pytest.skip("set KODER_RUN_LIVE_SANDBOX_TESTS=1 for credential-gated smoke tests")
+
+    from koder_agent.harness.sandbox.sdk_backend import execute_with_sdk_backend
+
+    status = get_backend_status(backend_id)
+    if not status.available:
+        pytest.skip(status.reason)
+    (tmp_path / "AGENTS.md").write_text("# live contract\n", encoding="utf-8")
+    outside_marker = "/tmp/koder-sandbox-live-outside-workspace"
+    Path(outside_marker).unlink(missing_ok=True)
+    result = await execute_with_sdk_backend(
+        SandboxExecutionContext(
+            cwd=tmp_path,
+            repo_root=tmp_path,
+            command=(
+                "test -f AGENTS.md && touch backend-roundtrip.txt && "
+                f"if touch {outside_marker}; then exit 42; fi"
+            ),
+            env={},
+            timeout=30,
+            background=False,
+            session_id=None,
+            policy=SandboxPolicy(
+                mode="workspace-write",
+                backend=backend_id,
+                network_access=True,
+            ),
+            degradation_approved=True,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert (tmp_path / "backend-roundtrip.txt").exists()
+    assert not Path(outside_marker).exists()
 
 
 def test_registry_still_covers_user_facing_backend_matrix():

@@ -393,21 +393,26 @@ async def test_shell_output_and_kill_invalid_shell_id():
 
 async def test_scheduler_cleanup_terminates_background_shells():
     """AgentScheduler.cleanup performs background shell cleanup via BackgroundShellManager."""
-    cmd = _make_long_sleep_command(5)
+    from koder_agent.tools.todo import reset_todo_context, set_todo_context
 
-    result = await run_shell.on_invoke_tool(
-        None,
-        json.dumps(
-            {
-                "command": cmd,
-                "run_in_background": True,
-            }
-        ),
-    )
+    cmd = _make_long_sleep_command(5)
+    scheduler = AgentScheduler(session_id="test-shell-cleanup", streaming=False)
+    todo_token = set_todo_context(scheduler.todo_store)
+    try:
+        result = await run_shell.on_invoke_tool(
+            None,
+            json.dumps(
+                {
+                    "command": cmd,
+                    "run_in_background": True,
+                }
+            ),
+        )
+    finally:
+        reset_todo_context(todo_token)
     shell_id = _parse_shell_id(result)
     assert shell_id in BackgroundShellManager.get_available_ids()
 
-    scheduler = AgentScheduler(session_id="test-shell-cleanup", streaming=False)
     await scheduler.cleanup()
 
     assert shell_id not in BackgroundShellManager.get_available_ids()

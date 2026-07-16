@@ -84,11 +84,14 @@ koder mcp add api --transport http --url http://localhost:8000 --header "Authori
 koder mcp list
 koder mcp get filesystem
 koder mcp remove filesystem --scope project
+koder mcp approve
 koder mcp reset-project-choices
 koder mcp serve
 ```
 
 MCP configuration can live in user, project, or local scopes depending on the command flags. Use project scope when the server is part of the repository workflow; use user scope for personal tools.
+
+Repository-controlled MCP definitions, including inline `mcpServers` in project agent frontmatter, are fail-closed until reviewed. Run `koder mcp approve` to inspect each source path, fixed execution directory, server target, and current expanded-configuration digest, then approve it interactively. Use `--source PATH` to limit the review or `--yes` only after reviewing the displayed source. Changes to the source, workspace root, execution directory, or environment-expanded values require a new approval. Approval records contain only paths, the decision, and digests—not expanded secrets.
 
 See [Configuration Guide](configuration.md) for the YAML config format.
 

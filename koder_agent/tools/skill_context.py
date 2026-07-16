@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
+
+from agents import RunHooks
 
 if TYPE_CHECKING:
     from .skill import Skill
@@ -39,6 +42,12 @@ if TYPE_CHECKING:
 # Context variable to track active skill restrictions (async-safe)
 _active_restrictions: ContextVar[Optional["SkillRestrictions"]] = ContextVar(
     "active_skill_restrictions", default=None
+)
+_active_skill_invocation: ContextVar[object | None] = ContextVar(
+    "active_skill_invocation", default=None
+)
+_active_skill_run_state: ContextVar[Optional["_SkillRunState"]] = ContextVar(
+    "active_skill_run_state", default=None
 )
 
 # Substrings that indicate command/process substitution. A pattern like
@@ -281,6 +290,52 @@ class SkillRestrictions:
         self.allowed_tools.update(tools)
 
 
+@dataclass(frozen=True)
+class _SkillActivationBatch:
+    """Skill activation calls from one Runner model-response batch."""
+
+    activation_call_ids: frozenset[str]
+
+    def blocks(self, tool_name: str, call_id: str | None) -> bool:
+        if not self.activation_call_ids:
+            return False
+        if tool_name == "get_skill" and str(call_id or "") in self.activation_call_ids:
+            return False
+        # An activation batch must fail closed if the SDK reconstructs a call
+        # without preserving the expected call metadata.
+        return True
+
+
+@dataclass
+class _SkillRunState:
+    """Runner-local activation state inherited by that Runner's tool tasks."""
+
+    response: Any | None = None
+
+    def bind_response(self, response: Any) -> None:
+        """Bind the latest response for tool-call policy checks."""
+        self.response = response
+
+    def effective_batch(self) -> _SkillActivationBatch | None:
+        """Refresh from the final response output and return its tool-call batch."""
+        if self.response is None:
+            return None
+        return self._refresh_batch()
+
+    def _refresh_batch(self) -> _SkillActivationBatch:
+        calls = [
+            item
+            for item in getattr(self.response, "output", [])
+            if getattr(item, "type", None) == "function_call"
+        ]
+        activation_call_ids = frozenset(
+            str(getattr(item, "call_id", "") or "")
+            for item in calls
+            if getattr(item, "name", None) == "get_skill"
+        )
+        return _SkillActivationBatch(activation_call_ids=activation_call_ids)
+
+
 def get_active_restrictions() -> Optional[SkillRestrictions]:
     """Get the currently active skill restrictions.
 
@@ -288,6 +343,22 @@ def get_active_restrictions() -> Optional[SkillRestrictions]:
         SkillRestrictions instance if restrictions are active, None otherwise
     """
     return _active_restrictions.get()
+
+
+def get_skill_activation_block_message(
+    tool_name: str,
+    call_id: str | None,
+) -> str | None:
+    """Return a model-visible rejection when activation and work share a batch."""
+    state = _active_skill_run_state.get()
+    batch = state.effective_batch() if state is not None else None
+    if batch is None or not batch.blocks(tool_name, call_id):
+        return None
+    return (
+        f"Tool '{tool_name}' was not executed because this model response also requested "
+        "get_skill. Skill activation must complete before sibling tools can run; call this "
+        "tool again in the next model step."
+    )
 
 
 def clear_restrictions() -> None:
@@ -300,7 +371,7 @@ def clear_restrictions() -> None:
     _active_restrictions.set(None)
 
 
-def begin_skill_restriction_scope() -> Token:
+def begin_skill_restriction_scope(skill: "Skill | None" = None) -> Token:
     """Seed a persistent restrictions container at the current (run-loop) scope.
 
     The scheduler MUST call this before ``Runner.run`` so that skill restrictions
@@ -316,9 +387,31 @@ def begin_skill_restriction_scope() -> Token:
     every other tool task under the same parent observes the mutation. This
     mirrors ``set_tool_permission_context`` / ``set_goal_context``.
 
+    Nested scopes inherit a snapshot of the current restrictions. This is needed
+    for manual ``/<skill>`` invocation: the command activates the skill before
+    calling ``scheduler.handle()``, and the scheduler then seeds the SDK run-loop
+    without discarding that policy. A snapshot keeps additions made by nested
+    model-loaded skills local to the nested run while retaining union semantics
+    inside it.
+
+    Args:
+        skill: Optional manually-invoked skill to activate in the new scope.
+
     Returns a token for :func:`reset_skill_restriction_scope`.
     """
-    return _active_restrictions.set(SkillRestrictions())
+    current = _active_restrictions.get()
+    seeded = (
+        SkillRestrictions(
+            loaded_skills=list(current.loaded_skills),
+            allowed_tools=set(current.allowed_tools),
+        )
+        if current is not None
+        else SkillRestrictions()
+    )
+    token = _active_restrictions.set(seeded)
+    if skill is not None:
+        add_skill_restrictions(skill)
+    return token
 
 
 def reset_skill_restriction_scope(token: Token) -> None:
@@ -329,6 +422,125 @@ def reset_skill_restriction_scope(token: Token) -> None:
         # Token created in a different context (e.g. across task boundaries);
         # best-effort clear instead.
         _active_restrictions.set(None)
+
+
+@contextmanager
+def skill_restriction_scope(
+    skill: "Skill | None" = None,
+) -> Iterator[SkillRestrictions]:
+    """Backward-compatible alias for the unified skill invocation scope."""
+    with skill_invocation_scope(skill) as restrictions:
+        yield restrictions
+
+
+@contextmanager
+def skill_invocation_scope(
+    skill: "Skill | None" = None,
+) -> Iterator[SkillRestrictions]:
+    """Own restrictions and dynamic hooks for one logical scheduler turn.
+
+    Nested users join the existing mutable scope instead of creating a
+    continuation-local snapshot. This lets manual slash skills, model-loaded
+    skills, hidden goal continuations, and forked agents share one policy and
+    one cleanup boundary.
+    """
+    if _active_skill_invocation.get() is not None:
+        if skill is not None:
+            activate_skill_policy(skill)
+        restrictions = _active_restrictions.get()
+        assert restrictions is not None
+        yield restrictions
+        return
+
+    from koder_agent.harness.hooks.runtime import (
+        begin_skill_hook_scope,
+        reset_skill_hook_scope,
+    )
+
+    restriction_token = begin_skill_restriction_scope()
+    hook_token = begin_skill_hook_scope()
+    invocation_token = _active_skill_invocation.set(object())
+    try:
+        if skill is not None:
+            activate_skill_policy(skill)
+        restrictions = _active_restrictions.get()
+        assert restrictions is not None
+        yield restrictions
+    finally:
+        try:
+            _active_skill_invocation.reset(invocation_token)
+        finally:
+            try:
+                reset_skill_hook_scope(hook_token)
+            finally:
+                reset_skill_restriction_scope(restriction_token)
+
+
+class SkillPolicyRunHooks(RunHooks):
+    """Run-hook wrapper that establishes batch policy before tool execution."""
+
+    def __init__(self, state: _SkillRunState, wrapped_hooks: RunHooks | None = None):
+        self.state = state
+        self.wrapped_hooks = wrapped_hooks
+
+    def __getattr__(self, name: str) -> Any:
+        if self.wrapped_hooks is None:
+            raise AttributeError(name)
+        return getattr(self.wrapped_hooks, name)
+
+    async def on_llm_start(self, context, agent, system_prompt, input_items) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_llm_start(context, agent, system_prompt, input_items)
+
+    async def on_llm_end(self, context, agent, response) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_llm_end(context, agent, response)
+        # Bind after the wrapped hook because it may mutate or reconstruct
+        # response.output. The state also retains the response reference so the
+        # guardrail can refresh after concurrently-running agent hooks finish.
+        self.state.bind_response(response)
+
+    async def on_agent_start(self, context, agent) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_agent_start(context, agent)
+
+    async def on_agent_end(self, context, agent, output) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_agent_end(context, agent, output)
+
+    async def on_handoff(self, context, from_agent, to_agent) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_handoff(context, from_agent, to_agent)
+
+    async def on_tool_start(self, context, agent, tool) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_tool_start(context, agent, tool)
+
+    async def on_tool_end(self, context, agent, tool, result) -> None:
+        if self.wrapped_hooks is not None:
+            await self.wrapped_hooks.on_tool_end(context, agent, tool, result)
+
+
+@contextmanager
+def skill_run_scope(hooks: RunHooks | None = None) -> Iterator[SkillPolicyRunHooks]:
+    """Seed one tool-capable SDK run and wrap its hooks with the batch barrier."""
+    with skill_invocation_scope():
+        if isinstance(hooks, SkillPolicyRunHooks):
+            hooks = hooks.wrapped_hooks
+        state = _SkillRunState()
+        state_token = _active_skill_run_state.set(state)
+        try:
+            yield SkillPolicyRunHooks(state, hooks)
+        finally:
+            _active_skill_run_state.reset(state_token)
+
+
+def activate_skill_policy(skill: "Skill") -> None:
+    """Add one skill's allowed-tool union and hooks to the active turn."""
+    from koder_agent.harness.hooks.runtime import register_skill_hooks
+
+    add_skill_restrictions(skill)
+    register_skill_hooks(skill.name, skill.hooks, skill.base_dir)
 
 
 def add_skill_restrictions(skill: "Skill") -> None:

@@ -168,8 +168,23 @@ async def run_security_review(*, cwd: Path | None = None) -> str:
     if not context.diff_content.strip():
         return "security-review: no pending changes to review."
 
-    review = await llm_completion(build_security_review_messages(context))
-    review_text = review.strip()
+    completion = await llm_completion(
+        build_security_review_messages(context),
+        overflow_policy="truncate",
+        return_metadata=True,
+    )
+    if isinstance(completion, str):  # Backwards-compatible test doubles.
+        review_text = completion.strip()
+        truncation = None
+    else:
+        review_text = completion.text.strip()
+        truncation = completion.truncation
+    if truncation is not None:
+        review_text = (
+            "security-review input warning: the model received explicitly truncated input "
+            f"({truncation.original_input_tokens} -> {truncation.sent_input_tokens} tokens).\n\n"
+            f"{review_text}"
+        )
     if review_text:
         return review_text
     return "security-review: model returned an empty review."

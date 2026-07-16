@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from koder_agent.harness.permissions.tool_arguments import (
+    ToolArgumentError,
+    normalize_tool_arguments,
+)
 from koder_agent.tools.file import edit_file, read_file, write_file
 
 from .registry import ToolRegistry, ToolSpec, build_tool_result
@@ -30,7 +34,11 @@ async def _invoke_decorated_tool(name: str, tool, payload: dict[str, Any]) -> di
 
 
 async def invoke_read_file(arguments: dict[str, Any]) -> dict[str, Any]:
-    file_path = _require_argument(arguments, "file_path") or _require_argument(arguments, "path")
+    try:
+        arguments = normalize_tool_arguments("read_file", arguments)
+    except ToolArgumentError as exc:
+        return build_tool_result("read_file", f"Invalid arguments: {exc}", status="error")
+    file_path = _require_argument(arguments, "path")
     if not file_path:
         return build_tool_result(
             "read_file", "Missing required argument: file_path", status="error"
@@ -44,7 +52,11 @@ async def invoke_read_file(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def invoke_write_file(arguments: dict[str, Any]) -> dict[str, Any]:
-    file_path = _require_argument(arguments, "file_path") or _require_argument(arguments, "path")
+    try:
+        arguments = normalize_tool_arguments("write_file", arguments)
+    except ToolArgumentError as exc:
+        return build_tool_result("write_file", f"Invalid arguments: {exc}", status="error")
+    file_path = _require_argument(arguments, "path")
     content = arguments.get("content")
     if not file_path:
         return build_tool_result(
@@ -57,7 +69,11 @@ async def invoke_write_file(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def invoke_edit_file(arguments: dict[str, Any]) -> dict[str, Any]:
-    file_path = _require_argument(arguments, "file_path") or _require_argument(arguments, "path")
+    try:
+        arguments = normalize_tool_arguments("edit_file", arguments)
+    except ToolArgumentError as exc:
+        return build_tool_result("edit_file", f"Invalid arguments: {exc}", status="error")
+    file_path = _require_argument(arguments, "path")
     if not file_path:
         return build_tool_result(
             "edit_file", "Missing required argument: file_path", status="error"
@@ -90,6 +106,11 @@ async def invoke_edit_file(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_tools(registry: ToolRegistry) -> None:
-    registry.register(ToolSpec(name="read_file", invoke=invoke_read_file, category="file"))
-    registry.register(ToolSpec(name="write_file", invoke=invoke_write_file, category="file"))
-    registry.register(ToolSpec(name="edit_file", invoke=invoke_edit_file, category="file"))
+    registry.register_many(
+        [
+            ToolSpec(name="read_file", invoke=invoke_read_file, category="file"),
+            ToolSpec(name="write_file", invoke=invoke_write_file, category="file"),
+            ToolSpec(name="edit_file", invoke=invoke_edit_file, category="file"),
+        ],
+        source=__name__,
+    )

@@ -71,6 +71,15 @@ def test_parser_parses_config_validate():
     assert args.config_action == "validate"
 
 
+def test_parser_parses_mcp_approve():
+    parser = _build_cli_parser("mcp")
+    args = parser.parse_args(["mcp", "approve", "--source", ".mcp.json", "--yes"])
+    assert args.command == "mcp"
+    assert args.mcp_action == "approve"
+    assert args.source == [".mcp.json"]
+    assert args.yes is True
+
+
 def test_parser_parses_auth_status_json():
     parser = _build_cli_parser("auth")
     args = parser.parse_args(["auth", "status", "--json"])

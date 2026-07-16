@@ -204,8 +204,11 @@ async def test_sandbox_execution_surfaces_network_non_enforcement(tmp_path, monk
         policy=policy,
     )
     result = await execute_with_sdk_backend(context)
-    assert result.sandboxed is True
-    assert "network policy is NOT enforced" in result.stderr
+    assert result.sandboxed is False
+    assert result.created is False
+    assert result.executed is False
+    assert "network access disabled" in (result.reason or "")
+    assert "networkAccess=false is not enforced" in (result.reason or "")
 
 
 # --- Finding #5: interpreter payloads don't silently pass -------------------
@@ -319,7 +322,14 @@ def test_sandboxed_exec_path_uses_env_allowlist(monkeypatch, tmp_path):
     monkeypatch.setattr(se, "is_excluded_command", lambda *_a, **_k: False)
     monkeypatch.setattr(se, "execute_with_sdk_backend", _fake_backend)
 
-    asyncio.run(se.execute_shell_command("echo hi", timeout=5, session_id=None))
+    asyncio.run(
+        se.execute_shell_command(
+            "echo hi",
+            timeout=5,
+            session_id=None,
+            sandbox_unavailable_approval=lambda _reason: True,
+        )
+    )
 
     env = captured.get("env")
     assert env is not None, "sandboxed backend was not reached"

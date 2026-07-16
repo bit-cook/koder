@@ -134,18 +134,19 @@ async def invoke_tool_search(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_tools(registry: ToolRegistry) -> None:
-    registry.register(
-        ToolSpec(
-            name="list_mcp_resources",
-            invoke=invoke_list_mcp_resources,
-            category="mcp",
-        )
+    registry.register_many(
+        [
+            ToolSpec(
+                name="list_mcp_resources",
+                invoke=invoke_list_mcp_resources,
+                category="mcp",
+            ),
+            ToolSpec(
+                name="read_mcp_resource",
+                invoke=invoke_read_mcp_resource,
+                category="mcp",
+            ),
+            ToolSpec(name="tool_search", invoke=invoke_tool_search, category="mcp"),
+        ],
+        source=__name__,
     )
-    registry.register(
-        ToolSpec(
-            name="read_mcp_resource",
-            invoke=invoke_read_mcp_resource,
-            category="mcp",
-        )
-    )
-    registry.register(ToolSpec(name="tool_search", invoke=invoke_tool_search, category="mcp"))

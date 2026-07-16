@@ -145,6 +145,7 @@ async def test_auto_compact_check_after_response():
             # Check if the threshold check logic ran by verifying the manager exists
             # and has the expected threshold based on model context window
             assert scheduler._auto_compact.compact_threshold > 0
+        await scheduler.cleanup()
 
 
 @pytest.mark.asyncio
@@ -208,6 +209,7 @@ async def test_session_memory_extraction_check():
 
             # Verify the session memory manager is present
             assert scheduler._session_memory is not None
+        await scheduler.cleanup()
 
 
 @pytest.mark.asyncio

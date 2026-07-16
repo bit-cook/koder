@@ -9,9 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .manifest import find_manifest, parse_manifest
-from .name_validation import validate_plugin_name
+from .name_validation import canonical_marketplace_name
 
 _GITHUB_SHORTHAND = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
+
+class MarketplaceStoreError(ValueError):
+    """Persisted marketplace data cannot be safely canonicalized."""
 
 
 @dataclass(frozen=True)
@@ -115,9 +119,49 @@ class MarketplaceStore:
         if not self._path.exists():
             return {}
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            raw_data = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
+        if not isinstance(raw_data, dict):
+            return {}
+
+        migrated: dict[str, dict] = {}
+        changed = False
+        original_names: dict[str, str] = {}
+        for legacy_name, entry in raw_data.items():
+            canonical_name, reason = canonical_marketplace_name(legacy_name)
+            if canonical_name is None or not isinstance(entry, dict):
+                raise MarketplaceStoreError(
+                    f"Invalid persisted marketplace '{legacy_name}': {reason or 'invalid entry'}"
+                )
+            changed = changed or canonical_name != legacy_name
+            existing = migrated.get(canonical_name)
+            if existing is None:
+                migrated[canonical_name] = dict(entry)
+                original_names[canonical_name] = legacy_name
+                continue
+            if self._source_identity(existing) != self._source_identity(entry):
+                first_name = original_names[canonical_name]
+                raise MarketplaceStoreError(
+                    "Persisted marketplace names "
+                    f"'{first_name}' and '{legacy_name}' both canonicalize to "
+                    f"'{canonical_name}' but reference different sources"
+                )
+            for key, value in entry.items():
+                existing.setdefault(key, value)
+            changed = True
+
+        if changed:
+            self._save(migrated)
+        return migrated
+
+    @staticmethod
+    def _source_identity(entry: dict) -> tuple[str, object]:
+        source_type = entry.get("source_type", "directory")
+        raw_source = entry.get("raw_source")
+        if raw_source is None and source_type == "directory":
+            raw_source = entry.get("path")
+        return str(source_type), raw_source
 
     def _save(self, data: dict[str, dict]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,12 +173,34 @@ class MarketplaceStore:
         Accepts: owner/repo (GitHub), git URL, or local path.
         Returns (source, message). source is None on failure.
         """
-        source_type, name, raw_source = _parse_marketplace_input(source_input)
+        source_type, source_name, raw_source = _parse_marketplace_input(source_input)
 
-        # Validate marketplace name
-        is_valid, error_reason = validate_plugin_name(name, is_official=False)
-        if not is_valid:
+        name, error_reason = canonical_marketplace_name(source_name)
+        if name is None:
             return None, f"Invalid marketplace name: {error_reason}"
+
+        try:
+            data = self._load()
+        except MarketplaceStoreError as exc:
+            return None, str(exc)
+        existing = data.get(name)
+        if existing is not None:
+            existing_type = existing.get("source_type", "directory")
+            existing_source = existing.get("raw_source")
+            if existing_source is None and existing_type == "directory":
+                existing_source = existing.get("path")
+            if existing_type == source_type and existing_source == raw_source:
+                source = MarketplaceSource(
+                    name=name,
+                    source_type=existing_type,
+                    path=existing.get("path", raw_source),
+                )
+                return source, f"Marketplace already added: {name}"
+            return (
+                None,
+                f"Marketplace name '{name}' is already registered to a different source; "
+                "remove it before adding a replacement",
+            )
 
         local_path = raw_source
         if source_type == "github":
@@ -170,7 +236,6 @@ class MarketplaceStore:
             if not Path(local_path).is_dir():
                 return None, f"Directory not found: {local_path}"
 
-        data = self._load()
         data[name] = {
             "source_type": source_type,
             "path": local_path,
@@ -183,6 +248,9 @@ class MarketplaceStore:
         )
 
     def remove(self, name: str) -> bool:
+        name, _reason = canonical_marketplace_name(name)
+        if name is None:
+            return False
         data = self._load()
         if name not in data:
             return False
@@ -202,6 +270,9 @@ class MarketplaceStore:
         ]
 
     def get(self, name: str) -> MarketplaceSource | None:
+        name, _reason = canonical_marketplace_name(name)
+        if name is None:
+            return None
         data = self._load()
         entry = data.get(name)
         if entry is None:
@@ -254,7 +325,7 @@ class MarketplaceStore:
                         name=manifest.name,
                         version=manifest.version,
                         description=manifest.description,
-                        source=marketplace_name,
+                        source=source.name,
                         path=str(subdir),
                     )
                 )

@@ -10,6 +10,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+_TOOL_SCENARIOS = (
+    "streaming_tool_queue",
+    "streaming_tool_error",
+    "sandbox_shell_tool",
+)
+_SCENARIOS = ("single", *_TOOL_SCENARIOS)
+
 
 class _ReusableHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -32,7 +39,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._write_log(body)
 
-        if self.scenario in {"streaming_tool_queue", "streaming_tool_error"}:
+        if self.scenario in _TOOL_SCENARIOS:
             if not body.get("tools"):
                 self._send_json(self._chat_completion(body, self.response_text))
                 return
@@ -118,6 +125,15 @@ class _Handler(BaseHTTPRequestHandler):
         return payload
 
     def _tool_call_payload(self) -> dict[str, Any]:
+        if self.scenario == "sandbox_shell_tool":
+            return {
+                "id": "call_koder_sandbox_fixture",
+                "type": "function",
+                "function": {
+                    "name": "run_shell",
+                    "arguments": json.dumps({"command": "touch model-tool-created.txt"}),
+                },
+            }
         return {
             "id": "call_koder_queue_fixture",
             "type": "function",
@@ -157,7 +173,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_tool_call_stream(self, body: dict[str, Any]) -> None:
-        argument_json = json.dumps({"path": "sample.txt"})
+        tool_payload = self._tool_call_payload()
+        function_payload = tool_payload["function"]
+        argument_json = function_payload["arguments"]
         if self.stream_lines <= 2:
             content_chunks = [
                 self._stream_chunk(body, {"content": "streaming fixture line 1\n"}),
@@ -180,9 +198,12 @@ class _Handler(BaseHTTPRequestHandler):
                     "tool_calls": [
                         {
                             "index": 0,
-                            "id": "call_koder_queue_fixture",
+                            "id": tool_payload["id"],
                             "type": "function",
-                            "function": {"name": "read_file", "arguments": ""},
+                            "function": {
+                                "name": function_payload["name"],
+                                "arguments": "",
+                            },
                         }
                     ]
                 },
@@ -241,7 +262,7 @@ def main() -> None:
     parser.add_argument(
         "--scenario",
         default="single",
-        choices=["single", "streaming_tool_queue", "streaming_tool_error"],
+        choices=_SCENARIOS,
     )
     parser.add_argument("--stream-delay", type=float, default=0.0)
     parser.add_argument("--stream-lines", type=int, default=2)

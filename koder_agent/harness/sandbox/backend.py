@@ -14,7 +14,12 @@ class SandboxBackendCapabilities:
     supports_filesystem: bool = True
     supports_pty: str = "unknown"
     supports_background: bool = False
+    supports_host_process_isolation: str = "unknown"
+    supports_workspace_isolation: str = "unknown"
+    supports_repository_sync: str = "unknown"
+    supports_read_only_filesystem: str = "unknown"
     supports_network_policy: str = "unknown"
+    supports_domain_policy: str = "unknown"
     supports_protected_paths: str = "unknown"
 
 
@@ -54,6 +59,29 @@ class SandboxExecutionContext:
     session_id: str | None
     policy: object
     output_limit: int | None = None
+    degradation_approved: bool = False
+
+
+@dataclass(frozen=True)
+class SandboxExecutionRequirement:
+    """Immutable sandbox snapshot required by one auto-approved invocation."""
+
+    backend_id: str
+    canonical_cwd: str
+    policy_digest: str
+    capability_digest: str
+
+
+@dataclass(frozen=True)
+class SandboxFallbackRequirement:
+    """Exact sandbox state and losses accepted for one host fallback."""
+
+    backend_id: str
+    canonical_cwd: str
+    policy_digest: str
+    capability_digest: str
+    requirement_digest: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -66,6 +94,8 @@ class SandboxExecutionResult:
     exit_code: int | None = None
     backend_id: str | None = None
     sandboxed: bool = False
+    created: bool = False
+    executed: bool = False
     violation: str | None = None
     reason: str | None = None
 

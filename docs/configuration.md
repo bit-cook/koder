@@ -58,7 +58,14 @@ voice:
 # Runtime harness settings
 harness:
   reasoning_display: "off"     # off, summary, or full (default: off)
+  auto_dream_write_mode: review # off, review, or automatic (default: review)
 ```
+
+`automatic` is the only value that enables direct AutoDream memory writes. Legacy
+`auto_dream_enabled: true` migrates to the review queue, while `false` migrates to
+`off`; boolean and `yes`/`on`/`enabled` aliases are not accepted for the new field.
+Both review approval and automatic mode keep `user` memories in the global user store
+and route `feedback`, `project`, and `reference` memories to the originating workspace.
 
 ## Voice Mode
 
@@ -466,6 +473,8 @@ koder
 ```
 
 Note: `config.yaml` values are used literally; `${VAR}` placeholders are not expanded there. Environment-variable interpolation in MCP server definitions works only in a project `.mcp.json` file — put `"X-API-Key": "${COMPANY_API_KEY}"` there and the real value stays in your environment. For YAML-configured servers, use `koder mcp add --header` or write the literal value.
+
+Project `.mcp.json` files and inline `mcpServers` in project agent frontmatter must be reviewed with `koder mcp approve` before Koder connects them. Approval is bound to the repository root, source path, fixed execution directory, and a digest of the fully expanded executable values. Environment changes therefore invalidate approval without storing the expanded secret values.
 
 ### Multi-Provider Development
 

@@ -37,5 +37,6 @@ async def invoke_code_intelligence(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def register_tools(registry: ToolRegistry) -> None:
     registry.register(
-        ToolSpec(name="code_intelligence", invoke=invoke_code_intelligence, category="code")
+        ToolSpec(name="code_intelligence", invoke=invoke_code_intelligence, category="code"),
+        source=__name__,
     )

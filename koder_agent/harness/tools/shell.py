@@ -80,11 +80,14 @@ async def invoke_shell_kill(arguments: dict) -> dict:
 
 
 def register_tools(registry: ToolRegistry) -> None:
-    registry.register(ToolSpec(name="run_shell", invoke=invoke_run_shell, category="tool"))
+    specs = [ToolSpec(name="run_shell", invoke=invoke_run_shell, category="tool")]
     # PowerShell is Windows-only; never register it on other platforms.
     if platform.system() == "Windows":
-        registry.register(
-            ToolSpec(name="run_powershell", invoke=invoke_run_powershell, category="tool")
-        )
-    registry.register(ToolSpec(name="shell_output", invoke=invoke_shell_output, category="tool"))
-    registry.register(ToolSpec(name="shell_kill", invoke=invoke_shell_kill, category="tool"))
+        specs.append(ToolSpec(name="run_powershell", invoke=invoke_run_powershell, category="tool"))
+    specs.extend(
+        [
+            ToolSpec(name="shell_output", invoke=invoke_shell_output, category="tool"),
+            ToolSpec(name="shell_kill", invoke=invoke_shell_kill, category="tool"),
+        ]
+    )
+    registry.register_many(specs, source=__name__)

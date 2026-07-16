@@ -42,7 +42,7 @@ def test_koder_help_lists_common_subcommand_actions():
     )
     assert proc.returncode == 0
     assert "Use `koder <command> --help` for subcommand details." in proc.stdout
-    assert "mcp <add|add-json|list|get|remove|reset-project-choices|serve>" in proc.stdout
+    assert "mcp <add|add-json|list|get|remove|approve|reset-project-choices|serve>" in proc.stdout
     assert "config <show|list|path|edit|init|set|validate|export|import>" in proc.stdout
     assert "auth <login|list|revoke|status>" in proc.stdout
     assert "plugin <list|install|uninstall|enable|disable|validate|marketplace>" in proc.stdout

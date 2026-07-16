@@ -10,13 +10,11 @@ from typing import Any, Literal
 
 SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
 
-# Backends able to actually enforce a network deny/allow policy at runtime. The
-# unix-local backend cannot, so network_access must never be presented as
-# enforced when it is the resolved backend (honesty-first, finding #4).
-# NOTE: Docker is excluded because the SDK docker backend does NOT set
-# --network=none by default; containers use the default bridge network.
-# Only cloud-hosted backends guarantee network isolation.
-NETWORK_ENFORCING_BACKENDS = frozenset({"cloudflare", "e2b", "modal", "vercel"})
+# Legacy policy-level hint. E2B is the only currently wired backend whose SDK
+# options receive networkAccess as a real boolean internet-access control.
+# Auto-approval does not use this name-based hint; it consumes registry
+# capabilities through sandbox.enforcement instead.
+NETWORK_ENFORCING_BACKENDS = frozenset({"e2b"})
 
 DEFAULT_PROTECTED_PATHS = (".git", ".koder", ".agents", ".codex")
 DEFAULT_SENSITIVE_DENY_WRITE = (
@@ -136,7 +134,9 @@ class SandboxPolicy:
         rely on this flag rather than assuming ``network_access`` is honored
         (honesty-first, finding #4).
         """
-        return self.backend in NETWORK_ENFORCING_BACKENDS
+        return self.backend in NETWORK_ENFORCING_BACKENDS and not (
+            self.allowed_domains or self.denied_domains
+        )
 
     @property
     def network_restricted_but_unenforced(self) -> bool:

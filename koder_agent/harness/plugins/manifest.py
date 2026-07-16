@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
-_MAX_NAME_LEN = 64
+from .name_validation import validate_plugin_name_format
+from .path_safety import (
+    PluginPathError,
+    open_plugin_component,
+    resolve_plugin_component,
+    validate_component_path,
+)
 
 
 @dataclass(frozen=True)
@@ -49,13 +53,25 @@ def find_manifest(plugin_dir: Path) -> Path | None:
     1. <plugin_dir>/.koder-plugin/plugin.json
     2. <plugin_dir>/plugin.json
     """
-    koder_plugin = plugin_dir / ".koder-plugin" / "plugin.json"
-    if koder_plugin.is_file():
-        return koder_plugin
-    root_manifest = plugin_dir / "plugin.json"
-    if root_manifest.is_file():
-        return root_manifest
-    return None
+    try:
+        koder_plugin = resolve_plugin_component(
+            plugin_dir,
+            ".koder-plugin/plugin.json",
+            default=".koder-plugin/plugin.json",
+            field_name="manifest",
+            expect="file",
+        )
+        if koder_plugin is not None:
+            return koder_plugin
+        return resolve_plugin_component(
+            plugin_dir,
+            "plugin.json",
+            default="plugin.json",
+            field_name="manifest",
+            expect="file",
+        )
+    except PluginPathError:
+        return None
 
 
 def parse_manifest(
@@ -69,17 +85,31 @@ def parse_manifest(
     errors: list[str] = []
     warnings: list[str] = []
 
-    manifest_path = find_manifest(plugin_dir)
-    if manifest_path is None:
-        errors.append("No plugin.json found (checked .koder-plugin/plugin.json and plugin.json)")
-        return None, errors, warnings
-
+    manifest_path: Path | None = None
+    raw: object | None = None
     try:
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for relative in (".koder-plugin/plugin.json", "plugin.json"):
+            with open_plugin_component(
+                plugin_dir,
+                relative,
+                default=relative,
+                field_name="manifest",
+                expect="file",
+            ) as opened_manifest:
+                if opened_manifest is None:
+                    continue
+                manifest_path = plugin_dir.joinpath(*relative.split("/"))
+                raw = json.loads(opened_manifest.read_text(encoding="utf-8"))
+                break
+        if manifest_path is None:
+            errors.append(
+                "No plugin.json found (checked .koder-plugin/plugin.json and plugin.json)"
+            )
+            return None, errors, warnings
     except json.JSONDecodeError as exc:
         errors.append(f"Invalid JSON in {manifest_path}: {exc}")
         return None, errors, warnings
-    except OSError as exc:
+    except (OSError, PluginPathError) as exc:
         errors.append(f"Cannot read {manifest_path}: {exc}")
         return None, errors, warnings
 
@@ -92,15 +122,11 @@ def parse_manifest(
     if not isinstance(name, str) or not name.strip():
         errors.append("'name' field is required and must be a non-empty string")
         return None, errors, warnings
-    name = name.strip()
 
     # Name validation
-    if len(name) > _MAX_NAME_LEN:
-        warnings.append(f"Plugin name exceeds {_MAX_NAME_LEN} characters")
-    if not _NAME_PATTERN.match(name):
-        warnings.append(
-            f"Plugin name '{name}' should be lowercase alphanumeric with hyphens (kebab-case)"
-        )
+    is_valid_name, name_error = validate_plugin_name_format(name)
+    if not is_valid_name:
+        errors.append(f"Invalid plugin name '{name}': {name_error}")
 
     # Version
     version = str(raw.get("version", "0.0.0"))
@@ -118,16 +144,17 @@ def parse_manifest(
     keywords_raw = raw.get("keywords", [])
     keywords = tuple(str(k) for k in keywords_raw) if isinstance(keywords_raw, list) else ()
 
-    # Component paths — validate no path traversal
+    # Component paths are portable relative paths. Runtime discovery resolves
+    # them again beneath a symlink-free plugin root before use.
     def _validate_path(field_name: str) -> str | None:
         val = raw.get(field_name)
         if val is None:
             return None
-        val_str = str(val)
-        if ".." in val_str:
-            errors.append(f"Path traversal (..) not allowed in '{field_name}': {val_str}")
+        normalized, error = validate_component_path(val, field_name=field_name)
+        if normalized is None:
+            errors.append(error)
             return None
-        return val_str
+        return normalized
 
     commands = _validate_path("commands")
     agents = _validate_path("agents")

@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -160,6 +161,107 @@ class TestOutputTruncation:
         _install_output_truncation(server, "fake")
         assert server.call_tool is wrapped
 
+    def test_install_output_truncation_preserves_signature_and_meta(self, monkeypatch):
+        """The cap wrapper must remain transparent to SDK meta propagation."""
+        from koder_agent.mcp.server_factory import _install_output_truncation
+
+        monkeypatch.setenv("MAX_MCP_OUTPUT_TOKENS", "1000")
+
+        class FakeServer:
+            async def call_tool(self, tool_name, arguments=None, meta=None, **kwargs):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    received=(tool_name, arguments, meta, kwargs),
+                )
+
+        server = FakeServer()
+        original_signature = inspect.signature(server.call_tool)
+        _install_output_truncation(server, "fake")
+
+        assert inspect.signature(server.call_tool) == original_signature
+        out = asyncio.run(
+            server.call_tool(
+                "t",
+                {"value": 1},
+                meta={"static": True, "resolved": "yes"},
+                future_option="kept",
+            )
+        )
+        assert out.received == (
+            "t",
+            {"value": 1},
+            {"static": True, "resolved": "yes"},
+            {"future_option": "kept"},
+        )
+
+    def test_install_output_truncation_passes_positional_meta(self, monkeypatch):
+        """Positional SDK arguments must pass through unchanged as well."""
+        from koder_agent.mcp.server_factory import _install_output_truncation
+
+        monkeypatch.setenv("MAX_MCP_OUTPUT_TOKENS", "1000")
+
+        class FakeServer:
+            async def call_tool(self, *args, **kwargs):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    received=(args, kwargs),
+                )
+
+        server = FakeServer()
+        _install_output_truncation(server, "fake")
+        out = asyncio.run(server.call_tool("t", {}, {"resolved": True}))
+        assert out.received == (("t", {}, {"resolved": True}), {})
+
+    def test_sdk_static_and_resolved_meta_reach_wrapped_call(self, monkeypatch):
+        """SDK-composed static/dynamic meta must survive output-cap wrapping."""
+        from agents.mcp.util import MCPUtil
+        from mcp.types import Tool as MCPTool
+
+        from koder_agent.mcp.server_factory import _install_output_truncation
+
+        monkeypatch.setenv("MAX_MCP_OUTPUT_TOKENS", "1000")
+
+        class FakeServer:
+            name = "fake"
+            use_structured_content = False
+
+            def __init__(self):
+                self.received_meta = None
+
+            def _get_failure_error_function(self, failure_error_function):
+                return failure_error_function
+
+            def _get_needs_approval_for_tool(self, tool, agent):
+                return False
+
+            def tool_meta_resolver(self, context):
+                return {"dynamic": context.tool_name}
+
+            async def call_tool(self, tool_name, arguments=None, meta=None):
+                self.received_meta = meta
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    structuredContent=None,
+                    isError=False,
+                )
+
+        server = FakeServer()
+        _install_output_truncation(server, "fake")
+        tool = MCPTool(
+            name="lookup",
+            description="lookup",
+            inputSchema={"type": "object", "properties": {}},
+            _meta={"static": "kept", "resolved": "static"},
+        )
+        function_tool = MCPUtil.to_function_tool(tool, server, convert_schemas_to_strict=False)
+
+        asyncio.run(function_tool.on_invoke_tool(None, "{}"))
+        assert server.received_meta == {
+            "dynamic": "lookup",
+            "static": "kept",
+            "resolved": "static",
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Finding 4: name collision — project must not silently override user
@@ -177,6 +279,12 @@ def _write_project_mcp(project: Path, data: dict) -> None:
 @pytest.fixture()
 def isolate_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    node = bin_dir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    node.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setattr(ConfigManager, "DEFAULT_CONFIG_PATH", tmp_path / ".koder" / "config.yaml")
     reset_config_manager()
     yield tmp_path

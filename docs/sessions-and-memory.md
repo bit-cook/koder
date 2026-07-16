@@ -128,7 +128,11 @@ Memory files are local markdown files. User memory is shared across projects; pr
 
 ## AutoDream
 
-AutoDream is a best-effort cleanup-time memory consolidation task. When its local cadence threshold is met, it asks the configured provider to extract durable memory notes, writes them to `~/.koder/memory/auto-dream-*.md`, and records task metadata under `~/.koder/tasks/auto-dream/`.
+AutoDream is a best-effort cleanup-time memory consolidation task. When its local cadence threshold is met, it asks the configured provider to separate durable factual memories from reusable procedural skill candidates. The default `harness.auto_dream_write_mode: review` stages them under `~/.koder/memory-candidates/` and `~/.koder/skill-candidates/`; retrieval and skill discovery do not read those queues. Every candidate binds its storage scope, canonical origin workspace, and origin session into the reviewed record and content-derived ID.
+
+Review candidates with `/memory candidates`, `/memory show <id>`, `/memory approve <id>`, or `/memory reject <id>`. `user` memories are user-scoped and approve to `~/.koder/memory/`; `feedback`, `project`, and `reference` memories are project-scoped and approve only to the candidate's recorded origin workspace. Factual approval and disabled skill-draft approval use the same private, exclusive, no-follow writer with full candidate IDs; skill drafts remain outside normal discovery under `~/.koder/skill-drafts/`. Set the mode to the exact value `automatic` only to opt into direct factual-memory writes. Automatic mode applies the same scope routing and writes separate files for each actual memory type/scope group. Set the mode to `off` to disable AutoDream extraction. Legacy `auto_dream_enabled: true` migrates to review rather than automatic writes. `/remember` remains an immediate user-authorized project memory write.
+
+AutoDream records task metadata under `~/.koder/tasks/auto-dream/`.
 
 Inspect recent runtime tasks with:
 

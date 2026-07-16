@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 
 import yaml
 from pydantic import ValidationError
 
 from koder_agent.config import get_config_manager
-from koder_agent.harness.config.schema import RuntimeConfig
+from koder_agent.harness.config.schema import RuntimeConfig, parse_runtime_config_source
 from koder_agent.harness.config.service import RuntimeConfigService
 from koder_agent.harness.config.settings_bundle import (
     export_settings_bundle,
@@ -22,7 +23,12 @@ _EFFECTIVE_ENV_KEYS: dict[str, str] = {
     "model.name": "KODER_MODEL",
     "model.api_key": "KODER_API_KEY",
     "model.base_url": "KODER_BASE_URL",
+    "model.context_window": "KODER_CONTEXT_WINDOW",
+    "model.small_model": "KODER_SMALL_MODEL",
+    "model.small_model_context_window": "KODER_SMALL_MODEL_CONTEXT_WINDOW",
     "model.reasoning_effort": "KODER_REASONING_EFFORT",
+    "harness.task_delegate_max_batch_size": "KODER_TASK_DELEGATE_MAX_BATCH_SIZE",
+    "harness.task_delegate_max_concurrency": "KODER_TASK_DELEGATE_MAX_CONCURRENCY",
 }
 
 
@@ -169,7 +175,7 @@ async def handle_config_subcommand(args: argparse.Namespace) -> int:
 
 
 def _handle_config_validate() -> int:
-    """Load the config YAML and validate it against the RuntimeConfig schema.
+    """Validate the config YAML and its effective environment overrides.
 
     Returns 0 when the config is valid (or absent, since defaults apply) and a
     non-zero exit code with a rendered pydantic ValidationError otherwise.
@@ -177,29 +183,69 @@ def _handle_config_validate() -> int:
     service = RuntimeConfigService()
     config_path = service.config_path
 
-    if not config_path.exists():
-        print(f"Config file not found at {config_path}; defaults are valid.")
-        return 0
-
-    try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as exc:
-        print(f"Config invalid: YAML parse error at {config_path}: {exc}")
-        return 1
+    if config_path.exists():
+        try:
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            print(f"Config invalid: YAML parse error at {config_path}: {exc}")
+            return 1
+    else:
+        raw = {}
 
     if not isinstance(raw, dict):
         print(f"Config invalid: expected a mapping at {config_path}, got {type(raw).__name__}.")
         return 1
 
     try:
-        RuntimeConfig(**raw)
+        config = parse_runtime_config_source(raw)
     except ValidationError as exc:
         print(f"Config invalid: {config_path}")
-        for error in exc.errors():
-            location = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
-            message = error.get("msg", "invalid value")
-            print(f"- {location}: {message}")
+        _print_validation_errors(exc)
         return 1
 
-    print(f"Config valid: {config_path}")
+    effective_data = config.model_dump(exclude_none=False)
+    active_env_overrides: dict[str, str] = {}
+    for dotted_key, env_var in _EFFECTIVE_ENV_KEYS.items():
+        if env_var not in os.environ:
+            continue
+        active_env_overrides[dotted_key] = env_var
+        _set_nested(effective_data, dotted_key, os.environ[env_var])
+
+    try:
+        RuntimeConfig(**effective_data)
+    except ValidationError as exc:
+        print(f"Config invalid: effective configuration for {config_path}")
+        _print_validation_errors(exc, active_env_overrides=active_env_overrides)
+        print("Fix the environment override(s) above and run `koder config validate` again.")
+        return 1
+
+    if config_path.exists():
+        print(f"Config valid: {config_path}")
+    else:
+        print(
+            f"Config file not found at {config_path}; defaults are valid; env overrides are valid."
+        )
     return 0
+
+
+def _print_validation_errors(
+    exc: ValidationError,
+    *,
+    active_env_overrides: dict[str, str] | None = None,
+) -> None:
+    active_env_overrides = active_env_overrides or {}
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
+        message = error.get("msg", "invalid value")
+        matching_env = [
+            env_var
+            for dotted_key, env_var in active_env_overrides.items()
+            if location == dotted_key
+            or location.startswith(f"{dotted_key}.")
+            or dotted_key.startswith(f"{location}.")
+        ]
+        source = ""
+        if matching_env:
+            rendered = ", ".join(f"{name}={os.environ[name]!r}" for name in matching_env)
+            source = f" ({rendered})"
+        print(f"- {location}{source}: {message}")

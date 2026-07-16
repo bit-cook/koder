@@ -55,6 +55,16 @@ def test_registry_register_and_get():
     assert reg.get("mcp__gh__list_prs") is prompt
 
 
+def test_registry_collision_keeps_first_prompt():
+    reg = MCPPromptRegistry()
+    first = MCPPrompt(server_name="same server", prompt_name="same prompt", description="first")
+    second = MCPPrompt(server_name="same.server", prompt_name="same.prompt", description="second")
+
+    assert reg.register(first) is True
+    assert reg.register(second) is False
+    assert reg.get(first.command_name) is first
+
+
 def test_registry_list():
     reg = MCPPromptRegistry()
     reg.register(MCPPrompt(server_name="gh", prompt_name="list_prs"))
@@ -152,9 +162,36 @@ def test_find_server_session_by_name():
 
 
 def test_find_server_session_by_normalized_name():
-    s1 = _make_server("my-server")
-    session = _find_server_session("my-server", [s1])
+    s1 = _make_server("my.server")
+    session = _find_server_session("my_server", [s1])
     assert session is s1.session
+
+
+def test_find_server_session_prefers_exact_raw_name_over_normalized_match():
+    normalized_match = _make_server("alpha.beta")
+    exact_match = _make_server("alpha_beta")
+
+    session = _find_server_session("alpha_beta", [normalized_match, exact_match])
+
+    assert session is exact_match.session
+
+
+def test_find_server_session_rejects_ambiguous_normalized_fallback():
+    first = _make_server("alpha.beta")
+    second = _make_server("alpha_beta")
+
+    session = _find_server_session("alpha beta", [first, second])
+
+    assert session is None
+
+
+def test_find_server_session_rejects_duplicate_exact_raw_names():
+    first = _make_server("shared")
+    second = _make_server("shared")
+
+    session = _find_server_session("shared", [first, second])
+
+    assert session is None
 
 
 def test_find_server_session_not_found():

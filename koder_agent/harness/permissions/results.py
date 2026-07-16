@@ -17,6 +17,10 @@ class PermissionEvaluationResult:
     reason: str
     mode: PermissionMode
     matched_rule: str | None = None
+    sandbox_backend: str | None = None
+    sandbox_cwd: str | None = None
+    sandbox_policy_digest: str | None = None
+    sandbox_capability_digest: str | None = None
 
     @classmethod
     def allow(
@@ -26,6 +30,10 @@ class PermissionEvaluationResult:
         mode: PermissionMode,
         reason: str = "allowed",
         matched_rule: str | None = None,
+        sandbox_backend: str | None = None,
+        sandbox_cwd: str | None = None,
+        sandbox_policy_digest: str | None = None,
+        sandbox_capability_digest: str | None = None,
     ) -> "PermissionEvaluationResult":
         return cls(
             tool_name=tool_name,
@@ -34,6 +42,10 @@ class PermissionEvaluationResult:
             reason=reason,
             mode=mode,
             matched_rule=matched_rule,
+            sandbox_backend=sandbox_backend,
+            sandbox_cwd=sandbox_cwd,
+            sandbox_policy_digest=sandbox_policy_digest,
+            sandbox_capability_digest=sandbox_capability_digest,
         )
 
     @classmethod

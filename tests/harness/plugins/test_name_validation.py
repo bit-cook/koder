@@ -1,8 +1,12 @@
 """Tests for plugin name validation and anti-impersonation."""
 
+import pytest
+
 from koder_agent.harness.plugins.name_validation import (
     OFFICIAL_PREFIXES,
     RESERVED_NAMES,
+    canonical_marketplace_name,
+    canonical_plugin_name,
     sanitize_plugin_name,
     validate_plugin_name,
 )
@@ -51,7 +55,6 @@ class TestValidatePluginName:
         invalid_names = [
             "my plugin",  # space
             "my@plugin",  # special char
-            "my.plugin",  # dot
             "my/plugin",  # slash
             "my\\plugin",  # backslash
             "my plugin!",  # exclamation
@@ -64,6 +67,41 @@ class TestValidatePluginName:
             valid, reason = validate_plugin_name(name, is_official=False)
             assert not valid, f"Name '{name}' should be invalid"
             assert "invalid characters" in reason.lower()
+
+    def test_dotted_portable_name_passes(self):
+        valid, reason = validate_plugin_name("acme.tool", is_official=False)
+        assert valid
+        assert reason == ""
+
+    def test_non_string_name_is_rejected_safely(self):
+        canonical, reason = canonical_plugin_name(None)
+        assert canonical is None
+        assert "must be a string" in reason
+
+    def test_mixed_case_name_is_not_silently_canonicalized(self):
+        canonical, reason = canonical_plugin_name("Demo")
+        assert canonical is None
+        assert "lowercase canonical spelling" in reason
+
+    def test_infrastructure_names_are_reserved(self):
+        for name in ["marketplace-cache", "state.json", "marketplaces.json"]:
+            valid, reason = validate_plugin_name(name, is_official=False)
+            assert not valid
+            assert "infrastructure" in reason
+
+    def test_marketplace_name_has_separate_mixed_case_canonicalization(self):
+        canonical, reason = canonical_marketplace_name("Community.Plugins")
+        assert canonical == "community.plugins"
+        assert reason == ""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["../Market", r"..\Market", ".Hidden", "Trailing.", "CON", "State.JSON"],
+    )
+    def test_marketplace_name_keeps_component_and_reserved_name_protections(self, name):
+        canonical, reason = canonical_marketplace_name(name)
+        assert canonical is None
+        assert reason
 
     def test_empty_name_caught(self):
         """Empty plugin names are rejected."""
@@ -123,3 +161,5 @@ class TestConstants:
         assert "koder" in RESERVED_NAMES
         assert "koder-core" in RESERVED_NAMES
         assert "koder-official" in RESERVED_NAMES
+        assert "marketplace-cache" in RESERVED_NAMES
+        assert "state.json" in RESERVED_NAMES

@@ -17,6 +17,11 @@ if str(project_root) not in sys.path:
 
 from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.service import PermissionService
+from koder_agent.harness.sandbox.backend import (
+    SandboxBackendCapabilities,
+    SandboxBackendStatus,
+)
+from koder_agent.harness.sandbox.policy import SandboxPolicy
 from koder_agent.harness.sandbox.registry import get_backend_status
 
 
@@ -82,11 +87,14 @@ def test_permission_service_sandbox_blocks_non_excluded_shell_commands(tmp_path,
     result = service.evaluate_tool_call("run_shell", {"command": "touch foo.txt"})
 
     assert result.allowed is False
-    assert result.requires_approval is False
-    assert "configured backend is unavailable" in result.reason
+    assert result.requires_approval is True
+    assert "sandbox backend is unavailable" in result.reason
+    assert "second explicit approval" in result.reason
 
 
-def test_permission_service_auto_allows_real_sandboxed_shell_commands(tmp_path, monkeypatch):
+def test_permission_service_unix_local_requires_approval_without_host_isolation(
+    tmp_path, monkeypatch
+):
     status = get_backend_status("unix-local")
     if not status.available:
         pytest.skip(status.reason)
@@ -99,6 +107,7 @@ def test_permission_service_auto_allows_real_sandboxed_shell_commands(tmp_path, 
                 "sandbox": {
                     "enabled": True,
                     "backend": "unix-local",
+                    "networkAccess": True,
                     "autoAllowBashIfSandboxed": True,
                 }
             }
@@ -109,6 +118,167 @@ def test_permission_service_auto_allows_real_sandboxed_shell_commands(tmp_path, 
 
     service = PermissionService.default()
     result = service.evaluate_tool_call("run_shell", {"command": "touch foo.txt"})
+
+    assert result.allowed is False
+    assert result.requires_approval is True
+    assert "mutate filesystem" in result.reason
+
+
+def _sandbox_state(
+    *,
+    policy: SandboxPolicy,
+    network_capability: str,
+    domain_capability: str = "unsupported",
+):
+    backend_status = SandboxBackendStatus(
+        backend_id=policy.backend,
+        selected=True,
+        available=True,
+        reason="available",
+        capabilities=SandboxBackendCapabilities(
+            supports_host_process_isolation="enforced",
+            supports_workspace_isolation="enforced",
+            supports_repository_sync="enforced",
+            supports_read_only_filesystem="enforced",
+            supports_network_policy=network_capability,
+            supports_domain_policy=domain_capability,
+            supports_protected_paths="enforced",
+        ),
+    )
+    return types.SimpleNamespace(
+        enabled=True,
+        backend=policy.backend,
+        backend_available=True,
+        backend_reason="available",
+        platform_enabled=True,
+        auto_allow_bash_if_sandboxed=True,
+        policy=policy,
+        backend_statuses=(backend_status,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command"),
+    [
+        ("run_shell", "curl https://example.com -o artifact.tar.gz"),
+        ("git_command", "push origin main"),
+    ],
+)
+def test_permission_service_does_not_auto_allow_unenforced_network_restriction(
+    monkeypatch, tool_name, command
+):
+    policy = SandboxPolicy(
+        mode="workspace-write",
+        backend="unix-local",
+        network_access=False,
+    )
+    state = _sandbox_state(policy=policy, network_capability="unsupported")
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.resolve_sandbox_settings",
+        lambda _cwd: state,
+    )
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.is_excluded_command",
+        lambda _command, *, cwd: False,
+    )
+
+    result = PermissionService.default().evaluate_tool_call(tool_name, {"command": command})
+
+    assert result.allowed is False
+    assert result.requires_approval is True
+    assert "network access disabled" in result.reason
+    assert "networkAccess=false" in result.reason
+    assert "generic command or mutation approval does not accept" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("policy", "capabilities", "expected_losses"),
+    (
+        (
+            SandboxPolicy.from_config(
+                {
+                    "enabled": True,
+                    "backend": "unix-local",
+                    "networkAccess": True,
+                    "protectedPaths": ["private"],
+                }
+            ),
+            SandboxBackendCapabilities(
+                supports_host_process_isolation="enforced",
+                supports_workspace_isolation="enforced",
+                supports_repository_sync="enforced",
+                supports_network_policy="enforced",
+                supports_protected_paths="unsupported",
+            ),
+            ("protectedPaths", "protected subpaths"),
+        ),
+        (
+            SandboxPolicy.from_config({"enabled": True, "backend": "e2b", "networkAccess": True}),
+            SandboxBackendCapabilities(
+                supports_host_process_isolation="remote-sandbox",
+                supports_workspace_isolation="not-proven",
+                supports_repository_sync="unsupported",
+                supports_network_policy="enforced",
+            ),
+            (
+                "workspace materialization and isolation",
+                "repository synchronization",
+            ),
+        ),
+    ),
+)
+def test_permission_service_names_incomplete_sandbox_guarantees(
+    monkeypatch, policy, capabilities, expected_losses
+):
+    state = _sandbox_state(policy=policy, network_capability="enforced")
+    state.backend_statuses = (
+        SandboxBackendStatus(
+            backend_id=policy.backend,
+            selected=True,
+            available=True,
+            reason="available",
+            capabilities=capabilities,
+        ),
+    )
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.resolve_sandbox_settings",
+        lambda _cwd: state,
+    )
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.is_excluded_command",
+        lambda _command, *, cwd: False,
+    )
+
+    result = PermissionService.default().evaluate_tool_call(
+        "run_shell",
+        {"command": "python mutate.py"},
+    )
+
+    assert result.requires_approval is True
+    for expected in expected_losses:
+        assert expected in result.reason
+
+
+def test_permission_service_auto_allows_only_with_complete_backend_capabilities(monkeypatch):
+    policy = SandboxPolicy(
+        mode="workspace-write",
+        backend="unix-local",
+        network_access=True,
+    )
+    state = _sandbox_state(policy=policy, network_capability="unsupported")
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.resolve_sandbox_settings",
+        lambda _cwd: state,
+    )
+    monkeypatch.setattr(
+        "koder_agent.harness.permissions.service.is_excluded_command",
+        lambda _command, *, cwd: False,
+    )
+
+    result = PermissionService.default().evaluate_tool_call(
+        "run_shell",
+        {"command": "touch artifact.tar.gz"},
+    )
 
     assert result.allowed is True
     assert result.requires_approval is False

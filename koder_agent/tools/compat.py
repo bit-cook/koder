@@ -14,20 +14,54 @@ from agents import function_tool as _agents_function_tool
 from agents.tool import default_tool_error_function
 from agents.tool_context import ToolContext
 
-from .permission_context import enforce_tool_permission
+from .permission_context import (
+    begin_tool_invocation,
+    enforce_tool_permission,
+    reset_tool_invocation,
+)
 
 logger = logging.getLogger(__name__)
 
-# Default maximum number of characters for a tool's string result before it is
-# truncated to a head+tail window. Configurable via ``KODER_MAX_TOOL_OUTPUT_CHARS``.
+# Default maximum number of characters returned by a string-valued tool.
+# Configurable via ``KODER_MAX_TOOL_OUTPUT_CHARS``.
 DEFAULT_MAX_TOOL_OUTPUT_CHARS = 30000
+_TOOL_OUTPUT_TOO_LARGE_MINIMAL = '{"error":"tool_output_too_large"}'
+MIN_TOOL_OUTPUT_ERROR_CHARS = len(_TOOL_OUTPUT_TOO_LARGE_MINIMAL)
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_COLLECTION_ITEMS = 10000
+_MAX_JSON_TOTAL_ITEMS = 100000
+_MAX_JSON_PARSE_CHARS = 1_000_000
+
+
+class StructuredOutputTooLargeError(ValueError):
+    """Raised when structured data exceeds safe parsing or serialization limits."""
+
+
+class DuplicateJSONKeyError(ValueError):
+    """Raised when duplicate object keys are forbidden by the caller."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"duplicate JSON object key: {key}")
+        self.key = key
+
+
+class InvalidJSONConstantError(ValueError):
+    """Raised for non-standard JSON constants such as NaN and Infinity."""
+
+
+class _JSONObjectPairs(list[tuple[str, Any]]):
+    """Object representation that preserves duplicate keys during validation."""
+
+
+class _JSONNumber(str):
+    """Validated number lexeme that avoids Python's huge-integer conversion limit."""
 
 
 def _get_max_tool_output_chars() -> int:
     """Resolve the tool-output truncation threshold from the environment.
 
     Falls back to :data:`DEFAULT_MAX_TOOL_OUTPUT_CHARS` when the env var is unset,
-    empty, non-numeric, or non-positive (the latter disables truncation).
+    empty, non-numeric, or non-positive.
     """
 
     raw = os.environ.get("KODER_MAX_TOOL_OUTPUT_CHARS")
@@ -42,25 +76,236 @@ def _get_max_tool_output_chars() -> int:
     return value
 
 
-def _truncate_tool_output(result: str, max_chars: int) -> str:
-    """Truncate ``result`` to a head+tail window with a clear middle marker.
-
-    Keeps roughly the first 70% and last 30% of the budget, joined by a marker
-    that reports how many characters were removed. Small outputs (``len`` within
-    ``max_chars``) are returned unchanged.
-    """
-
+def _truncate_text_output(result: str, max_chars: int) -> str:
+    """Fit plain text within ``max_chars`` using a head/tail marker."""
     total = len(result)
     if total <= max_chars:
         return result
 
-    head_len = (max_chars * 7) // 10
-    tail_len = max_chars - head_len
+    kept = max_chars
+    marker = ""
+    for _ in range(4):
+        removed = total - kept
+        marker = f"\n...[truncated {removed} characters]...\n"
+        next_kept = max(0, max_chars - len(marker))
+        if next_kept == kept:
+            break
+        kept = next_kept
+
+    if not marker or len(marker) > max_chars:
+        short_marker = f"...[truncated {total} chars]..."
+        return short_marker[:max_chars]
+
+    head_len = (kept * 7) // 10
+    tail_len = kept - head_len
     head = result[:head_len]
     tail = result[total - tail_len :] if tail_len > 0 else ""
-    removed = total - head_len - tail_len
-    marker = f"\n...[truncated {removed} characters]...\n"
     return f"{head}{marker}{tail}"
+
+
+def tool_output_too_large_json(max_chars: int, *, original_chars: int | None = None) -> str:
+    """Return an explicit error, using a fixed minimum for impossibly tiny caps."""
+    payload: dict[str, Any] = {"error": "tool_output_too_large"}
+    if original_chars is not None:
+        payload.update(original_chars=original_chars, max_chars=max_chars)
+        detailed = json.dumps(payload, separators=(",", ":"))
+        if len(detailed) <= max_chars:
+            return detailed
+    return _TOOL_OUTPUT_TOO_LARGE_MINIMAL
+
+
+def _validate_native_json(value: Any) -> None:
+    """Reject deep, wide, cyclic, or non-JSON-native values without recursion."""
+    stack = [(value, 0)]
+    seen_containers: set[int] = set()
+    total_items = 0
+
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, (str, int, float, bool)) or current is None:
+            continue
+        if not isinstance(current, (dict, list)):
+            raise StructuredOutputTooLargeError
+        if depth >= _MAX_JSON_DEPTH:
+            raise StructuredOutputTooLargeError
+
+        identity = id(current)
+        if identity in seen_containers:
+            raise StructuredOutputTooLargeError
+        seen_containers.add(identity)
+
+        size = len(current)
+        if size > _MAX_JSON_COLLECTION_ITEMS:
+            raise StructuredOutputTooLargeError
+        total_items += size
+        if total_items > _MAX_JSON_TOTAL_ITEMS:
+            raise StructuredOutputTooLargeError
+
+        if isinstance(current, dict):
+            if not all(isinstance(key, str) for key in current):
+                raise StructuredOutputTooLargeError
+            stack.extend((item, depth + 1) for item in current.values())
+        else:
+            stack.extend((item, depth + 1) for item in current)
+
+
+def serialize_bounded_json(value: Any, max_chars: int) -> str:
+    """Serialize native JSON once, replacing unsafe or oversized values with an error."""
+    try:
+        _validate_native_json(value)
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (MemoryError, OverflowError, RecursionError, TypeError, ValueError):
+        return tool_output_too_large_json(max_chars)
+    if len(serialized) > max_chars:
+        return tool_output_too_large_json(max_chars, original_chars=len(serialized))
+    return serialized
+
+
+def parse_json_with_limits(data: str, *, reject_duplicate_keys: bool = False) -> Any:
+    """Validate a bounded JSON document without collapsing duplicate keys.
+
+    Number hooks retain the already-validated JSON lexeme instead of converting
+    arbitrarily large integers to Python ``int`` objects. Generic callers receive
+    objects as ordered key/value pairs, preserving duplicates. Callers that need
+    normal native objects may request duplicate rejection, in which case objects
+    are converted to dictionaries only after uniqueness is established.
+    """
+    if len(data) > _MAX_JSON_PARSE_CHARS:
+        raise StructuredOutputTooLargeError
+
+    object_items = 0
+
+    def _bounded_object(pairs: list[tuple[str, Any]]) -> dict[str, Any] | _JSONObjectPairs:
+        nonlocal object_items
+        object_items += len(pairs)
+        if len(pairs) > _MAX_JSON_COLLECTION_ITEMS or object_items > _MAX_JSON_TOTAL_ITEMS:
+            raise StructuredOutputTooLargeError
+        seen: set[str] = set()
+        for key, _value in pairs:
+            if key in seen and reject_duplicate_keys:
+                raise DuplicateJSONKeyError(key)
+            seen.add(key)
+        if reject_duplicate_keys:
+            return dict(pairs)
+        return _JSONObjectPairs(pairs)
+
+    def _invalid_constant(_value: str) -> None:
+        raise InvalidJSONConstantError
+
+    try:
+        parsed = json.loads(
+            data,
+            object_pairs_hook=_bounded_object,
+            parse_int=_JSONNumber,
+            parse_float=_JSONNumber,
+            parse_constant=_invalid_constant,
+        )
+    except (
+        json.JSONDecodeError,
+        DuplicateJSONKeyError,
+        InvalidJSONConstantError,
+        StructuredOutputTooLargeError,
+    ):
+        raise
+    except (MemoryError, OverflowError, RecursionError, ValueError) as exc:
+        raise StructuredOutputTooLargeError from exc
+
+    stack = [(parsed, 0)]
+    total_items = 0
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, (str, int, float, bool)) or current is None:
+            continue
+        if depth >= _MAX_JSON_DEPTH:
+            raise StructuredOutputTooLargeError
+        if isinstance(current, _JSONObjectPairs):
+            size = len(current)
+            total_items += size
+            stack.extend((value, depth + 1) for _key, value in current)
+        elif isinstance(current, dict):
+            size = len(current)
+            total_items += size
+            stack.extend((value, depth + 1) for value in current.values())
+        elif isinstance(current, list):
+            size = len(current)
+            total_items += size
+            stack.extend((value, depth + 1) for value in current)
+        else:
+            raise StructuredOutputTooLargeError
+        if size > _MAX_JSON_COLLECTION_ITEMS or total_items > _MAX_JSON_TOTAL_ITEMS:
+            raise StructuredOutputTooLargeError
+    return parsed
+
+
+def _bound_tool_output(result: Any, max_chars: int) -> Any:
+    """Bound strings while preserving SDK-native structured output types."""
+    if not isinstance(result, str):
+        return result
+    if len(result) <= max_chars:
+        return result
+
+    if not _has_plausible_json_root(result):
+        return _truncate_text_output(result, max_chars)
+
+    try:
+        parse_json_with_limits(result)
+    except (json.JSONDecodeError, InvalidJSONConstantError):
+        return _truncate_text_output(result, max_chars)
+    except (MemoryError, RecursionError, StructuredOutputTooLargeError):
+        return tool_output_too_large_json(max_chars, original_chars=len(result))
+
+    # JSON scalars are intentionally treated the same as objects and lists. A
+    # syntactically valid all-digit identifier is therefore JSON, deterministically,
+    # and receives an explicit error instead of being corrupted by text truncation.
+    return tool_output_too_large_json(max_chars, original_chars=len(result))
+
+
+def _has_plausible_json_root(data: str) -> bool:
+    """Return whether ``data`` starts like a JSON value after JSON whitespace.
+
+    This lightweight classification runs before the structured parser's work
+    limit. Clearly ordinary oversized text therefore keeps the useful head/tail
+    contract instead of being mislabeled as an oversized structured payload.
+    """
+    index = 0
+    while index < len(data) and data[index] in " \t\r\n":
+        index += 1
+    if index >= len(data):
+        return False
+
+    root = data[index]
+    if root in '{["0123456789':
+        return True
+    if root == "-":
+        return index + 1 < len(data) and data[index + 1].isdigit()
+    return data.startswith(("true", "false", "null"), index)
+
+
+def _validate_declared_tool_arguments(tool: FunctionTool, input_json: str) -> str | None:
+    """Reject undeclared top-level fields before permission checks or invocation.
+
+    The SDK emits ``additionalProperties: false`` in strict schemas, but its
+    generated Pydantic model ignores extras during direct ``on_invoke_tool``
+    calls. Enforce the advertised schema here so an ignored field cannot steer
+    permission extraction while a different declared field reaches the tool.
+    """
+    try:
+        arguments = json.loads(input_json) if input_json else {}
+    except (TypeError, ValueError):
+        return None  # Let the SDK produce its normal malformed-JSON error.
+    if not isinstance(arguments, dict):
+        return None
+
+    schema = tool.params_json_schema if isinstance(tool.params_json_schema, dict) else {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    undeclared = sorted(set(arguments) - set(properties))
+    if not undeclared:
+        return None
+
+    fields = ", ".join(undeclared)
+    return f"Invalid JSON input for tool {tool.name}: undeclared argument(s): {fields}"
 
 
 def _wrap_none_context(tool: FunctionTool) -> FunctionTool:
@@ -70,25 +315,29 @@ def _wrap_none_context(tool: FunctionTool) -> FunctionTool:
 
     @wraps(original_on_invoke_tool)
     async def _on_invoke_tool(ctx: ToolContext[Any] | None, input_json: str) -> Any:
-        if ctx is None:
-            ctx = ToolContext(
-                context=None,
-                tool_name=tool.name,
-                tool_call_id=f"manual-{tool.name}",
-                tool_arguments=input_json,
-            )
-        # Argument-level permission enforcement for the main agent chain. Returns a
-        # denial string (fed back to the model) when the active permission service
-        # blocks this specific call; None when allowed or when no service is active.
-        blocked = await enforce_tool_permission(tool.name, input_json)
-        if blocked is not None:
-            return blocked
-        result = await original_on_invoke_tool(ctx, input_json)
-        # Size guard: only truncate oversized *string* results; leave
-        # non-string results (dicts/objects) untouched.
-        if isinstance(result, str):
-            result = _truncate_tool_output(result, _get_max_tool_output_chars())
-        return result
+        invocation_token = begin_tool_invocation()
+        try:
+            max_chars = _get_max_tool_output_chars()
+            if ctx is None:
+                ctx = ToolContext(
+                    context=None,
+                    tool_name=tool.name,
+                    tool_call_id=f"manual-{tool.name}",
+                    tool_arguments=input_json,
+                )
+            argument_error = _validate_declared_tool_arguments(tool, input_json)
+            if argument_error is not None:
+                return _bound_tool_output(argument_error, max_chars)
+            # Argument-level permission enforcement for the main agent chain. Returns a
+            # denial string (fed back to the model) when the active permission service
+            # blocks this specific call; None when allowed or when no service is active.
+            blocked = await enforce_tool_permission(tool.name, input_json)
+            if blocked is not None:
+                return _bound_tool_output(blocked, max_chars)
+            result = await original_on_invoke_tool(ctx, input_json)
+            return _bound_tool_output(result, max_chars)
+        finally:
+            reset_tool_invocation(invocation_token)
 
     tool.on_invoke_tool = _on_invoke_tool
     return tool

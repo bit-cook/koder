@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..sandbox.enforcement import (
+    autoapproval_blockers,
+    backend_capability_digest,
+    canonical_workspace_path,
+    sandbox_degradation_reason,
+    sandbox_policy_digest,
+)
 from ..sandbox.workspace import protected_write_violation, read_only_violation
 from ..sandbox_settings import is_excluded_command, resolve_sandbox_settings
 from .denial_log import DenialLog
@@ -26,6 +33,11 @@ from .shell_classifier import (
     _tokenize_segments,
     classify_shell_command,
     normalize_segment_for_rule,
+)
+from .tool_arguments import (
+    ToolArgumentError,
+    extract_canonical_tool_target,
+    normalize_tool_arguments,
 )
 
 if TYPE_CHECKING:
@@ -165,7 +177,11 @@ class PermissionService:
         Returns the rule string that was persisted, or ``None`` if no rule
         target could be derived (nothing is persisted in that case).
         """
-        target = self._extract_rule_target(tool_name, arguments)
+        try:
+            normalized_arguments = normalize_tool_arguments(tool_name, arguments)
+        except ToolArgumentError:
+            return None
+        target = self._extract_rule_target(tool_name, normalized_arguments)
         if not target:
             return None
 
@@ -201,9 +217,6 @@ class PermissionService:
                             bucket.append(rule)
 
     def _extract_rule_target(self, tool_name: str, arguments: dict) -> str | None:
-        if tool_name in {"run_shell", "run_powershell"}:
-            command = arguments.get("command")
-            return command if isinstance(command, str) else None
         if tool_name == "git_command":
             command = arguments.get("command")
             if not isinstance(command, str):
@@ -212,19 +225,7 @@ class PermissionService:
             # token; normalize so allow/deny rules can match a stable "git ..."
             # target regardless of how the model phrased it.
             return command if command.strip().startswith("git") else f"git {command}"
-        if tool_name in {"Skill", "skill"}:
-            skill = arguments.get("skill")
-            if not isinstance(skill, str):
-                return None
-            arguments_text = arguments.get("arguments")
-            if isinstance(arguments_text, str) and arguments_text.strip():
-                return f"{skill} {arguments_text.strip()}"
-            return skill
-        for field_name in ("file_path", "path", "uri", "url"):
-            value = arguments.get(field_name)
-            if isinstance(value, str):
-                return value
-        return None
+        return extract_canonical_tool_target(tool_name, arguments)
 
     def _match_rule(self, tool_name: str, behavior: str, target: str | None) -> str | None:
         if not target:
@@ -435,6 +436,7 @@ class PermissionService:
             "write_file": "write",
             "edit_file": "write",
             "append_file": "write",
+            "notebook_edit": "write",
         }.get(tool_name)
         target = self._extract_rule_target(tool_name, arguments)
         if not operation or not target:
@@ -487,6 +489,16 @@ class PermissionService:
         )
 
     def evaluate_tool_call(self, tool_name: str, arguments: dict) -> PermissionEvaluationResult:
+        try:
+            arguments = normalize_tool_arguments(tool_name, arguments)
+        except ToolArgumentError as exc:
+            reason = f"invalid tool arguments: {exc}"
+            self.denial_log.record(tool_name, reason)
+            return PermissionEvaluationResult.deny(
+                tool_name=tool_name,
+                reason=reason,
+                mode=self.mode,
+            )
         target = self._extract_rule_target(tool_name, arguments)
 
         # For shell tools, match allow/deny rules PER SEGMENT so an ``echo:*``
@@ -572,11 +584,11 @@ class PermissionService:
             if state.enabled and not excluded_from_sandbox:
                 if tool_name == "run_powershell":
                     reason = (
-                        "sandbox is enabled, but PowerShell sandbox execution is not implemented; "
-                        "add a sandbox exclusion with /sandbox exclude, or run /sandbox disable"
+                        "sandbox protection is unavailable for PowerShell; unsandboxed fallback "
+                        "loses host-process, workspace, protected-path, and network protections "
+                        "and requires explicit approval"
                     )
-                    self.denial_log.record(tool_name, reason)
-                    return PermissionEvaluationResult.deny(
+                    return PermissionEvaluationResult.approval_required(
                         tool_name=tool_name,
                         reason=reason,
                         mode=self.mode,
@@ -596,11 +608,13 @@ class PermissionService:
 
                 if not state.backend_available or not state.platform_enabled:
                     reason = (
-                        "sandbox is enabled, but the configured backend is unavailable; "
-                        f"backend={state.backend}; reason={state.backend_reason}"
+                        "sandbox backend is unavailable; approving this request permits only a "
+                        "sandbox attempt. A second explicit approval is required before any "
+                        "unsandboxed fallback because host-process, workspace, protected-path, "
+                        f"and network protections would be lost; backend={state.backend}; "
+                        f"reason={state.backend_reason}"
                     )
-                    self.denial_log.record(tool_name, reason)
-                    return PermissionEvaluationResult.deny(
+                    return PermissionEvaluationResult.approval_required(
                         tool_name=tool_name,
                         reason=reason,
                         mode=self.mode,
@@ -620,18 +634,51 @@ class PermissionService:
                             reason=violation,
                             mode=self.mode,
                         )
+                    backend_status = next(
+                        (
+                            status
+                            for status in state.backend_statuses
+                            if status.backend_id == state.backend and status.available
+                        ),
+                        None,
+                    )
+                    blockers = (
+                        autoapproval_blockers(
+                            state.policy,
+                            backend_status.capabilities,
+                        )
+                        if backend_status is not None and backend_status.available
+                        else ()
+                    )
                     if (
                         decision.requires_approval
                         and state.auto_allow_bash_if_sandboxed
-                        and state.backend_available
-                        and state.policy is not None
+                        and backend_status is not None
+                        and backend_status.available
+                        and not blockers
                     ):
+                        canonical_cwd = canonical_workspace_path(current_cwd)
                         return PermissionEvaluationResult.allow(
                             tool_name=tool_name,
                             mode=self.mode,
                             reason=(
                                 f"sandboxed shell command auto-allowed; backend={state.backend}"
                             ),
+                            sandbox_backend=state.backend,
+                            sandbox_cwd=canonical_cwd,
+                            sandbox_policy_digest=sandbox_policy_digest(state.policy),
+                            sandbox_capability_digest=backend_capability_digest(
+                                backend_status.capabilities
+                            ),
+                        )
+                    if decision.requires_approval and blockers:
+                        degradation = sandbox_degradation_reason(state.backend, blockers)
+                        return self._apply_mode_override(
+                            PermissionEvaluationResult.approval_required(
+                                tool_name=tool_name,
+                                reason=f"{decision.reason}; {degradation}",
+                                mode=self.mode,
+                            )
                         )
             if not decision.allowed:
                 self.denial_log.record(tool_name, decision.reason)

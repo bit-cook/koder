@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from koder_agent.core.queued_input import ApprovalBroker
 from koder_agent.harness.permissions.interactive_approver import build_interactive_approver
 from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.results import PermissionEvaluationResult
@@ -70,6 +73,57 @@ def test_approver_prompt_includes_tool_and_reason():
     assert "write_file" in seen["prompt"]
 
 
+def test_approver_prompt_includes_notebook_path():
+    seen = {}
+
+    def _reader(prompt):
+        seen["prompt"] = prompt
+        return "n"
+
+    approver = build_interactive_approver(reader=_reader)
+    notebook_path = "/workspace/analysis.ipynb"
+    _run(approver, tool="notebook_edit", args={"notebook_path": notebook_path})
+
+    assert f"notebook_path={notebook_path}" in seen["prompt"]
+
+
+def test_approver_summary_uses_canonical_write_target():
+    seen = {}
+
+    def _reader(prompt):
+        seen["prompt"] = prompt
+        return "n"
+
+    approver = build_interactive_approver(reader=_reader)
+    target = "/workspace/output.txt"
+    _run(
+        approver,
+        tool="write_file",
+        args={"path": target, "file_path": target, "content": "hello"},
+    )
+
+    assert f"path={target}" in seen["prompt"]
+    assert "file_path=" not in seen["prompt"]
+
+
+def test_approver_summary_never_prefers_conflicting_alias():
+    seen = {}
+
+    def _reader(prompt):
+        seen["prompt"] = prompt
+        return "n"
+
+    approver = build_interactive_approver(reader=_reader)
+    _run(
+        approver,
+        tool="notebook_edit",
+        args={"path": "/workspace/decoy.ipynb", "notebook_path": "/tmp/outside.ipynb"},
+    )
+
+    assert "invalid_arguments=" in seen["prompt"]
+    assert "path=/workspace/decoy.ipynb" not in seen["prompt"]
+
+
 def test_default_reader_is_fail_closed_when_not_a_tty(monkeypatch):
     """With no injected reader and a non-interactive stdin, the approver must not
     hang or auto-allow — it fails closed."""
@@ -105,3 +159,38 @@ def test_approver_sanitizes_control_chars_in_prompt():
     # The injected 'command' value must not introduce a new physical line that
     # could impersonate the prompt's own structure.
     assert "\nfake=git status" not in p
+
+
+@pytest.mark.asyncio
+async def test_active_broker_owns_input_instead_of_terminal_reader():
+    broker = ApprovalBroker()
+    broker.activate()
+    reader_calls = []
+    approver = build_interactive_approver(
+        reader=lambda prompt: reader_calls.append(prompt) or "y",
+        approval_broker=broker,
+    )
+
+    task = asyncio.create_task(approver("run_shell", {"command": "touch marker"}, _decision()))
+    await asyncio.sleep(0)
+
+    assert broker.has_pending_request
+    assert broker.submit("n") is True
+    assert await task == "deny"
+    assert reader_calls == []
+    assert broker.prompt is None
+
+
+@pytest.mark.asyncio
+async def test_inactive_broker_uses_blocking_terminal_fallback():
+    broker = ApprovalBroker()
+    prompts = []
+    approver = build_interactive_approver(
+        reader=lambda prompt: prompts.append(prompt) or "y",
+        approval_broker=broker,
+    )
+
+    verdict = await approver("run_shell", {"command": "touch marker"}, _decision())
+
+    assert verdict == "allow"
+    assert len(prompts) == 1

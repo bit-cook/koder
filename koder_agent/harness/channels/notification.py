@@ -97,6 +97,7 @@ def validate_channel_permission_params(params: dict[str, Any]) -> tuple[str, str
 
 ChannelMessageCallback = Callable[[str, str, Optional[dict[str, str]]], Awaitable[None]]
 ChannelPermissionCallback = Callable[[str, str, str], Awaitable[None]]
+UnregisterCallback = Callable[[], None]
 
 
 class ChannelNotificationRouter:
@@ -107,16 +108,27 @@ class ChannelNotificationRouter:
     """
 
     def __init__(self) -> None:
-        self._message_callbacks: list[ChannelMessageCallback] = []
-        self._permission_callbacks: list[ChannelPermissionCallback] = []
+        self._message_callbacks: dict[int, ChannelMessageCallback] = {}
+        self._permission_callbacks: dict[int, ChannelPermissionCallback] = {}
+        self._next_callback_id = 0
 
-    def on_channel_message(self, callback: ChannelMessageCallback) -> None:
-        """Register a callback for channel message notifications."""
-        self._message_callbacks.append(callback)
+    def on_channel_message(self, callback: ChannelMessageCallback) -> UnregisterCallback:
+        """Register a message callback and return an idempotent unregister handle."""
+        return self._register(self._message_callbacks, callback)
 
-    def on_channel_permission(self, callback: ChannelPermissionCallback) -> None:
-        """Register a callback for channel permission notifications."""
-        self._permission_callbacks.append(callback)
+    def on_channel_permission(self, callback: ChannelPermissionCallback) -> UnregisterCallback:
+        """Register a permission callback and return an idempotent unregister handle."""
+        return self._register(self._permission_callbacks, callback)
+
+    def _register(self, callbacks: dict[int, Any], callback: Any) -> UnregisterCallback:
+        self._next_callback_id += 1
+        callback_id = self._next_callback_id
+        callbacks[callback_id] = callback
+
+        def unregister() -> None:
+            callbacks.pop(callback_id, None)
+
+        return unregister
 
     async def handle_channel_message(
         self,
@@ -125,7 +137,7 @@ class ChannelNotificationRouter:
         meta: Optional[dict[str, str]] = None,
     ) -> None:
         """Dispatch a channel message to all registered callbacks."""
-        for cb in self._message_callbacks:
+        for cb in list(self._message_callbacks.values()):
             try:
                 await cb(server_name, content, meta)
             except Exception as exc:
@@ -138,7 +150,7 @@ class ChannelNotificationRouter:
         behavior: str,
     ) -> None:
         """Dispatch a channel permission verdict to all registered callbacks."""
-        for cb in self._permission_callbacks:
+        for cb in list(self._permission_callbacks.values()):
             try:
                 await cb(server_name, request_id, behavior)
             except Exception as exc:

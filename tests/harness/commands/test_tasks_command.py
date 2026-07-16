@@ -15,7 +15,13 @@ def test_tasks_command_includes_auto_dream_task_records(tmp_path, monkeypatch):
     task = storage.create(
         "AutoDream memory consolidation",
         description="fixture",
-        metadata={"kind": "auto-dream", "memories_written": 2, "errors": []},
+        metadata={
+            "kind": "auto-dream",
+            "memories_written": 0,
+            "memory_candidates_staged": 2,
+            "skill_candidates_staged": 1,
+            "errors": [],
+        },
     )
     storage.update(task.id, status="completed")
 
@@ -23,7 +29,9 @@ def test_tasks_command_includes_auto_dream_task_records(tmp_path, monkeypatch):
 
     assert f"auto-dream/{task.id}" in output
     assert "AutoDream memory consolidation status=completed" in output
-    assert "memories=2" in output
+    assert "memories=0" in output
+    assert "memory_candidates=2" in output
+    assert "skill_candidates=1" in output
 
 
 def test_tasks_command_reports_malformed_auto_dream_records(tmp_path, monkeypatch):

@@ -790,7 +790,8 @@ class InteractivePrompt:
             nonlocal voice_message_visible
             text = buffer.text
             if queue_manager is not None:
-                if text.strip():
+                approval_submitted = queue_manager.approval_broker.submit(text)
+                if not approval_submitted and text.strip():
                     self.auto_suggest.record_input(text)
                     self.history.append_string(text)
                     queue_manager.enqueue(text)
@@ -921,6 +922,20 @@ class InteractivePrompt:
         queued_lines_window = Window(
             content=FormattedTextControl(_queued_lines_text),
             dont_extend_height=True,
+        )
+
+        def _approval_prompt_text():
+            if queue_manager is None:
+                return []
+            prompt = queue_manager.approval_broker.prompt
+            if not prompt:
+                return []
+            return [("class:approval-prompt", prompt.lstrip("\n"))]
+
+        approval_prompt_window = Window(
+            content=FormattedTextControl(_approval_prompt_text),
+            dont_extend_height=True,
+            wrap_lines=True,
         )
 
         def _tip_line_text():
@@ -1236,6 +1251,12 @@ class InteractivePrompt:
                     filter=Condition(lambda: queue_manager.has_pending()),
                 )
             )
+            components.append(
+                ConditionalContainer(
+                    approval_prompt_window,
+                    filter=Condition(lambda: queue_manager.approval_broker.has_pending_request),
+                )
+            )
         components.append(
             ConditionalContainer(
                 tip_line_window,
@@ -1374,8 +1395,11 @@ class InteractivePrompt:
             stream_output.attach_app(app)
 
         remove_queue_callback = None
+        remove_approval_callback = None
         if queue_manager is not None:
             remove_queue_callback = queue_manager.on_change(app.invalidate)
+            remove_approval_callback = queue_manager.approval_broker.on_change(app.invalidate)
+            queue_manager.approval_broker.activate()
 
         async def _run_until_stopped() -> str | None:
             run_task = asyncio.create_task(app.run_async())
@@ -1399,6 +1423,10 @@ class InteractivePrompt:
         try:
             return await _run_until_stopped()
         finally:
+            if queue_manager is not None:
+                queue_manager.approval_broker.deactivate()
+            if remove_approval_callback is not None:
+                remove_approval_callback()
             if remove_queue_callback is not None:
                 remove_queue_callback()
 

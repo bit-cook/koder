@@ -1,7 +1,9 @@
 """Tests for AutoDream background memory consolidation."""
 
+import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -12,10 +14,23 @@ from koder_agent.harness.memory.auto_dream import (
     DreamConfig,
     DreamState,
     list_auto_dream_tasks,
+    reconcile_stale_auto_dream_tasks,
     run_auto_dream_from_messages,
 )
+from koder_agent.harness.memory.candidates import CandidateStore
 from koder_agent.harness.memory.extraction import ExtractionResult
+from koder_agent.harness.memory.memory_files import parse_memory_file
+from koder_agent.harness.memory.retrieval import retrieve_relevant_memories
 from koder_agent.harness.tasks.storage import TaskStorage
+
+
+def _origin_kwargs(tmp_path: Path, *, session_id: str = "auto-dream-test-session") -> dict:
+    project_root = tmp_path / "origin-project"
+    project_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "origin_project_root": project_root,
+        "origin_session_id": session_id,
+    }
 
 
 class TestDreamConfig:
@@ -27,6 +42,7 @@ class TestDreamConfig:
         assert config.enabled is True
         assert config.cooldown_minutes == 60
         assert config.min_sessions == 3
+        assert config.write_mode == "review"
 
     def test_custom_values(self):
         """Test custom configuration values."""
@@ -34,10 +50,16 @@ class TestDreamConfig:
             enabled=False,
             cooldown_minutes=30,
             min_sessions=5,
+            write_mode="off",
         )
         assert config.enabled is False
         assert config.cooldown_minutes == 30
         assert config.min_sessions == 5
+        assert config.write_mode == "off"
+
+    def test_invalid_write_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="write_mode"):
+            DreamConfig(write_mode="unsafe")
 
 
 class TestDreamState:
@@ -271,9 +293,10 @@ class TestAutoDreamManager:
 
 
 @pytest.mark.asyncio
-async def test_run_auto_dream_from_messages_writes_memory_file(tmp_path: Path):
+async def test_run_auto_dream_defaults_to_review_without_retrieval_visible_write(tmp_path: Path):
     state_file = tmp_path / "dream_state.json"
-    memory_dir = tmp_path / "memory"
+    memory_dir = tmp_path / "origin-project" / ".koder" / "memory"
+    candidate_store = CandidateStore(tmp_path / "memory-candidates", kind="memory")
     manager = AutoDreamManager(
         config=DreamConfig(cooldown_minutes=0, min_sessions=1),
         state_path=state_file,
@@ -299,25 +322,213 @@ async def test_run_auto_dream_from_messages_writes_memory_file(tmp_path: Path):
         result = await run_auto_dream_from_messages(
             [{"role": "user", "content": "remember tmux verification"}],
             manager=manager,
-            memory_dir=memory_dir,
+            **_origin_kwargs(tmp_path),
+            memory_candidate_store=candidate_store,
         )
 
-    assert result.memories_written == 1
+    assert result.memories_written == 0
+    assert result.memory_candidates_staged == 1
     assert result.errors == []
-    assert result.saved_path is not None
-    saved = result.saved_path.read_text(encoding="utf-8")
-    assert "AutoDream consolidated session memories" in saved
-    assert "Use tmux scenarios for TUI verification." in saved
+    assert result.saved_path is None
+    assert len(candidate_store.list()) == 1
+    candidate = candidate_store.list()[0]
+    assert candidate.storage_scope == "project"
+    assert candidate.origin_project_root == str((tmp_path / "origin-project").resolve())
+    assert candidate.origin_session_id == "auto-dream-test-session"
+    retrieval = retrieve_relevant_memories("tmux verification", [memory_dir], max_tokens=1000)
+    assert retrieval.memories == []
     assert manager.state.dream_count == 1
     assert manager.state.session_count == 0
     assert state_file.exists()
 
 
 @pytest.mark.asyncio
+async def test_run_auto_dream_automatic_writes_memory_file(tmp_path: Path):
+    manager = AutoDreamManager(
+        config=DreamConfig(cooldown_minutes=0, min_sessions=1, write_mode="automatic"),
+        state_path=tmp_path / "dream_state.json",
+    )
+    manager.record_session()
+    extraction = ExtractionResult(
+        memories=[
+            {
+                "type": "project",
+                "content": "Use tmux scenarios for TUI verification.",
+                "description": "Validation preference",
+            }
+        ],
+        errors=[],
+    )
+
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "remember tmux verification"}],
+            manager=manager,
+            **_origin_kwargs(tmp_path),
+        )
+
+    assert result.memories_written == 1
+    assert result.memory_candidates_staged == 0
+    assert result.saved_path is not None
+    assert "Use tmux scenarios for TUI verification." in result.saved_path.read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_mode_groups_actual_types_and_scopes_without_cross_project_leak(
+    tmp_path: Path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    home.mkdir()
+    project_a.mkdir()
+    project_b.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    extraction = ExtractionResult(
+        memories=[
+            {
+                "type": "project",
+                "content": "projectalphazxq",
+                "description": "Project-only fact",
+            },
+            {
+                "type": "user",
+                "content": "globaluserqvx",
+                "description": "Cross-project user fact",
+            },
+            {
+                "type": "feedback",
+                "content": "feedback alpha governance marker",
+                "description": "Project-local correction",
+            },
+            {
+                "type": "reference",
+                "content": "reference alpha governance marker",
+                "description": "Project-local reference",
+            },
+        ],
+        errors=[],
+    )
+
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "persist governed memories"}],
+            manager=AutoDreamManager(config=DreamConfig(write_mode="automatic")),
+            origin_project_root=project_a,
+            origin_session_id="project-a-session",
+        )
+
+    project_files = sorted((project_a / ".koder" / "memory").glob("*.md"))
+    user_files = sorted((home / ".koder" / "memory").glob("*.md"))
+    assert result.memories_written == 4
+    assert set(result.saved_paths) == set(project_files + user_files)
+    assert len(project_files) == 3
+    assert len(user_files) == 1
+    project_metadata = [
+        parse_memory_file(path.read_text(encoding="utf-8")) for path in project_files
+    ]
+    user_metadata = [parse_memory_file(path.read_text(encoding="utf-8")) for path in user_files]
+    assert {parsed.memory_type for parsed in project_metadata} == {
+        "feedback",
+        "project",
+        "reference",
+    }
+    assert {parsed.metadata["storage_scope"] for parsed in project_metadata} == {"project"}
+    assert user_metadata[0].memory_type == "user"
+    assert user_metadata[0].metadata["storage_scope"] == "user"
+    assert all(
+        "origin_project_root" not in parsed.metadata for parsed in project_metadata + user_metadata
+    )
+
+    project_from_b = retrieve_relevant_memories(
+        "projectalphazxq",
+        [project_b / ".koder" / "memory", home / ".koder" / "memory"],
+        max_tokens=1000,
+    )
+    user_from_b = retrieve_relevant_memories(
+        "globaluserqvx",
+        [project_b / ".koder" / "memory", home / ".koder" / "memory"],
+        max_tokens=1000,
+    )
+    assert project_from_b.memories == []
+    assert [memory.path for memory in user_from_b.memories] == user_files
+
+
+@pytest.mark.asyncio
+async def test_run_auto_dream_off_skips_extraction_and_writes(tmp_path: Path):
+    manager = AutoDreamManager(config=DreamConfig(write_mode="off"))
+
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+    ) as extract:
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "secret"}],
+            manager=manager,
+            **_origin_kwargs(tmp_path),
+            memory_candidate_store=CandidateStore(tmp_path / "memory-candidates", kind="memory"),
+        )
+
+    extract.assert_not_awaited()
+    assert result.memories_written == 0
+    assert result.memory_candidates_staged == 0
+    assert not (tmp_path / "origin-project" / ".koder" / "memory").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_auto_dream_stages_skill_candidates_separately(tmp_path: Path):
+    memory_store = CandidateStore(tmp_path / "memory-candidates", kind="memory")
+    skill_store = CandidateStore(tmp_path / "skill-candidates", kind="skill")
+    manager = AutoDreamManager(config=DreamConfig(write_mode="review"))
+    extraction = ExtractionResult(
+        memories=[{"type": "project", "content": "Use uv.", "description": "Tooling"}],
+        skill_candidates=[
+            {
+                "name": "verify-first",
+                "description": "Run focused verification",
+                "instructions": "Run focused tests before broader suites.",
+            }
+        ],
+        errors=[],
+    )
+
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "Use uv and verify first"}],
+            manager=manager,
+            **_origin_kwargs(tmp_path),
+            memory_candidate_store=memory_store,
+            skill_candidate_store=skill_store,
+        )
+
+    assert result.memory_candidates_staged == 1
+    assert result.skill_candidates_staged == 1
+    assert len(memory_store.list()) == 1
+    assert len(skill_store.list()) == 1
+    assert memory_store.list()[0].kind == "memory"
+    assert skill_store.list()[0].kind == "skill"
+
+
+@pytest.mark.asyncio
 async def test_run_auto_dream_from_messages_records_task_state(tmp_path: Path):
     task_storage = TaskStorage(tmp_path / "tasks")
     manager = AutoDreamManager(
-        config=DreamConfig(cooldown_minutes=0, min_sessions=1),
+        config=DreamConfig(cooldown_minutes=0, min_sessions=1, write_mode="automatic"),
         state_path=tmp_path / "dream_state.json",
     )
     manager.record_session()
@@ -341,7 +552,7 @@ async def test_run_auto_dream_from_messages_records_task_state(tmp_path: Path):
         result = await run_auto_dream_from_messages(
             [{"role": "user", "content": "record task state"}],
             manager=manager,
-            memory_dir=tmp_path / "memory",
+            **_origin_kwargs(tmp_path),
             task_storage=task_storage,
         )
 
@@ -360,7 +571,7 @@ async def test_run_auto_dream_from_messages_records_task_state(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_run_auto_dream_from_messages_records_attempt_without_memories(tmp_path: Path):
     manager = AutoDreamManager(
-        config=DreamConfig(cooldown_minutes=0, min_sessions=1),
+        config=DreamConfig(cooldown_minutes=0, min_sessions=1, write_mode="automatic"),
         state_path=tmp_path / "dream_state.json",
     )
     manager.record_session()
@@ -375,11 +586,221 @@ async def test_run_auto_dream_from_messages_records_attempt_without_memories(tmp
         result = await run_auto_dream_from_messages(
             [{"role": "user", "content": "nothing durable"}],
             manager=manager,
-            memory_dir=tmp_path / "memory",
+            **_origin_kwargs(tmp_path),
         )
 
     assert result.saved_path is None
     assert result.memories_written == 0
-    assert result.errors == ["model unavailable"]
+    assert result.errors == ["extraction_error: model unavailable"]
     assert manager.state.dream_count == 1
     assert manager.state.session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_secret_memory_is_not_persisted_in_review_mode(tmp_path: Path):
+    store = CandidateStore(tmp_path / "memory-candidates", kind="memory")
+    extraction = ExtractionResult(
+        memories=[
+            {
+                "type": "project",
+                "content": "credential sk-live-EXAMPLE-SECRET",
+                "description": "must reject",
+            }
+        ],
+        errors=[],
+    )
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "secret"}],
+            manager=AutoDreamManager(config=DreamConfig(write_mode="review")),
+            **_origin_kwargs(tmp_path),
+            memory_candidate_store=store,
+        )
+
+    assert store.list() == []
+    assert result.memory_candidates_staged == 0
+    assert all("sk-live" not in error for error in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_secret_memory_is_not_persisted_in_automatic_mode(tmp_path: Path):
+    extraction = ExtractionResult(
+        memories=[
+            {
+                "type": "project",
+                "content": "credential sk-live-EXAMPLE-SECRET",
+                "description": "must reject",
+            }
+        ],
+        errors=[],
+    )
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        result = await run_auto_dream_from_messages(
+            [{"role": "user", "content": "secret"}],
+            manager=AutoDreamManager(config=DreamConfig(write_mode="automatic")),
+            **_origin_kwargs(tmp_path),
+        )
+
+    assert result.saved_path is None
+    assert not (tmp_path / "origin-project" / ".koder" / "memory").exists()
+    assert all("sk-live" not in error for error in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_provider_error_secret_is_redacted_from_task_metadata(tmp_path: Path):
+    storage = TaskStorage(tmp_path / "tasks")
+    secret = "sk-live-EXAMPLE-SECRET"
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError(f"provider failed with {secret}"),
+    ):
+        with pytest.raises(RuntimeError):
+            await run_auto_dream_from_messages(
+                [{"role": "user", "content": "trigger"}],
+                manager=AutoDreamManager(config=DreamConfig(write_mode="review")),
+                **_origin_kwargs(tmp_path),
+                task_storage=storage,
+            )
+
+    task = storage.list_all()[0]
+    assert task.status == "failed"
+    assert secret not in json.dumps(task.to_dict())
+    assert "[REDACTED]" in json.dumps(task.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_automatic_runs_in_same_second_do_not_overwrite(tmp_path: Path):
+    extraction = ExtractionResult(
+        memories=[{"type": "project", "content": "durable", "description": "same second"}],
+        errors=[],
+    )
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        new_callable=AsyncMock,
+        return_value=extraction,
+    ):
+        results = [
+            await run_auto_dream_from_messages(
+                [{"role": "user", "content": "trigger"}],
+                manager=AutoDreamManager(config=DreamConfig(write_mode="automatic")),
+                **_origin_kwargs(tmp_path),
+            )
+            for _ in range(2)
+        ]
+
+    assert results[0].saved_path != results[1].saved_path
+    assert len(list((tmp_path / "origin-project" / ".koder" / "memory").glob("*.md"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_marks_auto_dream_task_terminal(tmp_path: Path):
+    storage = TaskStorage(tmp_path / "tasks")
+
+    async def slow_extraction(_messages):
+        await asyncio.sleep(10)
+
+    with patch(
+        "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+        side_effect=slow_extraction,
+    ):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                run_auto_dream_from_messages(
+                    [{"role": "user", "content": "trigger"}],
+                    manager=AutoDreamManager(config=DreamConfig(write_mode="review")),
+                    **_origin_kwargs(tmp_path),
+                    task_storage=storage,
+                ),
+                timeout=0.01,
+            )
+
+    task = storage.list_all()[0]
+    assert task.status == "cancelled"
+    assert task.metadata["failure_code"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_marks_auto_dream_task_terminal(tmp_path: Path):
+    storage = TaskStorage(tmp_path / "tasks")
+    extraction = ExtractionResult(
+        memories=[{"type": "project", "content": "durable", "description": "write"}],
+        errors=[],
+    )
+    with (
+        patch(
+            "koder_agent.harness.memory.auto_dream.llm_extract_memories",
+            new_callable=AsyncMock,
+            return_value=extraction,
+        ),
+        patch(
+            "koder_agent.harness.memory.auto_dream.write_approved_output",
+            side_effect=OSError("disk failed"),
+        ),
+    ):
+        with pytest.raises(OSError, match="disk failed"):
+            await run_auto_dream_from_messages(
+                [{"role": "user", "content": "trigger"}],
+                manager=AutoDreamManager(config=DreamConfig(write_mode="automatic")),
+                **_origin_kwargs(tmp_path),
+                task_storage=storage,
+            )
+
+    task = storage.list_all()[0]
+    assert task.status == "failed"
+    assert task.metadata["failure_code"] == "persistence_failure"
+
+
+def test_startup_reconciles_stale_auto_dream_task(tmp_path: Path):
+    storage = TaskStorage(tmp_path / "tasks")
+    task = storage.create(
+        "AutoDream memory consolidation",
+        metadata={"kind": "auto-dream", "started_at": datetime.now(timezone.utc).isoformat()},
+    )
+    storage.update(task.id, status="in_progress")
+
+    count = reconcile_stale_auto_dream_tasks(
+        storage,
+        now=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+
+    reconciled = storage.get(task.id)
+    assert count == 1
+    assert reconciled is not None
+    assert reconciled.status == "failed"
+    assert reconciled.metadata["failure_code"] == "interrupted"
+
+
+def test_malformed_task_record_does_not_block_stale_auto_dream_reconciliation(
+    tmp_path: Path,
+    caplog,
+):
+    storage = TaskStorage(tmp_path / "tasks")
+    task = storage.create(
+        "AutoDream memory consolidation",
+        metadata={"kind": "auto-dream", "started_at": datetime.now(timezone.utc).isoformat()},
+    )
+    storage.update(task.id, status="in_progress")
+    (storage.root / "broken.json").write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        count = reconcile_stale_auto_dream_tasks(
+            storage,
+            now=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+
+    reconciled = storage.get(task.id)
+    assert count == 1
+    assert reconciled is not None
+    assert reconciled.status == "failed"
+    assert reconciled.metadata["failure_code"] == "interrupted"
+    assert "broken.json" in caplog.text
+    assert (storage.root / "broken.json").read_text(encoding="utf-8") == "{not json"

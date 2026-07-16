@@ -422,7 +422,7 @@ class TestAutoCompact:
                     {"role": "assistant", "content": "done"},
                 ]
             )
-            mock_session.clear_session = AsyncMock()
+            mock_session.replace_items = AsyncMock()
             mock_session.db_path = ":memory:"
             mock_session_cls.return_value = mock_session
 
@@ -444,7 +444,7 @@ class TestAutoCompact:
                 context_window=50_000, max_output_tokens=10_000
             )
 
-            # Mock add_items on the session (threshold bypass uses add_items)
+            # File restoration still appends through add_items.
             mock_session.add_items = AsyncMock()
             mock_session.summarization_threshold = None
 
@@ -452,11 +452,10 @@ class TestAutoCompact:
 
             # Verify compaction was called
             mock_compact.assert_called_once()
-            # Verify session was cleared then repopulated
-            mock_session.clear_session.assert_called_once()
-            mock_session.add_items.assert_called_once()
+            # Verify session history was replaced in one operation.
+            mock_session.replace_items.assert_called_once()
             # Verify the compacted items include summary + kept messages
-            added_items = mock_session.add_items.call_args[0][0]
+            added_items = mock_session.replace_items.call_args[0][0]
             assert added_items[0]["content"].startswith("[Conversation compacted]")
             assert len(added_items) == 3  # summary + 2 kept messages
             # Verify circuit breaker success was recorded
@@ -482,7 +481,7 @@ class TestAutoCompact:
                     {"role": "assistant", "content": "latest answer"},
                 ]
             )
-            mock_session.clear_session = AsyncMock()
+            mock_session.replace_items = AsyncMock()
             mock_session.add_items = AsyncMock()
             mock_session.summarization_threshold = None
             mock_session.db_path = ":memory:"
@@ -506,7 +505,7 @@ class TestAutoCompact:
 
             await scheduler._run_auto_compact()
 
-            compacted_items = mock_session.add_items.call_args[0][0]
+            compacted_items = mock_session.replace_items.call_args[0][0]
             expected = 17 + estimate_messages_tokens(compacted_items)
             assert scheduler.usage_tracker.session_usage.current_context_tokens == expected
 
@@ -525,8 +524,7 @@ class TestAutoCompact:
             mock_session.get_items = AsyncMock(
                 return_value=[valid_item, {"role": "unknown", "content": ""}]
             )
-            mock_session.clear_session = AsyncMock()
-            mock_session.add_items = AsyncMock()
+            mock_session.replace_items = AsyncMock()
             mock_session.summarization_threshold = None
             mock_session.db_path = ":memory:"
             mock_session_cls.return_value = mock_session
@@ -538,8 +536,7 @@ class TestAutoCompact:
 
             await scheduler._repair_unreplayable_session_items()
 
-            mock_session.clear_session.assert_called_once()
-            mock_session.add_items.assert_called_once_with([valid_item])
+            mock_session.replace_items.assert_called_once_with([valid_item])
             assert scheduler.usage_tracker.session_usage.current_context_tokens == (
                 estimate_messages_tokens([valid_item])
             )
@@ -594,7 +591,7 @@ class TestAutoCompact:
             mock_session = AsyncMock()
             mock_session.session_id = "test"
             mock_session.get_items = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
-            mock_session.clear_session = AsyncMock()
+            mock_session.replace_items = AsyncMock()
             mock_session.db_path = ":memory:"
             mock_session_cls.return_value = mock_session
 
@@ -616,15 +613,11 @@ class TestAutoCompact:
 
             assert scheduler._auto_compact._consecutive_failures == 0
             # A no-op never rewrites the session.
-            mock_session.clear_session.assert_not_called()
+            mock_session.replace_items.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_run_auto_compact_restores_original_items_when_add_fails(self):
-        """If add_items(compacted) fails, the original conversation must be restored.
-
-        clear_session() + add_items() are non-atomic; a failure between them would
-        otherwise leave history empty. The original snapshot must be re-added.
-        """
+    async def test_run_auto_compact_records_atomic_replace_failure(self):
+        """A failed atomic replacement records failure without a restore write."""
         original_items = [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi there"},
@@ -641,19 +634,10 @@ class TestAutoCompact:
             mock_session = AsyncMock()
             mock_session.session_id = "test"
             mock_session.get_items = AsyncMock(return_value=list(original_items))
-            mock_session.clear_session = AsyncMock()
+            mock_session.replace_items = AsyncMock(side_effect=RuntimeError("disk full"))
             mock_session.summarization_threshold = None
             mock_session.db_path = ":memory:"
-
-            added_batches = []
-
-            async def add_items_side_effect(batch):
-                added_batches.append(batch)
-                # The first add (the compacted history) fails; the restore add works.
-                if len(added_batches) == 1:
-                    raise RuntimeError("disk full")
-
-            mock_session.add_items = AsyncMock(side_effect=add_items_side_effect)
+            mock_session.add_items = AsyncMock()
             mock_session_cls.return_value = mock_session
 
             mock_compact.return_value = CompactionResult(
@@ -675,10 +659,106 @@ class TestAutoCompact:
 
             await scheduler._run_auto_compact()
 
-            # Two add_items calls: the failed compacted write, then the restore.
-            assert len(added_batches) == 2
-            assert added_batches[1] == original_items  # history restored, not empty
+            mock_session.replace_items.assert_called_once()
+            mock_session.add_items.assert_not_called()
             assert scheduler._auto_compact._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_run_auto_compact_rollback_removes_partial_compacted_items(self):
+        """A partial failed write is cleared before originals are restored."""
+        original_items = [
+            {"role": "user", "content": "ORIGINAL_A"},
+            {"role": "assistant", "content": "ORIGINAL_B"},
+        ]
+
+        class PartialWriteSession:
+            session_id = "test"
+            db_path = ":memory:"
+            summarization_threshold = None
+
+            def __init__(self):
+                self.items = list(original_items)
+                self.add_calls = 0
+
+            async def get_items(self):
+                return list(self.items)
+
+            async def clear_session(self):
+                self.items.clear()
+
+            async def add_items(self, batch):
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    self.items.append({"role": "assistant", "content": "PARTIAL_COMPACTED"})
+                    raise RuntimeError("partial disk write")
+                self.items.extend(batch)
+
+        session = PartialWriteSession()
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession", return_value=session),
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            mock_compact.return_value = CompactionResult(
+                summary="PARTIAL_COMPACTED",
+                kept_messages=[],
+                token_count=10,
+                original_count=2,
+            )
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
+
+            await scheduler._run_auto_compact()
+
+        assert session.items == original_items
+        assert all("PARTIAL_COMPACTED" not in str(item) for item in session.items)
+        assert scheduler._auto_compact._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_restore_prefers_replace_items_capability(self):
+        original_items = [{"role": "user", "content": "ORIGINAL"}]
+
+        class ReplaceCapableSession:
+            session_id = "test"
+            db_path = ":memory:"
+
+            def __init__(self):
+                self.items = [{"role": "assistant", "content": "PARTIAL_COMPACTED"}]
+                self.replace_calls = 0
+
+            async def replace_items(self, items):
+                self.replace_calls += 1
+                self.items = list(items)
+
+            async def get_items(self):
+                return list(self.items)
+
+            async def clear_session(self):
+                raise AssertionError("replace_items should be preferred")
+
+            async def add_items(self, _items):
+                raise AssertionError("replace_items should be preferred")
+
+        session = ReplaceCapableSession()
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession", return_value=session),
+        ):
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            await scheduler._restore_session_items(original_items)
+
+        assert session.replace_calls == 1
+        assert session.items == original_items
 
     @pytest.mark.asyncio
     async def test_run_auto_compact_adds_file_restoration_attachments(self):
@@ -716,7 +796,12 @@ class TestAutoCompact:
                 mock_session = AsyncMock()
                 mock_session.session_id = "test"
                 mock_session.get_items = AsyncMock(return_value=list(original_items))
-                mock_session.clear_session = AsyncMock()
+                replaced_batches = []
+
+                async def replace_items_side_effect(batch):
+                    replaced_batches.append(batch)
+
+                mock_session.replace_items = AsyncMock(side_effect=replace_items_side_effect)
                 mock_session.summarization_threshold = None
                 mock_session.db_path = ":memory:"
 
@@ -744,21 +829,21 @@ class TestAutoCompact:
 
                 await scheduler._run_auto_compact()
 
-                # First add: compacted history. Second add: restoration attachments.
-                assert len(added_batches) == 2
-                attachments = added_batches[1]
+                assert len(replaced_batches) == 1
+                # Replacement is atomic; restoration attachments append afterward.
+                assert len(added_batches) == 1
+                attachments = added_batches[0]
                 assert len(attachments) == 1
                 assert "def restored" in attachments[0]["content"]
                 assert str(read_path) in attachments[0]["content"]
                 assert scheduler._auto_compact._consecutive_failures == 0
 
 
-class TestRepairUnreplayableRestore:
-    """Verify _repair_unreplayable_session_items never loses history on failure."""
+class TestRepairUnreplayableAtomicity:
+    """Verify repair delegates rollback guarantees to atomic replacement."""
 
     @pytest.mark.asyncio
-    async def test_repair_restores_original_items_when_add_fails(self):
-        """If the re-add of replayable items fails, the original items are restored."""
+    async def test_repair_does_not_issue_fragile_restore_when_replace_fails(self):
         original_items = [
             {"role": "user", "content": "hello"},
             {"role": "unknown", "content": ""},  # unreplayable -> triggers rewrite
@@ -772,18 +857,10 @@ class TestRepairUnreplayableRestore:
             mock_session = AsyncMock()
             mock_session.session_id = "test"
             mock_session.get_items = AsyncMock(return_value=list(original_items))
-            mock_session.clear_session = AsyncMock()
+            mock_session.replace_items = AsyncMock(side_effect=RuntimeError("disk full"))
             mock_session.summarization_threshold = None
             mock_session.db_path = ":memory:"
-
-            added_batches = []
-
-            async def add_items_side_effect(batch):
-                added_batches.append(batch)
-                if len(added_batches) == 1:
-                    raise RuntimeError("disk full")
-
-            mock_session.add_items = AsyncMock(side_effect=add_items_side_effect)
+            mock_session.add_items = AsyncMock()
             mock_session_cls.return_value = mock_session
 
             from koder_agent.core.scheduler import AgentScheduler
@@ -793,9 +870,53 @@ class TestRepairUnreplayableRestore:
 
             await scheduler._repair_unreplayable_session_items()
 
-            # First add (replayable subset) failed; second add restored the originals.
-            assert len(added_batches) == 2
-            assert added_batches[1] == original_items
+            mock_session.replace_items.assert_called_once_with([original_items[0]])
+            mock_session.add_items.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repair_rollback_removes_partial_and_restores_once(self):
+        original_items = [
+            {"role": "user", "content": "ORIGINAL_A"},
+            {"role": "unknown", "content": "ORIGINAL_B"},
+        ]
+
+        class PartialRepairSession:
+            session_id = "test"
+            db_path = ":memory:"
+            summarization_threshold = None
+
+            def __init__(self):
+                self.items = list(original_items)
+                self.add_calls = 0
+
+            async def get_items(self):
+                return list(self.items)
+
+            async def clear_session(self):
+                self.items.clear()
+
+            async def add_items(self, batch):
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    self.items.append({"role": "assistant", "content": "PARTIAL_COMPACTED"})
+                    raise RuntimeError("partial disk write")
+                self.items.extend(batch)
+
+        session = PartialRepairSession()
+        with (
+            patch("koder_agent.core.scheduler.get_all_tools", return_value=[]),
+            patch("koder_agent.core.scheduler.get_display_hooks"),
+            patch("koder_agent.core.scheduler.ApprovalHooks"),
+            patch("koder_agent.core.scheduler.EnhancedSQLiteSession", return_value=session),
+        ):
+            from koder_agent.core.scheduler import AgentScheduler
+
+            scheduler = AgentScheduler(session_id="test")
+            scheduler._estimate_static_context_tokens = MagicMock(return_value=0)
+            await scheduler._repair_unreplayable_session_items()
+
+        assert session.items == original_items
+        assert all("PARTIAL_COMPACTED" not in str(item) for item in session.items)
 
 
 class TestSessionMemoryExtraction:

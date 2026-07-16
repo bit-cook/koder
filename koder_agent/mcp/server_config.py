@@ -68,6 +68,36 @@ class MCPServerConfig(BaseModel):
     source_path: Optional[str] = Field(
         default=None, description="Source file that defined the server"
     )
+    source_digest: Optional[str] = Field(
+        default=None,
+        description="Digest of the expanded executable project MCP configuration",
+    )
+    project_root: Optional[str] = Field(
+        default=None,
+        description="Canonical project/workspace root that owns this project MCP source",
+    )
+    execution_cwd: Optional[str] = Field(
+        default=None,
+        description="Fixed reviewed working directory used for project MCP subprocesses",
+    )
+    execution_descriptor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Reviewed executable identity, PATH, argv, cwd, and file fingerprint",
+    )
+    headers_helper_argv: Optional[List[str]] = Field(
+        default=None,
+        description="Shell-free reviewed argv used for project-scoped headersHelper execution",
+    )
+    source_content_digest: Optional[str] = Field(
+        default=None,
+        description="Digest of the source file bytes used to detect runtime source changes",
+    )
+    source_template: Optional[Dict[str, Any]] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="Unexpanded in-memory source mapping used only for reconnect revalidation",
+    )
 
     @field_validator("command")
     @classmethod

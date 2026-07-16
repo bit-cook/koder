@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import os
 import re
+import shlex
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, List, Optional
@@ -28,6 +32,7 @@ except ImportError:  # pragma: no cover
 
 _PROJECT_MCP_FILENAME = ".mcp.json"
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+_PROJECT_HELPER_SHELL_SYNTAX = re.compile(r"[\n\r;&|<>`$()]")
 
 
 class MCPServerManager:
@@ -73,6 +78,15 @@ class MCPServerManager:
         return MCPServerManager._cwd_path(cwd) / _PROJECT_MCP_FILENAME
 
     @staticmethod
+    def project_boundary(cwd: str | Path | None = None) -> Path:
+        """Return the repository/workspace boundary for project MCP discovery."""
+        current = MCPServerManager._cwd_path(cwd)
+        for candidate in (current, *current.parents):
+            if (candidate / ".git").exists():
+                return candidate
+        return current
+
+    @staticmethod
     def _normalize_scope(scope: MCPServerScope | str | None) -> MCPServerScope:
         if scope is None:
             return MCPServerScope.LOCAL
@@ -88,8 +102,15 @@ class MCPServerManager:
 
     @staticmethod
     def _project_candidate_paths(cwd: str | Path | None = None) -> list[Path]:
-        root = MCPServerManager._cwd_path(cwd)
-        candidates = [root, *root.parents]
+        current = MCPServerManager._cwd_path(cwd)
+        boundary = MCPServerManager.project_boundary(current)
+        candidates: list[Path] = []
+        candidate = current
+        while True:
+            candidates.append(candidate)
+            if candidate == boundary:
+                break
+            candidate = candidate.parent
         candidates.reverse()
         return [candidate / _PROJECT_MCP_FILENAME for candidate in candidates]
 
@@ -100,6 +121,134 @@ class MCPServerManager:
             return True
         except ValueError:
             return False
+
+    @classmethod
+    def validate_project_source_path(
+        cls,
+        source_path: str | Path,
+        project_root: str | Path,
+    ) -> Path:
+        """Return a canonical in-project source path, rejecting source symlinks.
+
+        Project MCP approval is intentionally bound to a regular file reached
+        without traversing symlinks. This prevents a repository path from being
+        retargeted outside the reviewed workspace after approval.
+        """
+        root = Path(project_root).expanduser().resolve(strict=True)
+        source = Path(source_path).expanduser()
+        if not source.is_absolute():
+            source = root / source
+        source = source.absolute()
+
+        try:
+            relative = source.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Project MCP source is outside project root: {source}") from exc
+
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"Project MCP source symlinks are not allowed: {current}")
+
+        resolved = source.resolve(strict=True)
+        if not cls._path_contains(root, resolved):
+            raise ValueError(f"Project MCP source resolves outside project root: {source}")
+        if not resolved.is_file():
+            raise ValueError(f"Project MCP source is not a regular file: {resolved}")
+        return resolved
+
+    @staticmethod
+    def _source_content_digest(source_path: str | Path) -> str:
+        return hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+
+    @staticmethod
+    def _reviewed_path(env_vars: dict[str, str], execution_cwd: Path) -> str:
+        """Return an explicit absolute PATH whose relative entries use the reviewed cwd."""
+        configured = env_vars.get("PATH", os.environ.get("PATH", os.defpath))
+        entries: list[str] = []
+        for raw_entry in configured.split(os.pathsep):
+            entry = Path(raw_entry or execution_cwd).expanduser()
+            if not entry.is_absolute():
+                entry = execution_cwd / entry
+            entries.append(str(entry.absolute()))
+        return os.pathsep.join(entries)
+
+    @staticmethod
+    def _executable_fingerprint(path: Path) -> dict[str, object]:
+        digest = hashlib.sha256()
+        with path.open("rb") as executable:
+            for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+                digest.update(chunk)
+            stat = os.fstat(executable.fileno())
+        return {"sha256": digest.hexdigest(), "size": stat.st_size}
+
+    @classmethod
+    def _resolve_reviewed_executable(
+        cls,
+        command: str,
+        *,
+        reviewed_path: str,
+        execution_cwd: Path,
+        label: str,
+    ) -> tuple[str, dict[str, object]]:
+        """Resolve and fingerprint one executable without accepting a symlink target."""
+        has_separator = os.sep in command or (os.altsep is not None and os.altsep in command)
+        command_path = Path(command).expanduser()
+        if command_path.is_absolute() or has_separator:
+            candidate = command_path if command_path.is_absolute() else execution_cwd / command_path
+            candidate = candidate.absolute()
+        else:
+            located = shutil.which(command, path=reviewed_path)
+            if located is None:
+                raise ValueError(
+                    f"{label} executable could not be resolved on reviewed PATH: {command}"
+                )
+            candidate = Path(located).absolute()
+
+        if candidate.is_symlink():
+            raise ValueError(f"{label} executable symlinks are not allowed: {candidate}")
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"{label} executable could not be resolved: {candidate}") from exc
+        if not resolved.is_file():
+            raise ValueError(f"{label} executable is not a regular file: {resolved}")
+        if not os.access(resolved, os.X_OK):
+            raise ValueError(f"{label} executable is not executable: {resolved}")
+        return str(resolved), cls._executable_fingerprint(resolved)
+
+    @classmethod
+    def _project_headers_helper_argv(
+        cls,
+        helper: str,
+        *,
+        reviewed_path: str,
+        execution_cwd: Path,
+    ) -> tuple[list[str], dict[str, object]]:
+        if _PROJECT_HELPER_SHELL_SYNTAX.search(helper):
+            raise ValueError(
+                "Project headersHelper must be a shell-free command; "
+                "shell metacharacters and substitutions are not allowed"
+            )
+        try:
+            argv = shlex.split(helper, posix=os.name != "nt")
+        except ValueError as exc:
+            raise ValueError(f"Invalid project headersHelper argv: {exc}") from exc
+        if not argv:
+            raise ValueError("Project headersHelper must contain an executable")
+        executable, fingerprint = cls._resolve_reviewed_executable(
+            argv[0],
+            reviewed_path=reviewed_path,
+            execution_cwd=execution_cwd,
+            label="Project headersHelper",
+        )
+        reviewed_argv = [executable, *argv[1:]]
+        return reviewed_argv, {
+            "executable": executable,
+            "argv": reviewed_argv,
+            "fingerprint": fingerprint,
+        }
 
     async def _ensure_legacy_migration(self) -> None:
         if self._migration_completed:
@@ -190,6 +339,34 @@ class MCPServerManager:
             blocked_tools=config.blocked_tools,
         )
 
+    def _yaml_servers_to_unique_map(
+        self,
+        entries: list[tuple[MCPServerConfigYaml, str]],
+        *,
+        scope: MCPServerScope,
+    ) -> dict[str, MCPServerConfig]:
+        """Convert list-backed configs without silently dropping duplicates."""
+        servers: dict[str, MCPServerConfig] = {}
+        origins: dict[str, str] = {}
+        source_path = str(self.config_manager.config_path)
+
+        for server, origin in entries:
+            previous_origin = origins.get(server.name)
+            if previous_origin is not None:
+                raise ValueError(
+                    f"Duplicate MCP server name '{server.name}' in {scope.value}-scoped "
+                    f"configured definitions at {source_path}: {previous_origin} conflicts "
+                    f"with {origin}. Exact names must be unique within that scope."
+                )
+            origins[server.name] = origin
+            servers[server.name] = self._yaml_to_mcp_config(
+                server,
+                scope=scope,
+                source_path=source_path,
+            )
+
+        return servers
+
     def _local_scope_entry(
         self,
         cwd: str | Path | None,
@@ -209,14 +386,11 @@ class MCPServerManager:
 
     def _load_user_servers(self) -> dict[str, MCPServerConfig]:
         koder_config = self.config_manager.load()
-        return {
-            server.name: self._yaml_to_mcp_config(
-                server,
-                scope=MCPServerScope.USER,
-                source_path=str(self.config_manager.config_path),
-            )
-            for server in koder_config.mcp_servers
-        }
+        entries = [
+            (server, f"user list entry {index}")
+            for index, server in enumerate(koder_config.mcp_servers, start=1)
+        ]
+        return self._yaml_servers_to_unique_map(entries, scope=MCPServerScope.USER)
 
     def _load_local_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
         koder_config = self.config_manager.load()
@@ -228,15 +402,15 @@ class MCPServerManager:
         ]
         matching_entries.sort(key=lambda entry: len(Path(entry.project_root).parts))
 
-        servers: dict[str, MCPServerConfig] = {}
-        for entry in matching_entries:
-            for server in entry.servers:
-                servers[server.name] = self._yaml_to_mcp_config(
-                    server,
-                    scope=MCPServerScope.LOCAL,
-                    source_path=str(self.config_manager.config_path),
-                )
-        return servers
+        entries = [
+            (
+                server,
+                f"local list entry {index} for project root '{Path(entry.project_root).resolve()}'",
+            )
+            for entry in matching_entries
+            for index, server in enumerate(entry.servers, start=1)
+        ]
+        return self._yaml_servers_to_unique_map(entries, scope=MCPServerScope.LOCAL)
 
     @staticmethod
     def _expand_env_string(value: str) -> str:
@@ -318,21 +492,223 @@ class MCPServerManager:
         payload = {"mcpServers": servers}
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    def project_source_config_groups(
+        self, cwd: str | Path | None = None
+    ) -> list[list[MCPServerConfig]]:
+        """Load each in-repository ``.mcp.json`` as a provenance-bound group."""
+        project_root = self.project_boundary(cwd)
+        groups: list[list[MCPServerConfig]] = []
+        for candidate in self._project_candidate_paths(cwd):
+            if not candidate.exists():
+                continue
+            try:
+                source_path = self.validate_project_source_path(candidate, project_root)
+                raw = self._read_project_config(source_path)
+                configs = self.build_project_source_configs(
+                    raw["mcpServers"],
+                    source_path=source_path,
+                    project_root=project_root,
+                    execution_cwd=project_root,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("Skipping invalid project MCP source '%s': %s", candidate, exc)
+                continue
+            if configs:
+                groups.append(configs)
+        return groups
+
     def _load_project_servers(self, cwd: str | Path | None = None) -> dict[str, MCPServerConfig]:
         servers: dict[str, MCPServerConfig] = {}
-        for path in self._project_candidate_paths(cwd):
-            if not path.exists():
+        for configs in self.project_source_config_groups(cwd):
+            for config in configs:
+                servers[config.name] = config
+        return servers
+
+    def build_project_source_configs(
+        self,
+        servers: dict[str, dict],
+        *,
+        source_path: str | Path,
+        project_root: str | Path,
+        execution_cwd: str | Path,
+    ) -> list[MCPServerConfig]:
+        """Build configs whose approval covers expanded values, root, and cwd."""
+        root = Path(project_root).expanduser().resolve(strict=True)
+        source = self.validate_project_source_path(source_path, root)
+        reviewed_cwd = Path(execution_cwd).expanduser().resolve(strict=True)
+        if not self._path_contains(root, reviewed_cwd) or not reviewed_cwd.is_dir():
+            raise ValueError(
+                f"Project MCP execution directory must be inside project root: {reviewed_cwd}"
+            )
+
+        configs: list[MCPServerConfig] = []
+        canonical_servers: dict[str, object] = {}
+        source_template = copy.deepcopy(servers)
+        content_digest = self._source_content_digest(source)
+        for name in sorted(servers):
+            mapping = servers[name]
+            if not isinstance(mapping, dict):
+                canonical_servers[name] = {"invalid": True, "source": mapping}
+                logger.warning(
+                    "Skipping invalid project MCP server '%s' from %s: expected an object",
+                    name,
+                    source,
+                )
                 continue
-            raw = self._read_project_config(path)
-            for name, mapping in raw["mcpServers"].items():
-                servers[name] = self._config_from_mapping(
+            try:
+                config = self._config_from_mapping(
                     name,
                     mapping,
                     scope=MCPServerScope.PROJECT,
-                    source_path=str(path),
+                    source_path=str(source),
                     expand_env=True,
                 )
-        return servers
+                env_vars = dict(config.env_vars or {})
+                reviewed_path = self._reviewed_path(env_vars, reviewed_cwd)
+                env_vars["PATH"] = reviewed_path
+                config.env_vars = env_vars
+
+                descriptor: dict[str, object] = {
+                    "cwd": str(reviewed_cwd),
+                    "path": reviewed_path,
+                }
+                if config.transport_type == MCPServerType.STDIO:
+                    if not config.command:
+                        raise ValueError(f"Project MCP server '{name}' is missing a command")
+                    executable, fingerprint = self._resolve_reviewed_executable(
+                        config.command,
+                        reviewed_path=reviewed_path,
+                        execution_cwd=reviewed_cwd,
+                        label=f"Project MCP server '{name}'",
+                    )
+                    config.command = executable
+                    descriptor["stdio"] = {
+                        "executable": executable,
+                        "argv": [executable, *(config.args or [])],
+                        "fingerprint": fingerprint,
+                    }
+                else:
+                    descriptor["url"] = config.url
+
+                if config.headers_helper:
+                    helper_argv, helper_descriptor = self._project_headers_helper_argv(
+                        config.headers_helper,
+                        reviewed_path=reviewed_path,
+                        execution_cwd=reviewed_cwd,
+                    )
+                    config.headers_helper_argv = helper_argv
+                    descriptor["headersHelper"] = helper_descriptor
+
+                config.execution_descriptor = descriptor
+                canonical_servers[name] = {
+                    **self._serialize_project_server(config),
+                    "executionDescriptor": descriptor,
+                }
+                configs.append(config)
+            except (OSError, ValueError) as exc:
+                canonical_servers[name] = {
+                    "invalid": True,
+                    "source": mapping,
+                    "error": str(exc),
+                }
+                logger.warning(
+                    "Skipping invalid project MCP server '%s' from %s: %s",
+                    name,
+                    source,
+                    exc,
+                )
+                continue
+
+        if not configs:
+            return []
+
+        canonical = json.dumps(
+            {
+                "projectRoot": str(root),
+                "sourcePath": str(source),
+                "executionCwd": str(reviewed_cwd),
+                "mcpServers": canonical_servers,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        source_digest = hashlib.sha256(canonical).hexdigest()
+        for config in configs:
+            config.source_digest = source_digest
+            config.project_root = str(root)
+            config.execution_cwd = str(reviewed_cwd)
+            config.source_content_digest = content_digest
+            config.source_template = copy.deepcopy(source_template)
+        return configs
+
+    def revalidate_project_config(
+        self,
+        config: MCPServerConfig,
+        *,
+        approval_lock_held: bool = False,
+    ) -> bool:
+        """Recheck current source, environment expansion, root, cwd, and approval.
+
+        ``approval_lock_held`` is reserved for the runtime authorization
+        admission path. It lets that path keep the cross-process approval lock
+        held until the operation has been recorded as in flight.
+        """
+        if config.scope != MCPServerScope.PROJECT:
+            return True
+        if not all(
+            [
+                config.source_path,
+                config.source_digest,
+                config.project_root,
+                config.execution_cwd,
+                config.execution_descriptor is not None,
+                config.source_content_digest,
+                config.source_template is not None,
+            ]
+        ):
+            return False
+
+        try:
+            root = Path(config.project_root).resolve(strict=True)
+            reviewed_cwd = Path(config.execution_cwd).resolve(strict=True)
+            source = self.validate_project_source_path(config.source_path, root)
+            if not self._path_contains(root, reviewed_cwd) or not reviewed_cwd.is_dir():
+                return False
+            if self._source_content_digest(source) != config.source_content_digest:
+                return False
+            refreshed = self.build_project_source_configs(
+                config.source_template or {},
+                source_path=source,
+                project_root=root,
+                execution_cwd=reviewed_cwd,
+            )
+        except (OSError, ValueError):
+            return False
+
+        refreshed_config = next((item for item in refreshed if item.name == config.name), None)
+        if refreshed_config is None or refreshed_config.source_digest != config.source_digest:
+            return False
+        if refreshed_config.execution_descriptor != config.execution_descriptor:
+            return False
+
+        if approval_lock_held:
+            from .project_approvals import _is_project_connect_allowed_unlocked
+
+            return _is_project_connect_allowed_unlocked(
+                project_root=root,
+                source_path=source,
+                source_digest=config.source_digest,
+            )
+
+        from .project_approvals import is_project_connect_allowed
+
+        return is_project_connect_allowed(
+            project_root=root,
+            source_path=source,
+            source_digest=config.source_digest,
+        )
 
     def _serialize_project_server(self, config: MCPServerConfig) -> dict:
         payload: dict[str, object] = {"type": config.transport_type.value}

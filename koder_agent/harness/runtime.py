@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,8 @@ from koder_agent.harness.permissions.rule_sources import RuleHierarchy
 from koder_agent.harness.permissions.service import PermissionService
 from koder_agent.harness.session_flow import run_harness_session_flow
 from koder_agent.harness.version_info import render_cli_version_banner
+
+_logger = logging.getLogger(__name__)
 
 
 def _load_permission_hierarchy() -> RuleHierarchy:
@@ -60,6 +64,28 @@ class HarnessRuntime:
     request: object
 
     async def run(self) -> int:
+        try:
+            return await self._run()
+        finally:
+            from koder_agent.mcp import drain_orphaned_mcp_owners
+            from koder_agent.mcp.reconnection import drain_orphaned_retirements
+
+            for label, drain in (
+                ("owner", drain_orphaned_mcp_owners),
+                ("transport", drain_orphaned_retirements),
+            ):
+                try:
+                    await drain()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.debug(
+                        "Best-effort MCP %s orphan cleanup was incomplete; retaining it for retry",
+                        label,
+                        exc_info=True,
+                    )
+
+    async def _run(self) -> int:
         # Create permission hierarchy and AI classifier
         rule_hierarchy = _load_permission_hierarchy()
         ai_classifier = AiShellClassifier()

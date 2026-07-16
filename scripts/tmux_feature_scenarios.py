@@ -288,6 +288,7 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                 scenario_name = fake_openai.get("scenario")
                 if scenario_name is not None and scenario_name not in {
                     "single",
+                    "sandbox_shell_tool",
                     "streaming_tool_error",
                     "streaming_tool_queue",
                 }:

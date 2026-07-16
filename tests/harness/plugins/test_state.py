@@ -1,8 +1,11 @@
 """Tests for plugin state persistence."""
 
+import json
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
@@ -74,3 +77,88 @@ def test_state_store_persists_across_instances(tmp_path):
     loaded = store2.get("persistent")
     assert loaded is not None
     assert loaded.scope == "local"
+
+
+def test_state_store_refuses_symlink_without_overwriting_target(tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"sentinel": true}', encoding="utf-8")
+    (tmp_path / "state.json").symlink_to(outside)
+    store = PluginStateStore.for_test(tmp_path)
+
+    with pytest.raises(OSError, match="symlinked plugin state"):
+        store.set("demo", PluginState())
+
+    assert outside.read_text(encoding="utf-8") == '{"sentinel": true}'
+
+
+def test_state_store_parent_path_swap_stays_pinned_to_original_directory(tmp_path):
+    root = tmp_path / "state-root"
+    store = PluginStateStore.for_test(root)
+    pinned_root = tmp_path / "pinned-state-root"
+    outside = tmp_path / "outside-state-root"
+    outside.mkdir()
+    root.rename(pinned_root)
+    root.symlink_to(outside, target_is_directory=True)
+
+    store.set("demo", PluginState(enabled=False))
+
+    assert not (outside / "state.json").exists()
+    data = json.loads((pinned_root / "state.json").read_text(encoding="utf-8"))
+    assert data["demo"]["enabled"] is False
+
+
+def test_state_store_atomic_replace_failure_preserves_previous_data(tmp_path, monkeypatch):
+    store = PluginStateStore.for_test(tmp_path)
+    store.set("demo", PluginState(enabled=False))
+    state_module = sys.modules[PluginStateStore.__module__]
+
+    def fail_replace(_source, _target, **_kwargs):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(state_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        store.set("demo", PluginState(enabled=True))
+
+    data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert data["demo"]["enabled"] is False
+    assert not list(tmp_path.glob(".state.json-*.tmp"))
+
+
+def test_state_store_quarantines_legacy_case_alias_without_blocking_canonical_state(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"Demo": {"enabled": False}, "demo": {"enabled": True}}),
+        encoding="utf-8",
+    )
+    store = PluginStateStore.for_test(tmp_path)
+
+    states = store.list_all()
+
+    assert states["demo"].enabled is True
+    assert json.loads((tmp_path / "state.legacy.json").read_text(encoding="utf-8")) == {
+        "Demo": {"enabled": False}
+    }
+    assert json.loads((tmp_path / "state.json").read_text(encoding="utf-8")) == {
+        "demo": {"enabled": True}
+    }
+
+
+def test_state_store_migrates_unambiguous_legacy_case(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"Demo": {"enabled": False, "scope": "project"}}),
+        encoding="utf-8",
+    )
+    store = PluginStateStore.for_test(tmp_path)
+
+    state = store.get("demo")
+
+    assert state is not None
+    assert state.enabled is False
+    assert state.scope == "project"
+
+
+def test_state_store_rejects_non_string_key_from_existing_state(tmp_path):
+    # JSON object keys are always strings, so a numeric legacy key becomes "1"
+    # and remains a valid canonical identity. Direct API misuse is rejected.
+    store = PluginStateStore.for_test(tmp_path)
+    with pytest.raises(ValueError, match="must be a string"):
+        store.get(None)  # type: ignore[arg-type]

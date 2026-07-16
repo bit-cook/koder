@@ -1,7 +1,16 @@
 """MCP (Model Context Protocol) support for Koder."""
 
+import asyncio
+import atexit
+import concurrent.futures
+import logging
 import os
-from typing import Any, List
+import threading
+import weakref
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, List
 
 from rich.console import Console
 
@@ -10,7 +19,7 @@ try:  # pragma: no cover - depends on optional SDK extras at import time
 except ImportError:  # pragma: no cover
     MCPServer = Any
 
-from .project_approvals import is_project_connect_allowed
+from .lifecycle import cleanup_mcp_servers as _cleanup_legacy_mcp_servers
 from .prompts import (
     MCPPrompt,
     MCPPromptRegistry,
@@ -18,7 +27,12 @@ from .prompts import (
     get_prompt_registry,
     normalize_mcp_name,
 )
-from .reconnection import ReconnectionConfig, ReconnectionManager
+from .reconnection import (
+    LiveMCPServer,
+    ReconnectionConfig,
+    ReconnectionManager,
+    drain_orphaned_retirements,
+)
 from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
 from .server_manager import MCPServerManager
 
@@ -30,20 +44,394 @@ except ImportError:  # pragma: no cover
 # Dedicated stderr console so MCP-connection warnings reach the user even when
 # the root logger is pinned high elsewhere.
 _console = Console(stderr=True)
-
-# Reconnection managers for servers connected in the most recent
-# load_mcp_servers() call, keyed by server name. Retained (rather than
-# discarded) so a caller/scheduler can trigger runtime reconnects via
-# reconnect_unhealthy_servers().
-_reconnection_managers: "dict[str, ReconnectionManager]" = {}
+_logger = logging.getLogger(__name__)
 
 
-def get_reconnection_managers() -> "dict[str, ReconnectionManager]":
-    """Return the reconnection managers from the last load_mcp_servers() call."""
-    return _reconnection_managers
+@dataclass(frozen=True)
+class _MCPServerCleanupOutcome:
+    cancelled: bool = False
+    error: BaseException | None = None
 
 
-async def reconnect_unhealthy_servers() -> "dict[str, bool]":
+class _MCPServerOwnerState:
+    """Finalizer-safe state shared by one transferable MCP owner."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.servers: list[MCPServer] = []
+        self.runtime_resources: ExitStack | None = None
+        self.reconnection_managers: dict[str, ReconnectionManager] = {}
+        self.prompt_registry = MCPPromptRegistry()
+        self.accepting_adoptions = True
+        self.closed = False
+        self.orphaned = False
+        self.cleanup_future: concurrent.futures.Future[_MCPServerCleanupOutcome] | None = None
+
+    def adopt(
+        self,
+        server: MCPServer,
+        *,
+        server_name: str,
+        reconnection_manager: ReconnectionManager | None = None,
+        runtime_resources: ExitStack | None = None,
+    ) -> None:
+        with self.lock:
+            if not self.accepting_adoptions:
+                raise RuntimeError("Cannot adopt an MCP server into a closed owner")
+            if runtime_resources is not None and self.runtime_resources is not None:
+                raise RuntimeError("MCP runtime resources already adopted")
+            if runtime_resources is not None:
+                self.runtime_resources = runtime_resources
+            self.servers.append(server)
+            if reconnection_manager is not None:
+                self.reconnection_managers[server_name] = reconnection_manager
+
+    def begin_cleanup(
+        self,
+    ) -> tuple[concurrent.futures.Future[_MCPServerCleanupOutcome], bool] | None:
+        with self.lock:
+            if self.closed:
+                return None
+            self.accepting_adoptions = False
+            if self.cleanup_future is not None:
+                return self.cleanup_future, False
+            cleanup_future: concurrent.futures.Future[_MCPServerCleanupOutcome] = (
+                concurrent.futures.Future()
+            )
+            self.cleanup_future = cleanup_future
+            return cleanup_future, True
+
+    def pending_servers(self) -> list[MCPServer]:
+        with self.lock:
+            return list(self.servers)
+
+    def mark_server_cleaned(self, server: MCPServer) -> None:
+        with self.lock:
+            for index, pending in enumerate(self.servers):
+                if pending is server:
+                    del self.servers[index]
+                    break
+
+    def resources_if_servers_cleaned(self) -> tuple[bool, ExitStack | None]:
+        with self.lock:
+            if self.servers:
+                return False, None
+            return True, self.runtime_resources
+
+    def finish_cleanup(
+        self,
+        cleanup_future: concurrent.futures.Future[_MCPServerCleanupOutcome],
+        *,
+        resources_closed: bool,
+    ) -> bool:
+        with self.lock:
+            if resources_closed and not self.servers:
+                self.runtime_resources = None
+            if not self.servers and self.runtime_resources is None:
+                self.reconnection_managers.clear()
+                self.prompt_registry.clear()
+                self.closed = True
+            if self.cleanup_future is cleanup_future:
+                self.cleanup_future = None
+            return self.closed
+
+    def abandon(self) -> bool:
+        with self.lock:
+            if self.closed or self.orphaned:
+                return False
+            self.accepting_adoptions = False
+            self.orphaned = True
+            return True
+
+    def is_closed(self) -> bool:
+        with self.lock:
+            return self.closed
+
+
+async def _run_mcp_owner_cleanup(
+    state: _MCPServerOwnerState,
+    cleanup_future: concurrent.futures.Future[_MCPServerCleanupOutcome],
+    *,
+    timeout: float = 3.0,
+) -> None:
+    cancelled = False
+    error: BaseException | None = None
+    resources_closed = False
+    try:
+        for server in state.pending_servers():
+            cleanup = getattr(server, "cleanup", None)
+            if cleanup is None:
+                state.mark_server_cleaned(server)
+                continue
+            try:
+                await asyncio.wait_for(cleanup(), timeout=timeout)
+            except asyncio.CancelledError:
+                cancelled = True
+                _logger.debug(
+                    "MCP server cleanup was cancelled for %s; retaining it for retry",
+                    getattr(server, "name", ""),
+                )
+            except asyncio.TimeoutError:
+                _logger.debug(
+                    "Timed out cleaning up MCP server %s; retaining it for retry",
+                    getattr(server, "name", ""),
+                )
+            except Exception as exc:
+                _logger.debug(
+                    "Failed to clean up MCP server %s; retaining it for retry: %s",
+                    getattr(server, "name", ""),
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                state.mark_server_cleaned(server)
+
+        servers_cleaned, resources = state.resources_if_servers_cleaned()
+        if servers_cleaned:
+            if resources is None:
+                resources_closed = True
+            else:
+                try:
+                    resources.close()
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        cancelled = True
+                    else:
+                        _logger.debug(
+                            "Failed to close MCP runtime resources; retaining them for retry",
+                            exc_info=True,
+                        )
+                else:
+                    resources_closed = True
+    except BaseException as exc:  # pragma: no cover - defensive state-machine guard
+        if isinstance(exc, asyncio.CancelledError):
+            cancelled = True
+        else:
+            error = exc
+            _logger.debug("Unexpected MCP owner cleanup failure", exc_info=True)
+    finally:
+        state.finish_cleanup(cleanup_future, resources_closed=resources_closed)
+        if not cleanup_future.done():
+            cleanup_future.set_result(_MCPServerCleanupOutcome(cancelled=cancelled, error=error))
+
+
+async def _await_mcp_owner_cleanup(
+    state: _MCPServerOwnerState,
+) -> tuple[bool, _MCPServerCleanupOutcome, asyncio.CancelledError | None]:
+    operation = state.begin_cleanup()
+    if operation is None:
+        return False, _MCPServerCleanupOutcome(), None
+
+    cleanup_future, should_start = operation
+    if should_start:
+        try:
+            cleanup_task = asyncio.create_task(_run_mcp_owner_cleanup(state, cleanup_future))
+        except BaseException as exc:  # pragma: no cover - create_task is normally infallible
+            state.finish_cleanup(cleanup_future, resources_closed=False)
+            if not cleanup_future.done():
+                cleanup_future.set_result(_MCPServerCleanupOutcome(error=exc))
+        else:
+            cleanup_task.add_done_callback(
+                lambda completed: completed.exception() if not completed.cancelled() else None
+            )
+
+    caller_cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            outcome = await asyncio.shield(asyncio.wrap_future(cleanup_future))
+            break
+        except asyncio.CancelledError as exc:
+            if caller_cancellation is None:
+                caller_cancellation = exc
+    return True, outcome, caller_cancellation
+
+
+_orphaned_owner_lock = threading.Lock()
+_orphaned_owner_states: list[_MCPServerOwnerState] = []
+_ATEXIT_ORPHAN_DRAIN_ATTEMPTS = 3
+
+
+def _remove_orphaned_owner(state: _MCPServerOwnerState) -> None:
+    with _orphaned_owner_lock:
+        _orphaned_owner_states[:] = [
+            queued for queued in _orphaned_owner_states if queued is not state
+        ]
+
+
+async def drain_orphaned_mcp_owners() -> None:
+    """Retry durable owners while propagating only cancellation of this caller."""
+    with _orphaned_owner_lock:
+        states = list(_orphaned_owner_states)
+
+    caller_cancellation: asyncio.CancelledError | None = None
+    cleanup_cancelled = False
+    first_error: BaseException | None = None
+    for state in states:
+        _attempted, outcome, state_caller_cancellation = await _await_mcp_owner_cleanup(state)
+        if state.is_closed():
+            _remove_orphaned_owner(state)
+        if caller_cancellation is None and state_caller_cancellation is not None:
+            caller_cancellation = state_caller_cancellation
+        cleanup_cancelled = cleanup_cancelled or outcome.cancelled
+        if first_error is None and outcome.error is not None:
+            first_error = outcome.error
+
+    if caller_cancellation is not None:
+        raise caller_cancellation
+    if first_error is not None:
+        raise first_error
+    if cleanup_cancelled:
+        _logger.debug(
+            "MCP orphan cleanup reported cancellation; retaining unfinished owners for retry"
+        )
+
+
+def _finalize_mcp_owner(state: _MCPServerOwnerState) -> None:
+    if not state.abandon():
+        return
+    with _orphaned_owner_lock:
+        _orphaned_owner_states.append(state)
+
+
+def _drain_orphaned_mcp_owners_at_exit() -> None:
+    for attempt in range(1, _ATEXIT_ORPHAN_DRAIN_ATTEMPTS + 1):
+        with _orphaned_owner_lock:
+            if not _orphaned_owner_states:
+                return
+        try:
+            asyncio.run(drain_orphaned_mcp_owners())
+        except BaseException:
+            _logger.debug(
+                "Process-exit MCP orphan cleanup attempt %d was incomplete",
+                attempt,
+                exc_info=True,
+            )
+
+    with _orphaned_owner_lock:
+        remaining = len(_orphaned_owner_states)
+    if remaining:
+        _logger.debug(
+            "Process-exit MCP orphan cleanup left %d owner(s) retryable after %d attempts",
+            remaining,
+            _ATEXIT_ORPHAN_DRAIN_ATTEMPTS,
+        )
+
+
+atexit.register(_drain_orphaned_mcp_owners_at_exit)
+
+
+class MCPServerSet(list[MCPServer]):
+    """One transferable owner for servers, prompts, reconnect state, and snapshots."""
+
+    def __init__(
+        self,
+        servers: Iterable[MCPServer] = (),
+        *,
+        runtime_resources: ExitStack | None = None,
+        reconnection_managers: dict[str, ReconnectionManager] | None = None,
+    ) -> None:
+        initial_servers = list(servers)
+        super().__init__(initial_servers)
+        self._owner_state = _MCPServerOwnerState()
+        self.reconnection_managers = self._owner_state.reconnection_managers
+        self.prompt_registry = self._owner_state.prompt_registry
+        for server in initial_servers:
+            self._owner_state.adopt(
+                server,
+                server_name=str(getattr(server, "name", "")),
+            )
+        if runtime_resources is not None:
+            self._owner_state.runtime_resources = runtime_resources
+        self.reconnection_managers.update(reconnection_managers or {})
+        self._owner_finalizer = weakref.finalize(
+            self,
+            _finalize_mcp_owner,
+            self._owner_state,
+        )
+
+    def adopt_server(
+        self,
+        server: MCPServer,
+        *,
+        server_name: str,
+        reconnection_manager: ReconnectionManager | None = None,
+        runtime_resources: ExitStack | None = None,
+    ) -> None:
+        """Adopt a newly connected server before any later await can fail."""
+        self._owner_state.adopt(
+            server,
+            server_name=server_name,
+            reconnection_manager=reconnection_manager,
+            runtime_resources=runtime_resources,
+        )
+        super().append(server)
+
+    async def aclose(self, *, propagate_cancellation: bool = True) -> bool:
+        """Close this owner through a shared, cancellation-safe retry operation."""
+        try:
+            attempted, outcome, caller_cancellation = await _await_mcp_owner_cleanup(
+                self._owner_state
+            )
+        finally:
+            if self._owner_state.is_closed() and self._owner_finalizer.alive:
+                self._owner_finalizer.detach()
+        if outcome.error is not None:
+            raise outcome.error
+        if propagate_cancellation and caller_cancellation is not None:
+            raise caller_cancellation
+        if propagate_cancellation and outcome.cancelled:
+            raise asyncio.CancelledError
+        return attempted
+
+
+async def close_mcp_servers(
+    servers: Iterable[MCPServer] | None,
+    *,
+    propagate_cancellation: bool = True,
+) -> bool:
+    """Close a server owner exactly once, with a plain-list compatibility path."""
+    if servers is None:
+        return False
+    close = getattr(servers, "aclose", None)
+    if callable(close):
+        return bool(await close(propagate_cancellation=propagate_cancellation))
+    await _cleanup_legacy_mcp_servers(
+        list(servers),
+        logger=_logger,
+        propagate_cancellation=propagate_cancellation,
+    )
+    return True
+
+
+def detach_mcp_server_owner(holder: object | None) -> Iterable[MCPServer] | None:
+    """Detach one agent's MCP owner before cleanup so repeats are harmless."""
+    if holder is None:
+        return None
+    owner = getattr(holder, "_koder_mcp_servers", None)
+    if owner is None:
+        owner = getattr(holder, "mcp_servers", None)
+    try:
+        setattr(holder, "_koder_mcp_servers", None)
+    except Exception:
+        pass
+    try:
+        setattr(holder, "mcp_servers", [])
+    except Exception:
+        pass
+    return owner
+
+
+def get_reconnection_managers(
+    servers: Iterable[MCPServer] | None = None,
+) -> "dict[str, ReconnectionManager]":
+    """Return reconnection managers owned by one server/session set."""
+    managers = getattr(servers, "reconnection_managers", None)
+    return managers if isinstance(managers, dict) else {}
+
+
+async def reconnect_unhealthy_servers(
+    servers: Iterable[MCPServer] | None = None,
+) -> "dict[str, bool]":
     """Reconnect any retained MCP servers whose connection looks unhealthy.
 
     Returns a mapping of server name -> healthy(after) for every managed server.
@@ -51,7 +439,7 @@ async def reconnect_unhealthy_servers() -> "dict[str, bool]":
     lifecycle is a cross-file concern handled outside this package.
     """
     results: dict[str, bool] = {}
-    for name, mgr in _reconnection_managers.items():
+    for name, mgr in get_reconnection_managers(servers).items():
         try:
             results[name] = await mgr.reconnect_if_needed()
         except Exception:  # pragma: no cover - defensive
@@ -59,99 +447,175 @@ async def reconnect_unhealthy_servers() -> "dict[str, bool]":
     return results
 
 
-def _load_plugin_mcp_configs() -> List[MCPServerConfig]:
-    """Load MCP server configs from enabled plugins' .mcp.json files."""
+@contextmanager
+def _load_plugin_mcp_configs():
+    """Yield plugin MCP configs while their private plugin snapshots exist."""
     import json
-    import logging
-    from pathlib import Path
 
     from koder_agent.harness.plugins.env import expand_plugin_vars, plugin_env_vars
     from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
+    from koder_agent.harness.plugins.path_safety import (
+        PluginPathError,
+        open_plugin_component,
+        snapshot_plugin_tree,
+    )
 
-    _logger = logging.getLogger(__name__)
-    configs: List[MCPServerConfig] = []
-
-    try:
-        plugin_root = Path.home() / ".koder" / "plugins"
-        lifecycle = PluginLifecycleService(plugin_root)
-        for manifest, state in lifecycle.installed_plugins():
-            if not state.enabled:
-                continue
-            plugin_dir = lifecycle.root / manifest.name
-            mcp_json_path = plugin_dir / ".mcp.json"
-            if not mcp_json_path.is_file():
-                continue
-
-            try:
-                raw = json.loads(mcp_json_path.read_text("utf-8"))
-                servers = raw.get("mcpServers", {})
-                env_vars = plugin_env_vars(manifest.name, plugin_dir)
-
-                for server_name, server_def in servers.items():
-                    command = server_def.get("command", "")
-                    args = server_def.get("args", [])
-
-                    # Expand Koder plugin variables.
-                    command = expand_plugin_vars(command, manifest.name, plugin_dir)
-                    args = [expand_plugin_vars(a, manifest.name, plugin_dir) for a in args]
-
-                    # Merge plugin env vars into server env
-                    server_env = dict(server_def.get("env", {}))
-                    server_env.update(env_vars)
-
-                    # Channel plugins use Koder-owned state paths by default.
-                    koder_channels_dir = Path.home() / ".koder" / "channels" / server_name
-                    state_dir_key = f"{server_name.upper()}_STATE_DIR"
-                    if state_dir_key not in server_env:
-                        server_env[state_dir_key] = str(koder_channels_dir)
-
-                    transport_type = server_def.get("type", "stdio")
-                    config = MCPServerConfig(
-                        name=server_name,
-                        transport_type=MCPServerType(transport_type),
-                        command=command,
-                        args=args,
-                        env_vars=server_env,
-                        url=server_def.get("url"),
-                        headers=server_def.get("headers"),
-                        cache_tools_list=server_def.get("cacheToolsList", False),
-                        source_path=str(mcp_json_path),
+    with ExitStack() as snapshots:
+        configs: List[MCPServerConfig] = []
+        try:
+            plugin_root = Path.home() / ".koder" / "plugins"
+            lifecycle = PluginLifecycleService(plugin_root)
+            for manifest, state in lifecycle.installed_plugins():
+                if not state.enabled:
+                    continue
+                try:
+                    plugin_dir = snapshots.enter_context(
+                        snapshot_plugin_tree(lifecycle.resolve_plugin_target(manifest.name))
                     )
-                    configs.append(config)
-                    _logger.info(
-                        "Loaded MCP server '%s' from plugin '%s'",
-                        server_name,
-                        manifest.name,
-                    )
-            except Exception as exc:
-                _logger.warning(
-                    "Failed to load .mcp.json from plugin '%s': %s",
-                    manifest.name,
-                    exc,
+                except PluginPathError:
+                    continue
+                mcp_source_path = plugin_dir.joinpath(
+                    *((manifest.mcp_servers or ".mcp.json").split("/"))
                 )
-    except Exception as exc:
-        _logger.debug("Plugin MCP loading skipped: %s", exc)
+                try:
+                    with open_plugin_component(
+                        plugin_dir,
+                        manifest.mcp_servers,
+                        default=".mcp.json",
+                        field_name="mcpServers",
+                        expect="file",
+                    ) as mcp_json_path:
+                        if mcp_json_path is None:
+                            continue
+                        raw = json.loads(mcp_json_path.read_text("utf-8"))
+                except PluginPathError:
+                    continue
+                try:
+                    servers = raw.get("mcpServers", {})
+                    env_vars = plugin_env_vars(manifest.name, plugin_dir)
 
-    return configs
+                    for server_name, server_def in servers.items():
+                        command = server_def.get("command", "")
+                        args = server_def.get("args", [])
+
+                        command = expand_plugin_vars(command, manifest.name, plugin_dir)
+                        args = [expand_plugin_vars(a, manifest.name, plugin_dir) for a in args]
+
+                        server_env = dict(server_def.get("env", {}))
+                        server_env.update(env_vars)
+
+                        koder_channels_dir = Path.home() / ".koder" / "channels" / server_name
+                        state_dir_key = f"{server_name.upper()}_STATE_DIR"
+                        if state_dir_key not in server_env:
+                            server_env[state_dir_key] = str(koder_channels_dir)
+
+                        transport_type = server_def.get("type", "stdio")
+                        config = MCPServerConfig(
+                            name=server_name,
+                            transport_type=MCPServerType(transport_type),
+                            command=command,
+                            args=args,
+                            env_vars=server_env,
+                            url=server_def.get("url"),
+                            headers=server_def.get("headers"),
+                            cache_tools_list=server_def.get("cacheToolsList", False),
+                            source_path=str(mcp_source_path),
+                        )
+                        configs.append(config)
+                        _logger.info(
+                            "Loaded MCP server '%s' from plugin '%s'",
+                            server_name,
+                            manifest.name,
+                        )
+                except Exception as exc:
+                    _logger.warning(
+                        "Failed to load .mcp.json from plugin '%s': %s",
+                        manifest.name,
+                        exc,
+                    )
+        except Exception as exc:
+            _logger.debug("Plugin MCP loading skipped: %s", exc)
+
+        yield configs
 
 
-async def load_mcp_servers() -> List[MCPServer]:
+def _mcp_config_source(config: MCPServerConfig) -> str:
+    return str(config.source_path or "runtime configuration")
+
+
+def _validate_mcp_server_identities(configs: Iterable[MCPServerConfig]) -> None:
+    """Reject raw or normalized public server-name collisions before connection."""
+    by_raw_name: dict[str, MCPServerConfig] = {}
+    by_public_identity: dict[str, MCPServerConfig] = {}
+
+    for config in configs:
+        name = config.name
+        previous = by_raw_name.get(name)
+        if previous is not None:
+            raise ValueError(
+                f"Duplicate public MCP server identity '{name}': server name '{name}' "
+                f"from {_mcp_config_source(previous)} conflicts exactly with "
+                f"{_mcp_config_source(config)}"
+            )
+
+        public_identity = normalize_mcp_name(name).lower()
+        if not public_identity:
+            raise ValueError(
+                f"MCP server name '{name}' from {_mcp_config_source(config)} normalizes to an "
+                "empty public identity; choose a name containing letters, numbers, '_' or '-'."
+            )
+        previous = by_public_identity.get(public_identity)
+        if previous is not None:
+            raise ValueError(
+                f"Duplicate public MCP server identity '{public_identity}': server names "
+                f"'{previous.name}' from {_mcp_config_source(previous)} and '{name}' from "
+                f"{_mcp_config_source(config)} normalize and case-fold to the same public name"
+            )
+
+        by_raw_name[name] = config
+        by_public_identity[public_identity] = config
+
+
+async def load_mcp_servers(
+    extra_configs: Iterable[MCPServerConfig] | None = None,
+) -> MCPServerSet:
     """Load and create MCP server instances from configuration."""
-    import logging
+    try:
+        await drain_orphaned_mcp_owners()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.debug("Failed to retry abandoned MCP owner cleanup", exc_info=True)
+    try:
+        await drain_orphaned_retirements(max_attempts=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.debug("Failed to retry orphaned MCP transport cleanup", exc_info=True)
 
-    _logger = logging.getLogger(__name__)
-
+    plugin_snapshots = ExitStack()
+    plugin_resources_adopted = False
+    owner = MCPServerSet()
     try:
         manager = MCPServerManager()
-        configs = await manager.list_servers(cwd=os.getcwd())
+        configs = list(await manager.list_servers(cwd=os.getcwd()))
 
         # Also load MCP servers from enabled plugins
-        plugin_configs = _load_plugin_mcp_configs()
+        plugin_config_source = _load_plugin_mcp_configs()
+        if hasattr(plugin_config_source, "__enter__"):
+            plugin_configs = plugin_snapshots.enter_context(plugin_config_source)
+        else:
+            plugin_configs = list(plugin_config_source)
+        plugin_config_ids = {id(config) for config in plugin_configs}
         if plugin_configs:
-            configs = list(configs) + plugin_configs
+            configs.extend(plugin_configs)
+        if extra_configs:
+            configs.extend(extra_configs)
+
+        _validate_mcp_server_identities(configs)
 
         if not configs:
-            return []
+            return owner
 
         # Determine which servers need channel notification interception
         channel_callback = None
@@ -201,10 +665,7 @@ async def load_mcp_servers() -> List[MCPServer]:
         )
         # Configure reconnection with retry
         reconnection_config = ReconnectionConfig(max_attempts=3, initial_delay=1.0, max_delay=10.0)
-        servers: List[MCPServer] = []
         connected: list[tuple[MCPServerConfig, MCPServer]] = []
-        project_root = os.getcwd()
-        _reconnection_managers.clear()
         for config in configs:
             try:
                 # SECURITY GATE: PROJECT-scoped servers come from an in-repo
@@ -213,13 +674,15 @@ async def load_mcp_servers() -> List[MCPServer]:
                 # or rejected => skip (safe headless default). User/local scopes
                 # (the user's own config) are unaffected.
                 is_project = config.scope == MCPServerScope.PROJECT
-                if is_project and not is_project_connect_allowed(project_root):
-                    _logger.warning(
-                        "Skipping unapproved project MCP server '%s' (%s). "
-                        "Approve it for this project to enable it.",
-                        config.name,
-                        config.source_path,
+                source_path = config.source_path
+                if is_project and not manager.revalidate_project_config(config):
+                    approval_message = (
+                        f"Approval required for project MCP server '{config.name}' from "
+                        f"{source_path or 'an unknown project source'}. Review and approve "
+                        "that source's current configuration to enable it."
                     )
+                    _logger.warning(approval_message)
+                    _console.print(f"[yellow]⚠ {approval_message}[/yellow]")
                     continue
 
                 cb = channel_callback if config.name in channel_server_names else None
@@ -244,9 +707,24 @@ async def load_mcp_servers() -> List[MCPServer]:
                     config.name,
                     type(server).__name__,
                 )
-                servers.append(server)
+                runtime_resources = None
+                if id(config) in plugin_config_ids and not plugin_resources_adopted:
+                    runtime_resources = plugin_snapshots.pop_all()
+                try:
+                    owner.adopt_server(
+                        server,
+                        server_name=config.name,
+                        reconnection_manager=reconnection_mgr,
+                        runtime_resources=runtime_resources,
+                    )
+                except BaseException:
+                    if runtime_resources is not None:
+                        runtime_resources.close()
+                    reconnection_mgr.retire_unpublished()
+                    raise
+                if runtime_resources is not None:
+                    plugin_resources_adopted = True
                 connected.append((config, server))
-                _reconnection_managers[config.name] = reconnection_mgr
                 if config.name in channel_server_names:
                     # Verify capability after connection
                     caps = getattr(server, "server_initialize_result", None)
@@ -274,18 +752,25 @@ async def load_mcp_servers() -> List[MCPServer]:
         # Iterate the (config, server) pairs we actually connected, rather than
         # zip(configs, servers): a skipped server would misalign the zip and
         # attribute prompts to the wrong config after the first failure.
-        registry = get_prompt_registry()
-        registry.clear()
+        registry = owner.prompt_registry
         for config, server in connected:
             try:
                 await _discover_prompts(config.name, server, registry)
             except Exception:
                 pass  # Prompt discovery is best-effort
 
-        return servers
+        return owner
 
-    except Exception as e:
-        raise RuntimeError(f"Failed to load MCP servers: {e}") from e
+    except BaseException as exc:
+        try:
+            await owner.aclose(propagate_cancellation=False)
+        except BaseException:
+            _logger.debug("Failed to close MCP owner after load failure", exc_info=True)
+        if isinstance(exc, Exception):
+            raise RuntimeError(f"Failed to load MCP servers: {exc}") from exc
+        raise
+    finally:
+        plugin_snapshots.close()
 
 
 async def _discover_prompts(
@@ -294,13 +779,10 @@ async def _discover_prompts(
     registry: MCPPromptRegistry,
 ) -> None:
     """Try to discover prompts from an MCP server."""
-    # The agents library MCPServer may expose session for direct MCP calls
-    session = getattr(server, "session", None)
-    if session is None:
-        return
-
     try:
-        result = await session.list_prompts()
+        from .runtime_authorization import call_authorized_server_method
+
+        result = await call_authorized_server_method(server, "list_prompts")
         for prompt_info in getattr(result, "prompts", []):
             prompt = MCPPrompt(
                 server_name=server_name,
@@ -329,20 +811,16 @@ async def discover_mcp_resources(
     *display_uri* uses the ``server:protocol://path`` format so users can
     reference them as ``@server:protocol://path`` in prompts.
     """
-    import logging
-
-    _logger = logging.getLogger(__name__)
     results: List[tuple[str, str]] = []
 
     for server in servers:
-        session = getattr(server, "session", None)
-        if session is None:
-            continue
         server_name = getattr(server, "name", None)
         if not server_name:
             continue
         try:
-            response = await session.list_resources()
+            from .runtime_authorization import call_authorized_server_method
+
+            response = await call_authorized_server_method(server, "list_resources")
             for resource in getattr(response, "resources", []):
                 uri = str(resource.uri)
                 description = getattr(resource, "description", "") or getattr(resource, "name", "")
@@ -360,15 +838,20 @@ async def discover_mcp_resources(
 
 __all__ = [
     "load_mcp_servers",
+    "close_mcp_servers",
+    "drain_orphaned_mcp_owners",
+    "detach_mcp_server_owner",
     "discover_mcp_resources",
     "get_reconnection_managers",
     "reconnect_unhealthy_servers",
     "MCPPrompt",
     "MCPPromptRegistry",
     "MCPServerConfig",
+    "MCPServerSet",
     "MCPServerType",
     "MCPServerManager",
     "MCPServerFactory",
+    "LiveMCPServer",
     "execute_prompt",
     "get_prompt_registry",
     "normalize_mcp_name",

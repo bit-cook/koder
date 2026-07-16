@@ -184,3 +184,48 @@ class TestChannelNotificationRouter:
             router.dispatch_raw_notification("s", CHANNEL_NOTIFICATION_METHOD, {"content": "x"})
         )
         assert counts == [1, 1]
+
+    def test_duplicate_callback_registrations_unregister_independently(self):
+        router = ChannelNotificationRouter()
+        received = []
+
+        async def cb(server, content, meta):
+            received.append((server, content, meta))
+
+        unregister_first = router.on_channel_message(cb)
+        unregister_second = router.on_channel_message(cb)
+        unregister_first()
+        unregister_first()
+
+        asyncio.run(
+            router.dispatch_raw_notification("s", CHANNEL_NOTIFICATION_METHOD, {"content": "x"})
+        )
+        assert received == [("s", "x", None)]
+
+        unregister_second()
+        asyncio.run(
+            router.dispatch_raw_notification("s", CHANNEL_NOTIFICATION_METHOD, {"content": "y"})
+        )
+        assert received == [("s", "x", None)]
+
+    def test_stale_unregister_handle_does_not_remove_new_session_callback(self):
+        router = ChannelNotificationRouter()
+        received = []
+
+        async def old_cb(_server, content, _meta):
+            received.append(("old", content))
+
+        async def new_cb(_server, content, _meta):
+            received.append(("new", content))
+
+        unregister_old = router.on_channel_message(old_cb)
+        unregister_old()
+        unregister_new = router.on_channel_message(new_cb)
+        unregister_old()
+
+        asyncio.run(
+            router.dispatch_raw_notification("s", CHANNEL_NOTIFICATION_METHOD, {"content": "x"})
+        )
+        assert received == [("new", "x")]
+
+        unregister_new()

@@ -123,6 +123,9 @@ class TestNoDeadConfig:
             "companion",
             "companion_muted",
             "reasoning_display",
+            "auto_dream_write_mode",
+            "task_delegate_max_batch_size",
+            "task_delegate_max_concurrency",
         }
         actual_fields = set(HarnessRuntimeConfig.model_fields.keys())
         unexpected = actual_fields - known_fields

@@ -31,6 +31,8 @@ class AgentRecord:
     summary: str | None = None
     summary_updated_at: str | None = None
     model_config: dict[str, Any] | None = None
+    origin_cwd: str | None = None
+    definition_provenance: dict[str, Any] | None = None
 
     @classmethod
     def create(
@@ -50,6 +52,8 @@ class AgentRecord:
         summary: str | None = None,
         summary_updated_at: str | None = None,
         model_config: dict[str, Any] | None = None,
+        origin_cwd: str | None = None,
+        definition_provenance: dict[str, Any] | None = None,
     ) -> "AgentRecord":
         timestamp = _utc_now_iso()
         return cls(
@@ -69,6 +73,8 @@ class AgentRecord:
             summary=summary,
             summary_updated_at=summary_updated_at or (timestamp if summary else None),
             model_config=model_config,
+            origin_cwd=origin_cwd,
+            definition_provenance=definition_provenance,
         )
 
 

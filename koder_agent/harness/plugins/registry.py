@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .lifecycle import PluginLifecycleService
+from .path_safety import PluginPathError, open_plugin_component
 
 
 @dataclass(frozen=True)
@@ -31,17 +32,27 @@ class PluginRegistry:
         for manifest, state in lifecycle.installed_plugins():
             if not include_disabled and not state.enabled:
                 continue
-            # Detect components
             components: list[str] = []
-            plugin_dir = lifecycle.root / manifest.name
-            if (plugin_dir / "skills").is_dir():
-                components.append("skills")
-            if (plugin_dir / "agents").is_dir():
-                components.append("agents")
-            if (plugin_dir / "hooks").is_dir():
-                components.append("hooks")
-            if (plugin_dir / ".mcp.json").is_file():
-                components.append("mcp")
+            plugin_dir = lifecycle.resolve_plugin_target(manifest.name)
+            checks = (
+                ("skills", manifest.skills, "skills", "directory"),
+                ("agents", manifest.agents, "agents", "directory"),
+                ("hooks", manifest.hooks, "hooks/hooks.json", "file"),
+                ("mcp", manifest.mcp_servers, ".mcp.json", "file"),
+            )
+            for component, declared, default, expect in checks:
+                try:
+                    with open_plugin_component(
+                        plugin_dir,
+                        declared,
+                        default=default,
+                        field_name=component,
+                        expect=expect,
+                    ) as path:
+                        if path is not None:
+                            components.append(component)
+                except PluginPathError:
+                    continue
 
             plugins.append(
                 InstalledPlugin(

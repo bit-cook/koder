@@ -50,5 +50,10 @@ async def invoke_web_fetch(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_tools(registry: ToolRegistry) -> None:
-    registry.register(ToolSpec(name="web_fetch", invoke=invoke_web_fetch, category="web"))
-    registry.register(ToolSpec(name="web_search", invoke=invoke_web_search, category="web"))
+    registry.register_many(
+        [
+            ToolSpec(name="web_fetch", invoke=invoke_web_fetch, category="web"),
+            ToolSpec(name="web_search", invoke=invoke_web_search, category="web"),
+        ],
+        source=__name__,
+    )

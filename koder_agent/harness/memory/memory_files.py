@@ -45,10 +45,29 @@ def save_memory_file(
     """Persist a markdown memory file with YAML frontmatter."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    frontmatter = yaml.safe_dump(
-        {"type": memory_type, "description": description},
-        sort_keys=False,
-    ).strip()
-    content = f"---\n{frontmatter}\n---\n{body.strip()}\n"
+    content = render_memory_file(
+        memory_type=memory_type,
+        description=description,
+        body=body,
+    )
     target.write_text(content, encoding="utf-8")
     return target
+
+
+def render_memory_file(
+    *,
+    memory_type: str,
+    description: str,
+    body: str,
+    metadata: dict | None = None,
+) -> str:
+    """Render a markdown memory file without choosing persistence semantics."""
+
+    frontmatter_data = {"type": memory_type, "description": description}
+    if metadata:
+        frontmatter_data.update(metadata)
+    frontmatter = yaml.safe_dump(
+        frontmatter_data,
+        sort_keys=False,
+    ).strip()
+    return f"---\n{frontmatter}\n---\n{body.strip()}\n"

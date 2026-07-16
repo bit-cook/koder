@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socketserver
 import sys
 import threading
@@ -7,6 +8,8 @@ import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
@@ -22,11 +25,59 @@ from agents import ToolInputGuardrailData
 from koder_agent.agentic.hook_guardrail import hook_pretool_guardrail
 from koder_agent.harness.hooks.runtime import (
     _once_fired,
+    _payload_target,
+    _run_agent_hook,
     dispatch_command_hooks,
     list_configured_hooks,
     poll_file_change_hooks,
     update_watch_paths,
 )
+
+
+def test_hook_payload_target_uses_notebook_canonical_path():
+    assert (
+        _payload_target(
+            {
+                "tool_name": "notebook_edit",
+                "tool_input": {"notebook_path": "/tmp/outside.ipynb"},
+            }
+        )
+        == "/tmp/outside.ipynb"
+    )
+    assert (
+        _payload_target(
+            {
+                "tool_name": "notebook_edit",
+                "tool_input": {
+                    "path": "/workspace/decoy.ipynb",
+                    "notebook_path": "/tmp/outside.ipynb",
+                },
+            }
+        )
+        == ""
+    )
+
+
+def test_agent_hook_excludes_todo_tools_without_a_runtime_identity(monkeypatch):
+    captured = {}
+
+    async def fake_create_dev_agent(tools, **_kwargs):
+        captured["tool_names"] = {tool.name for tool in tools}
+        return object()
+
+    async def fake_run(*_args, **_kwargs):
+        return types.SimpleNamespace(final_output='{"ok": true}')
+
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent.create_dev_agent",
+        fake_create_dev_agent,
+    )
+    monkeypatch.setattr("agents.Runner.run", fake_run)
+
+    assert _run_agent_hook(prompt_text="check", payload_text="{}", model=None) == '{"ok": true}'
+    assert "task_delegate" not in captured["tool_names"]
+    assert "todo_read" not in captured["tool_names"]
+    assert "todo_write" not in captured["tool_names"]
 
 
 def test_list_configured_hooks_reads_koder_settings(tmp_path, monkeypatch):
@@ -90,6 +141,93 @@ def test_list_configured_hooks_includes_policy_and_plugin_sources(tmp_path, monk
     sources = {listing.source for listing in listings}
     assert "policy_settings" in sources
     assert "plugin" in sources
+
+
+def test_async_plugin_hook_snapshot_outlives_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / "project"
+    project.mkdir()
+    plugin_dir = tmp_path / ".koder" / "plugins" / "demo"
+    hooks_dir = plugin_dir / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "demo",
+                "version": "1.0.0",
+                "hooks": "hooks/hooks.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "asset.txt").write_text("snapshot-owned", encoding="utf-8")
+    (hooks_dir / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "ignored",
+                                    "async": True,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entered = threading.Event()
+    inspect_snapshot = threading.Event()
+    inspected = threading.Event()
+    finish = threading.Event()
+    observed: dict[str, object] = {}
+    snapshot: Path | None = None
+
+    def fake_run(*_args, **kwargs):
+        snapshot = Path(kwargs["cwd"])
+        observed["snapshot"] = snapshot
+        observed["plugin_root"] = kwargs["env"].get("KODER_PLUGIN_ROOT")
+        entered.set()
+        assert inspect_snapshot.wait(timeout=5)
+        observed["exists"] = snapshot.is_dir()
+        observed["asset"] = (snapshot / "asset.txt").read_text(encoding="utf-8")
+        inspected.set()
+        assert finish.wait(timeout=5)
+
+    monkeypatch.setattr("koder_agent.harness.hooks.runtime.subprocess.run", fake_run)
+
+    try:
+        result = dispatch_command_hooks(
+            cwd=project,
+            event_name="Stop",
+            payload={"event": "Stop"},
+        )
+        assert result.matched_hooks == 1
+        assert entered.wait(timeout=5)
+
+        shutil.rmtree(plugin_dir)
+        inspect_snapshot.set()
+        assert inspected.wait(timeout=5)
+        snapshot = observed["snapshot"]
+        assert isinstance(snapshot, Path)
+        assert observed["exists"] is True
+        assert observed["asset"] == "snapshot-owned"
+        assert observed["plugin_root"] == str(snapshot.resolve())
+    finally:
+        inspect_snapshot.set()
+        finish.set()
+
+    assert snapshot is not None
+    deadline = time.monotonic() + 5
+    while snapshot.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not snapshot.exists()
 
 
 def test_dispatch_command_hooks_blocks_user_prompt_submit_on_exit_code_2(tmp_path, monkeypatch):
@@ -724,3 +862,45 @@ def test_once_hook_does_not_double_fire(tmp_path, monkeypatch):
     # The hook should have fired exactly once despite 10 concurrent dispatches.
     assert int(counter.read_text()) == 1
     _once_fired.clear()
+
+
+@pytest.mark.parametrize("hook_name", ["_run_prompt_hook", "_run_agent_hook"])
+@pytest.mark.parametrize("runner_fails", [False, True])
+def test_agent_backed_hooks_close_mcp_owner(monkeypatch, hook_name, runner_fails):
+    from koder_agent.harness.hooks import runtime as hook_runtime
+    from koder_agent.mcp import MCPServerSet
+
+    class Server:
+        name = "hook-owned"
+
+        def __init__(self):
+            self.cleanup_count = 0
+
+        async def cleanup(self):
+            self.cleanup_count += 1
+
+    server = Server()
+    owner = MCPServerSet([server])
+    agent = types.SimpleNamespace(mcp_servers=[], _koder_mcp_servers=owner)
+
+    async def create_agent(*args, **kwargs):
+        return agent
+
+    async def run_agent(*args, **kwargs):
+        if runner_fails:
+            raise RuntimeError("hook failed")
+        return types.SimpleNamespace(final_output="{}")
+
+    monkeypatch.setattr("koder_agent.agentic.agent.create_dev_agent", create_agent)
+    monkeypatch.setattr("agents.Runner.run", run_agent)
+    monkeypatch.setattr("koder_agent.tools.get_all_tools", lambda: [])
+
+    run_hook = getattr(hook_runtime, hook_name)
+    if runner_fails:
+        with pytest.raises(RuntimeError, match="hook failed"):
+            run_hook(prompt_text="check", payload_text="{}", model=None)
+    else:
+        assert run_hook(prompt_text="check", payload_text="{}", model=None) == "{}"
+
+    assert server.cleanup_count == 1
+    assert agent._koder_mcp_servers is None

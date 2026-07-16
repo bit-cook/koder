@@ -140,14 +140,28 @@ async def run_review(
 
     prompt = build_review_prompt(selection.diff or "", selection.context or "changes")
     try:
-        review = await llm_completion(
+        completion = await llm_completion(
             messages=[
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
-            ]
+            ],
+            overflow_policy="truncate",
+            return_metadata=True,
         )
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         return f"Review failed: {exc}", False
 
-    text = f"Code Review ({selection.context}):\n\n{review}"
+    if isinstance(completion, str):  # Backwards-compatible test doubles.
+        review = completion
+        truncation = None
+    else:
+        review = completion.text
+        truncation = completion.truncation
+    provenance = ""
+    if truncation is not None:
+        provenance = (
+            "Input warning: the review model received explicitly truncated input "
+            f"({truncation.original_input_tokens} -> {truncation.sent_input_tokens} tokens).\n\n"
+        )
+    text = f"Code Review ({selection.context}):\n\n{provenance}{review}"
     return text, bool(review and review.strip())

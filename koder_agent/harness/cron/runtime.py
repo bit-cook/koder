@@ -5,12 +5,29 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .scheduler import CronScheduler
 from .storage import CronStorage, default_cron_storage
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_owned_task(task: asyncio.Task) -> None:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    try:
+        task.result()
+    except BaseException:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 @dataclass(frozen=True)
@@ -25,14 +42,14 @@ class CronPromptRunner:
 
     def __init__(
         self,
-        scheduler_getter: Callable[[], object],
+        prompt_dispatcher: Callable[..., Awaitable[str]],
         *,
         storage: CronStorage | None = None,
         check_interval: float = 60.0,
     ):
         if storage is None:
             storage = default_cron_storage()
-        self._scheduler_getter = scheduler_getter
+        self._prompt_dispatcher = prompt_dispatcher
         self._storage = storage
         self._queue: asyncio.Queue[QueuedCronJob] = asyncio.Queue()
         self._pending_job_ids: set[str] = set()
@@ -44,6 +61,7 @@ class CronPromptRunner:
             check_interval=check_interval,
         )
         self._consumer_task: asyncio.Task | None = None
+        self._stop_task: asyncio.Task | None = None
 
     @property
     def pending_job_ids(self) -> set[str]:
@@ -91,23 +109,39 @@ class CronPromptRunner:
 
     async def stop(self) -> None:
         """Stop background polling and prompt consumption."""
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_owned())
+        await _await_owned_task(self._stop_task)
 
-        await self._cron_scheduler.stop_async()
-
-        if self._consumer_task is not None:
-            self._consumer_task.cancel()
-            await asyncio.gather(self._consumer_task, return_exceptions=True)
-            self._consumer_task = None
+    async def _stop_owned(self) -> None:
+        try:
+            await self._cron_scheduler.stop_async()
+        except Exception:
+            logger.exception("Cron scheduler shutdown failed")
+            raise
+        finally:
+            if self._consumer_task is not None:
+                self._consumer_task.cancel()
+                results = await asyncio.gather(
+                    self._consumer_task,
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(
+                        result,
+                        asyncio.CancelledError,
+                    ):
+                        logger.debug(
+                            "Cron prompt consumer shutdown failed",
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
+                self._consumer_task = None
 
     async def _consume(self) -> None:
         while True:
             queued = await self._queue.get()
             try:
-                scheduler = self._scheduler_getter()
-                if scheduler is None or not hasattr(scheduler, "handle"):
-                    logger.warning("Cron prompt fired without an active scheduler")
-                    continue
-                await scheduler.handle(queued.prompt, render_output=True)
+                await self._prompt_dispatcher(queued.prompt, render_output=True)
                 if not queued.recurring:
                     self._storage.delete(queued.id)
             except Exception:

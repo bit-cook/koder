@@ -15,6 +15,7 @@ def test_render_completion_supports_all_shells():
     for shell in SUPPORTED_SHELLS:
         script = render_completion_script(shell)
         assert "koder" in script
+        assert "approve" in script
         assert script.strip()
 
 

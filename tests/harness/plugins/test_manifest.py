@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
     litellm_stub.model_cost = {}
@@ -113,8 +115,8 @@ def test_parse_manifest_component_paths(tmp_path):
     manifest, errors, _ = parse_manifest(plugin_dir)
     assert errors == []
     assert manifest is not None
-    assert manifest.skills == "skills/"
-    assert manifest.agents == "agents/"
+    assert manifest.skills == "skills"
+    assert manifest.agents == "agents"
     assert manifest.hooks == "hooks/hooks.json"
     assert manifest.mcp_servers == ".mcp.json"
 
@@ -126,6 +128,17 @@ def test_parse_manifest_rejects_missing_name(tmp_path):
     manifest, errors, _ = parse_manifest(plugin_dir)
     assert manifest is None
     assert any("name" in e for e in errors)
+
+
+@pytest.mark.parametrize("name", [None, 123, ["demo"]])
+def test_parse_manifest_rejects_non_string_names(tmp_path, name):
+    plugin_dir = tmp_path / "non-string-name"
+    _write_manifest(plugin_dir, {"name": name})
+
+    manifest, errors, _ = parse_manifest(plugin_dir)
+
+    assert manifest is None
+    assert any("must be a non-empty string" in error for error in errors)
 
 
 def test_parse_manifest_rejects_invalid_json(tmp_path):
@@ -150,23 +163,78 @@ def test_parse_manifest_rejects_path_traversal(tmp_path):
     assert any("Path traversal" in e for e in errors)
 
 
-def test_parse_manifest_warns_on_bad_name_format(tmp_path):
-    """parse_manifest warns for non-kebab-case names."""
+@pytest.mark.parametrize(
+    "component_path",
+    ["/tmp/outside", r"C:\outside", r"nested\outside", "skills//nested", "./skills"],
+)
+def test_parse_manifest_rejects_nonportable_component_paths(tmp_path, component_path):
+    plugin_dir = tmp_path / "unsafe-component"
+    _write_manifest(plugin_dir, {"name": "unsafe-component", "skills": component_path})
+
+    manifest, errors, _ = parse_manifest(plugin_dir)
+
+    assert manifest is None
+    assert errors
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../outside",
+        r"..\outside",
+        "/tmp/absolute-plugin",
+        r"C:\absolute-plugin",
+        "nested/plugin",
+        r"nested\plugin",
+        ".",
+        "..",
+        ".hidden-plugin",
+        "hidden-plugin.",
+        "-leading-separator",
+        "trailing-separator_",
+        "CON",
+        "nul",
+    ],
+)
+def test_parse_manifest_rejects_unsafe_plugin_names(tmp_path, name):
+    plugin_dir = tmp_path / "unsafe-name"
+    _write_manifest(plugin_dir, {"name": name})
+
+    manifest, errors, _ = parse_manifest(plugin_dir)
+
+    assert manifest is None
+    assert any("Invalid plugin name" in error for error in errors)
+
+
+def test_parse_manifest_rejects_noncanonical_case_with_migration_message(tmp_path):
+    """Existing mixed-case identities must be renamed, never silently aliased."""
     plugin_dir = tmp_path / "BadName"
     _write_manifest(plugin_dir, {"name": "BadName"})
     manifest, errors, warnings = parse_manifest(plugin_dir)
-    assert manifest is not None  # Still parses (warning, not error)
-    assert any("kebab-case" in w for w in warnings)
+    assert manifest is None
+    assert warnings == []
+    assert any("lowercase canonical spelling" in error for error in errors)
 
 
-def test_parse_manifest_warns_on_long_name(tmp_path):
-    """parse_manifest warns for excessively long names."""
+def test_parse_manifest_preserves_compatible_long_and_dotted_names(tmp_path):
+    """Portable names accepted before traversal hardening remain compatible."""
     plugin_dir = tmp_path / "long-name"
-    long_name = "a" * 100
+    long_name = f"acme.{('a' * 95)}"
     _write_manifest(plugin_dir, {"name": long_name})
-    manifest, _, warnings = parse_manifest(plugin_dir)
+    manifest, errors, _ = parse_manifest(plugin_dir)
+    assert errors == []
     assert manifest is not None
-    assert any("exceeds" in w for w in warnings)
+    assert manifest.name == long_name
+
+
+def test_parse_manifest_rejects_names_over_portable_filename_limit(tmp_path):
+    plugin_dir = tmp_path / "too-long"
+    _write_manifest(plugin_dir, {"name": "a" * 256})
+
+    manifest, errors, _ = parse_manifest(plugin_dir)
+
+    assert manifest is None
+    assert any("255 characters" in error for error in errors)
 
 
 def test_parse_manifest_from_koder_plugin_dir(tmp_path):

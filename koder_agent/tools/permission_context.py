@@ -32,6 +32,12 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from koder_agent.harness.permissions.tool_arguments import (
+    ToolArgumentError,
+    normalize_tool_arguments,
+)
+from koder_agent.harness.sandbox.backend import SandboxExecutionRequirement
+
 if TYPE_CHECKING:
     from koder_agent.harness.permissions.results import PermissionEvaluationResult
     from koder_agent.harness.permissions.service import PermissionService
@@ -49,6 +55,7 @@ GUARDED_TOOLS: frozenset[str] = frozenset(
         "write_file",
         "edit_file",
         "append_file",
+        "notebook_edit",
     }
 )
 
@@ -84,9 +91,47 @@ class ToolPermissionContext:
     approver: Optional[Approver] = None
 
 
+@dataclass(frozen=True)
+class ToolExecutionRequirement:
+    """Execution constraint produced by argument-level permission evaluation."""
+
+    tool_name: str
+    command: str
+    sandbox: SandboxExecutionRequirement
+
+
 _tool_permission_ctx: ContextVar[Optional[ToolPermissionContext]] = ContextVar(
     "tool_permission_context", default=None
 )
+_tool_execution_requirement: ContextVar[Optional[ToolExecutionRequirement]] = ContextVar(
+    "tool_execution_requirement", default=None
+)
+
+
+def begin_tool_invocation() -> Token:
+    """Clear any stale execution requirement for one FunctionTool invocation."""
+
+    return _tool_execution_requirement.set(None)
+
+
+def reset_tool_invocation(token: Token) -> None:
+    """Restore the previous invocation requirement."""
+
+    try:
+        _tool_execution_requirement.reset(token)
+    except (ValueError, LookupError):
+        _tool_execution_requirement.set(None)
+
+
+def required_sandbox_execution(tool_name: str, command: str) -> SandboxExecutionRequirement | None:
+    """Return the immutable sandbox snapshot for this auto-approved invocation."""
+
+    requirement = _tool_execution_requirement.get()
+    if requirement is None:
+        return None
+    if requirement.tool_name != tool_name or requirement.command != command:
+        return None
+    return requirement.sandbox
 
 
 def set_tool_permission_context(
@@ -215,6 +260,22 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
         return None
 
     try:
+        arguments = normalize_tool_arguments(tool_name, arguments)
+    except ToolArgumentError as exc:
+        reason = f"invalid tool arguments: {exc}"
+        _dispatch_permission_hooks(
+            "PermissionDenied",
+            tool_name,
+            {
+                "event": "PermissionDenied",
+                "tool_name": tool_name,
+                "tool_input": arguments,
+                "reason": reason,
+            },
+        )
+        return _denial_message(tool_name, reason)
+
+    try:
         decision = await ctx.permission_service.evaluate_tool_call_async(tool_name, arguments)
     except Exception:
         # Never let an evaluation bug crash a tool call; log and fail open so the
@@ -302,4 +363,84 @@ async def enforce_tool_permission(tool_name: str, input_json: str) -> Optional[s
     if not decision.allowed:
         return _deny(decision.reason)
 
+    sandbox_backend = getattr(decision, "sandbox_backend", None)
+    if sandbox_backend is not None:
+        command = arguments.get("command")
+        sandbox_cwd = getattr(decision, "sandbox_cwd", None)
+        policy_digest = getattr(decision, "sandbox_policy_digest", None)
+        capability_digest = getattr(decision, "sandbox_capability_digest", None)
+        if (
+            isinstance(command, str)
+            and isinstance(sandbox_cwd, str)
+            and isinstance(policy_digest, str)
+            and isinstance(capability_digest, str)
+        ):
+            _tool_execution_requirement.set(
+                ToolExecutionRequirement(
+                    tool_name=tool_name,
+                    command=command,
+                    sandbox=SandboxExecutionRequirement(
+                        backend_id=sandbox_backend,
+                        canonical_cwd=sandbox_cwd,
+                        policy_digest=policy_digest,
+                        capability_digest=capability_digest,
+                    ),
+                )
+            )
+
     return None
+
+
+async def approve_sandbox_degradation(
+    tool_name: str,
+    arguments: dict,
+    reason: str,
+) -> bool:
+    """Request a distinct approval before any degraded sandbox execution."""
+
+    ctx = _tool_permission_ctx.get()
+    if ctx is None or ctx.approver is None:
+        return False
+
+    from koder_agent.harness.permissions.results import PermissionEvaluationResult
+
+    warning = f"sandbox degradation approval required before execution: {reason}"
+    decision = PermissionEvaluationResult.approval_required(
+        tool_name=tool_name,
+        reason=warning,
+    )
+    request_result = _dispatch_permission_hooks(
+        "PermissionRequest",
+        tool_name,
+        {
+            "event": "PermissionRequest",
+            "tool_name": tool_name,
+            "tool_input": arguments,
+            "reason": warning,
+            "sandbox_degradation": True,
+        },
+    )
+    _dispatch_permission_hooks(
+        "Notification",
+        "permission_prompt",
+        {
+            "event": "Notification",
+            "notification_type": "permission_prompt",
+            "tool_name": tool_name,
+            "reason": warning,
+            "sandbox_degradation": True,
+        },
+    )
+    hook_decision = getattr(request_result, "permission_request_result", None)
+    if isinstance(hook_decision, dict):
+        behavior = hook_decision.get("behavior")
+        if behavior == "allow":
+            return True
+        if behavior == "deny":
+            return False
+    try:
+        verdict = await ctx.approver(tool_name, arguments, decision)
+    except Exception:
+        logger.debug("Sandbox degradation approver raised for %s", tool_name, exc_info=True)
+        return False
+    return verdict in (_ALLOW_ONCE_RESULTS | _ALLOW_ALWAYS_RESULTS)

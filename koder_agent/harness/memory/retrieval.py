@@ -217,7 +217,10 @@ async def llm_retrieve_relevant_memories(
         }
 
         # Call LLM
-        response = await llm_completion([system_message, user_message])
+        response = await llm_completion(
+            [system_message, user_message],
+            response_reserve=512,
+        )
 
         # Parse response: split by newlines, filter NONE, strip whitespace
         selected_filenames = [

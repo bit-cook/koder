@@ -80,6 +80,28 @@ def test_file_tool_transcript_shapes(tmp_path):
     assert "File not found" in error["content"]
 
 
+def test_file_tool_transcript_rejects_conflicting_path_aliases(tmp_path):
+    registry = ToolRegistry.empty()
+    registry.register_module("file_ops")
+    safe = tmp_path / "safe.txt"
+    outside = tmp_path.parent / "outside.txt"
+
+    result = asyncio.run(
+        registry.get("write_file").invoke(
+            {
+                "path": str(safe),
+                "file_path": str(outside),
+                "content": "must not be written",
+            }
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be exactly equal" in result["content"]
+    assert not safe.exists()
+    assert not outside.exists()
+
+
 def test_web_tool_transcript_shapes():
     registry = ToolRegistry.empty()
     registry.register_module("web_ops")

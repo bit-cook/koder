@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
+import sys
+
+import pytest
 
 from koder_agent.mcp.server_config import MCPServerConfig, MCPServerType
 from koder_agent.mcp.server_factory import (
@@ -42,6 +47,54 @@ class TestResolveHeadersHelper:
         finally:
             factory.HEADERS_HELPER_TIMEOUT_S = original
 
+    def test_cancellation_kills_child_group_and_drains_transport(self, tmp_path):
+        async def scenario():
+            pid_path = tmp_path / "helper.pid"
+            child = (
+                "import os,time,pathlib; "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                "time.sleep(60)"
+            )
+            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}"
+            loop = asyncio.get_running_loop()
+            baseline_transports = {
+                id(transport)
+                for transport in getattr(loop, "_transports", {}).values()
+                if transport is not None and not transport.is_closing()
+            }
+
+            task = asyncio.create_task(_resolve_headers_helper(command))
+            for _ in range(200):
+                if pid_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert pid_path.exists()
+            child_pid = int(pid_path.read_text())
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            for _ in range(200):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"headers helper child {child_pid} survived cancellation")
+
+            leaked_transports = [
+                transport
+                for transport in getattr(loop, "_transports", {}).values()
+                if transport is not None
+                and not transport.is_closing()
+                and id(transport) not in baseline_transports
+            ]
+            assert leaked_transports == []
+
+        asyncio.run(scenario())
+
     def test_non_object_returns_empty(self):
         """headersHelper returning a JSON array should return empty dict."""
         result = asyncio.run(_resolve_headers_helper('echo \'["a", "b"]\''))
@@ -51,6 +104,22 @@ class TestResolveHeadersHelper:
         """headersHelper values should be coerced to strings."""
         result = asyncio.run(_resolve_headers_helper('echo \'{"X-Count": 42, "X-Flag": true}\''))
         assert result == {"X-Count": "42", "X-Flag": "True"}
+
+    def test_reviewed_argv_runs_without_a_shell_and_with_explicit_env(self, tmp_path):
+        helper = tmp_path / "helper"
+        helper.write_text('#!/bin/sh\nprintf \'{"Mode": "safe"}\'\n', encoding="utf-8")
+        helper.chmod(0o755)
+
+        result = asyncio.run(
+            _resolve_headers_helper(
+                "ignored shell text",
+                argv=[str(helper)],
+                env={"PATH": str(tmp_path)},
+                cwd=str(tmp_path),
+            )
+        )
+
+        assert result == {"Mode": "safe"}
 
 
 class TestBuildEffectiveHeaders:

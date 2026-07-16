@@ -1,6 +1,9 @@
 """Tests for model_info utilities."""
 
+import pytest
+
 from koder_agent.utils.model_info import (
+    UnknownModelContextWindowError,
     get_context_window_size,
     get_maximum_output_tokens,
     get_model_name_variants_for_lookup,
@@ -92,12 +95,9 @@ class TestGetContextWindowSize:
         result = get_context_window_size("any-model", max_context_size=100000)
         assert result == 100000
 
-    def test_fallback_to_default(self, monkeypatch):
-        """Test fallback to default when model not in litellm registry."""
-        # Use a fake model name that won't exist
-        result = get_context_window_size("nonexistent-model-xyz-12345")
-        # Should return the fallback default (32000)
-        assert result == 32000
+    def test_unknown_model_fails_closed(self):
+        with pytest.raises(UnknownModelContextWindowError):
+            get_context_window_size("nonexistent-model-xyz-12345")
 
     def test_known_model_returns_correct_size(self, monkeypatch):
         """Test that known models return their context window size from litellm."""
@@ -116,8 +116,10 @@ class TestGetMaximumOutputTokens:
 
     def test_output_tokens_calculated_from_context(self):
         """Test that max output tokens is calculated from context size."""
-        # For a model with 32000 context, max_output should be floor(32000/5) = 6400
-        result = get_maximum_output_tokens("nonexistent-model-xyz-12345")
+        result = get_maximum_output_tokens(
+            "nonexistent-model-xyz-12345",
+            max_context_size=32000,
+        )
         assert result == 6400  # floor(32000 / 5)
 
     def test_output_tokens_capped_at_64000(self):
@@ -133,10 +135,17 @@ class TestGetSummarizationThreshold:
     def test_default_threshold_ratio(self):
         """Test default threshold ratio of 0.8."""
         # For 32000 context, threshold should be 32000 * 0.8 = 25600
-        result = get_summarization_threshold("nonexistent-model-xyz-12345")
+        result = get_summarization_threshold(
+            "nonexistent-model-xyz-12345",
+            max_context_size=32000,
+        )
         assert result == 25600
 
     def test_custom_threshold_ratio(self):
         """Test custom threshold ratio."""
-        result = get_summarization_threshold("nonexistent-model-xyz-12345", threshold_ratio=0.5)
+        result = get_summarization_threshold(
+            "nonexistent-model-xyz-12345",
+            threshold_ratio=0.5,
+            max_context_size=32000,
+        )
         assert result == 16000  # 32000 * 0.5

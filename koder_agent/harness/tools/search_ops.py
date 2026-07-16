@@ -48,5 +48,10 @@ async def invoke_grep_search(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_tools(registry: ToolRegistry) -> None:
-    registry.register(ToolSpec(name="glob_search", invoke=invoke_glob_search, category="search"))
-    registry.register(ToolSpec(name="grep_search", invoke=invoke_grep_search, category="search"))
+    registry.register_many(
+        [
+            ToolSpec(name="glob_search", invoke=invoke_glob_search, category="search"),
+            ToolSpec(name="grep_search", invoke=invoke_grep_search, category="search"),
+        ],
+        source=__name__,
+    )

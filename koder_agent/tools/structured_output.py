@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import json
 
-from .compat import function_tool
+from .compat import (
+    DuplicateJSONKeyError,
+    InvalidJSONConstantError,
+    StructuredOutputTooLargeError,
+    _get_max_tool_output_chars,
+    function_tool,
+    parse_json_with_limits,
+    serialize_bounded_json,
+    tool_output_too_large_json,
+)
 
 
 @function_tool
@@ -24,10 +33,21 @@ def structured_output(data: str) -> str:
     if not data:
         return json.dumps({"result": None})
 
+    max_chars = _get_max_tool_output_chars()
+    if len(data) > max_chars:
+        return tool_output_too_large_json(max_chars, original_chars=len(data))
+
     # Try to parse as JSON and return it validated
     try:
-        parsed = json.loads(data)
-        return json.dumps(parsed)
-    except (json.JSONDecodeError, TypeError):
+        parse_json_with_limits(data, reject_duplicate_keys=True)
+        return data
+    except DuplicateJSONKeyError as exc:
+        return serialize_bounded_json(
+            {"error": "duplicate_json_key", "key": exc.key},
+            max_chars,
+        )
+    except StructuredOutputTooLargeError:
+        return tool_output_too_large_json(max_chars, original_chars=len(data))
+    except (InvalidJSONConstantError, json.JSONDecodeError, TypeError):
         # If not valid JSON, wrap in a result object
-        return json.dumps({"result": data})
+        return serialize_bounded_json({"result": data}, max_chars)

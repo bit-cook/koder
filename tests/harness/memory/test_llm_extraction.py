@@ -11,6 +11,10 @@ from koder_agent.harness.memory.extraction import (
     extract_memories_from_messages,
     llm_extract_memories,
 )
+from koder_agent.harness.memory.governance import (
+    MAX_EXTRACTION_CANDIDATES,
+    MAX_EXTRACTION_RESPONSE_BYTES,
+)
 
 
 def test_memory_types_has_4():
@@ -89,6 +93,33 @@ async def test_llm_extraction_filters_invalid_types():
 
 
 @pytest.mark.anyio
+async def test_llm_extract_memories_separates_skill_candidates():
+    response = json.dumps(
+        {
+            "memories": [{"type": "project", "content": "Use uv.", "description": "Tooling"}],
+            "skill_candidates": [
+                {
+                    "name": "verify-first",
+                    "description": "Verify focused behavior",
+                    "instructions": "Run focused tests first.",
+                }
+            ],
+        }
+    )
+
+    with patch(
+        "koder_agent.harness.memory.extraction.llm_completion",
+        new_callable=AsyncMock,
+        return_value=response,
+    ):
+        result = await llm_extract_memories([{"role": "user", "content": "Use uv"}])
+
+    assert len(result.memories) == 1
+    assert len(result.skill_candidates) == 1
+    assert result.skill_candidates[0]["name"] == "verify-first"
+
+
+@pytest.mark.anyio
 async def test_llm_extraction_handles_error():
     messages = [{"role": "user", "content": "test"}]
 
@@ -150,3 +181,41 @@ async def test_llm_extraction_handles_multimodal_content():
     ):
         result = await llm_extract_memories(messages)
         assert len(result.errors) == 0
+
+
+@pytest.mark.anyio
+async def test_extraction_candidate_count_is_bounded():
+    response = json.dumps(
+        {
+            "memories": [
+                {"type": "project", "content": f"fact {index}", "description": "bounded"}
+                for index in range(MAX_EXTRACTION_CANDIDATES + 20)
+            ],
+            "skill_candidates": [],
+        }
+    )
+
+    with patch(
+        "koder_agent.harness.memory.extraction.llm_completion",
+        new_callable=AsyncMock,
+        return_value=response,
+    ):
+        result = await llm_extract_memories([{"role": "user", "content": "facts"}])
+
+    assert len(result.memories) == MAX_EXTRACTION_CANDIDATES
+    assert any(error.startswith("candidate_limit:") for error in result.errors)
+
+
+@pytest.mark.anyio
+async def test_oversized_extraction_response_is_rejected_before_json_parse():
+    response = " " * (MAX_EXTRACTION_RESPONSE_BYTES + 1)
+
+    with patch(
+        "koder_agent.harness.memory.extraction.llm_completion",
+        new_callable=AsyncMock,
+        return_value=response,
+    ):
+        result = await llm_extract_memories([{"role": "user", "content": "facts"}])
+
+    assert result.memories == []
+    assert "size limit" in result.errors[0]

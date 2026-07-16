@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json as _json
 import logging
+import os
+import signal
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, List, Optional
 
@@ -20,9 +23,15 @@ from agents.mcp import (
 )
 from mcp.client.session import ClientSession, ElicitationFnT
 
+from .lifecycle import cleanup_mcp_servers
 from .limits import get_timeout_seconds
-from .reconnection import ReconnectionConfig, ReconnectionManager
-from .server_config import MCPServerConfig, MCPServerType
+from .reconnection import (
+    LiveMCPServer,
+    ReconnectionConfig,
+    ReconnectionManager,
+    retain_orphaned_retirements,
+)
+from .server_config import MCPServerConfig, MCPServerScope, MCPServerType
 
 logger = logging.getLogger(__name__)
 
@@ -163,20 +172,69 @@ class ElicitationAwareHttp(_ElicitationMixin, MCPServerStreamableHttp):
 HEADERS_HELPER_TIMEOUT_S = 10.0
 
 
-async def _resolve_headers_helper(helper_cmd: str) -> dict[str, str]:
+async def _stop_headers_helper_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill and drain a headers-helper subprocess without leaking its transport."""
+    if proc.returncode is None:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:  # pragma: no cover - exercised on Windows
+                proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await proc.communicate()
+    except (ProcessLookupError, RuntimeError):
+        pass
+
+
+async def _settle_headers_helper_process(proc: asyncio.subprocess.Process) -> None:
+    task = asyncio.create_task(_stop_headers_helper_process(proc))
+    caller_cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            caller_cancelled = True
+    task.result()
+    if caller_cancelled:
+        raise asyncio.CancelledError
+
+
+async def _resolve_headers_helper(
+    helper_cmd: str,
+    *,
+    cwd: str | None = None,
+    argv: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Run a headersHelper shell command and return the parsed JSON headers.
 
     The command must write a JSON object of string key-value pairs to stdout.
-    It runs in a shell with a 10-second timeout.  On any error the result is
-    an empty dict so that the connection attempt can still proceed with the
-    static headers only.
+    User-scoped helpers retain shell compatibility. Project-scoped helpers pass
+    a reviewed *argv* and explicit environment, and therefore never invoke a
+    shell. On any error the result is an empty dict so the connection attempt
+    can still proceed with static headers only.
     """
+    proc: asyncio.subprocess.Process | None = None
     try:
-        proc = await asyncio.create_subprocess_shell(
-            helper_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        if argv is not None:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                start_new_session=os.name == "posix",
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                helper_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                start_new_session=os.name == "posix",
+            )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=HEADERS_HELPER_TIMEOUT_S
         )
@@ -193,8 +251,14 @@ async def _resolve_headers_helper(helper_cmd: str) -> dict[str, str]:
             return {}
         return {str(k): str(v) for k, v in parsed.items()}
     except asyncio.TimeoutError:
+        if proc is not None:
+            await _settle_headers_helper_process(proc)
         logger.warning("headersHelper timed out after %.0fs", HEADERS_HELPER_TIMEOUT_S)
         return {}
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _settle_headers_helper_process(proc)
+        raise
     except (_json.JSONDecodeError, Exception) as exc:
         logger.warning("headersHelper failed: %s", exc)
         return {}
@@ -225,16 +289,23 @@ async def _build_effective_headers(
         except Exception as exc:
             logger.warning("OAuth flow failed for '%s': %s", config.name, exc)
 
-    if config.headers_helper:
-        if trusted:
-            dynamic = await _resolve_headers_helper(config.headers_helper)
-            headers.update(dynamic)
-        else:
-            logger.warning(
-                "Skipping headersHelper for untrusted MCP server '%s': "
-                "project-scoped auth helpers only run after project approval.",
-                config.name,
-            )
+    if not config.headers_helper:
+        return headers
+    if not trusted:
+        logger.warning(
+            "Skipping headersHelper for untrusted MCP server '%s': "
+            "project-scoped auth helpers only run after project approval.",
+            config.name,
+        )
+        return headers
+
+    dynamic = await _resolve_headers_helper(
+        config.headers_helper,
+        cwd=config.execution_cwd,
+        argv=config.headers_helper_argv,
+        env=(dict(config.env_vars or {}) if config.headers_helper_argv else None),
+    )
+    headers.update(dynamic)
     return headers
 
 
@@ -254,8 +325,9 @@ def _install_output_truncation(server: MCPServer, server_name: str) -> None:
     if original is None or getattr(server, "_koder_output_capped", False):
         return
 
-    async def _capped_call_tool(tool_name: str, arguments: Any = None) -> Any:
-        result = await original(tool_name, arguments)
+    @functools.wraps(original)
+    async def _capped_call_tool(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
         try:
             return truncate_call_tool_result(result, server_name)
         except Exception:  # never let capping break a real tool call
@@ -270,8 +342,117 @@ def _install_output_truncation(server: MCPServer, server_name: str) -> None:
         logger.debug("Could not install MCP output cap on '%s'", server_name)
 
 
+def _install_cleanup_guard(server: MCPServer) -> None:
+    """Make concrete-server cleanup retryable and safe for concurrent callers."""
+    original = getattr(server, "cleanup", None)
+    if original is None or getattr(server, "_koder_cleanup_guarded", False):
+        return
+
+    cleanup_lock = asyncio.Lock()
+    cleaned = False
+    cleanup_task: asyncio.Task[Any] | None = None
+
+    async def _run_cleanup(*args: Any, **kwargs: Any) -> Any:
+        nonlocal cleaned, cleanup_task
+        task = asyncio.current_task()
+        try:
+            result = await original(*args, **kwargs)
+        except BaseException:
+            async with cleanup_lock:
+                if cleanup_task is task:
+                    cleanup_task = None
+            raise
+        else:
+            async with cleanup_lock:
+                if cleanup_task is task:
+                    cleaned = True
+                    cleanup_task = None
+            return result
+
+    @functools.wraps(original)
+    async def _cleanup_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal cleanup_task
+        async with cleanup_lock:
+            if cleaned:
+                return None
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(_run_cleanup(*args, **kwargs))
+            task = cleanup_task
+        return await asyncio.shield(task)
+
+    try:
+        server.cleanup = _cleanup_once  # type: ignore[method-assign]
+        server._koder_cleanup_guarded = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        logger.debug("Could not install MCP cleanup guard on '%s'", getattr(server, "name", ""))
+
+
+def _install_project_authorization_guard(
+    server: MCPServer,
+    config: MCPServerConfig,
+    *,
+    validator: Any = None,
+) -> None:
+    """Install the centralized project authorization/session boundary."""
+    if config.scope != MCPServerScope.PROJECT:
+        return
+
+    from .runtime_authorization import attach_project_authorization_validator
+
+    try:
+        attach_project_authorization_validator(server, config, validator=validator)
+    except (AttributeError, TypeError):
+        logger.error(
+            "Could not install project authorization boundary on '%s'; refusing server",
+            config.name,
+        )
+        raise RuntimeError(
+            f"Project MCP server '{config.name}' cannot be guarded at runtime"
+        ) from None
+
+
 class MCPServerFactory:
     """Factory for creating MCP server instances from configurations."""
+
+    @staticmethod
+    async def _build_concrete_server(
+        config: MCPServerConfig,
+        channel_callback: ChannelNotifCallbackT | None = None,
+        *,
+        trusted: bool = True,
+    ) -> MCPServer:
+        """Build one unguarded concrete transport with retryable cleanup."""
+        tool_filter = None
+        if config.allowed_tools or config.blocked_tools:
+            tool_filter = create_static_tool_filter(
+                allowed_tool_names=config.allowed_tools,
+                blocked_tool_names=config.blocked_tools,
+            )
+
+        if config.transport_type == MCPServerType.STDIO:
+            server: MCPServer = MCPServerFactory._create_stdio_server(
+                config,
+                tool_filter,
+                channel_callback=channel_callback,
+            )
+        elif config.transport_type == MCPServerType.SSE:
+            server = await MCPServerFactory._create_sse_server(
+                config,
+                tool_filter,
+                trusted=trusted,
+            )
+        elif config.transport_type == MCPServerType.HTTP:
+            server = await MCPServerFactory._create_http_server(
+                config,
+                tool_filter,
+                trusted=trusted,
+            )
+        else:
+            raise ValueError(f"Unsupported transport type: {config.transport_type}")
+
+        _install_output_truncation(server, config.name)
+        _install_cleanup_guard(server)
+        return server
 
     @staticmethod
     async def create_server(
@@ -280,7 +461,7 @@ class MCPServerFactory:
         *,
         trusted: bool = True,
     ) -> MCPServer:
-        """Create an MCP server instance from configuration.
+        """Create a standalone MCP server instance from configuration.
 
         If *channel_callback* is provided and the transport is stdio,
         a :class:`ChannelAwareMCPServerStdio` is used instead of the
@@ -292,34 +473,38 @@ class MCPServerFactory:
         but only when *trusted* is True (unapproved project servers do not run
         their auth helper).
         """
-        try:
-            # Create tool filter if specified
-            tool_filter = None
-            if config.allowed_tools or config.blocked_tools:
-                tool_filter = create_static_tool_filter(
-                    allowed_tool_names=config.allowed_tools,
-                    blocked_tool_names=config.blocked_tools,
-                )
 
-            if config.transport_type == MCPServerType.STDIO:
-                server: MCPServer = MCPServerFactory._create_stdio_server(
-                    config, tool_filter, channel_callback=channel_callback
+        async def _prepare_server(authorization_validator: Any = None) -> MCPServer:
+            server = await MCPServerFactory._build_concrete_server(
+                config,
+                channel_callback,
+                trusted=trusted,
+            )
+            if authorization_validator is not None:
+                _install_project_authorization_guard(
+                    server,
+                    config,
+                    validator=authorization_validator,
                 )
-            elif config.transport_type == MCPServerType.SSE:
-                server = await MCPServerFactory._create_sse_server(
-                    config, tool_filter, trusted=trusted
-                )
-            elif config.transport_type == MCPServerType.HTTP:
-                server = await MCPServerFactory._create_http_server(
-                    config, tool_filter, trusted=trusted
-                )
-            else:
-                raise ValueError(f"Unsupported transport type: {config.transport_type}")
-
-            # Enforce the MCP output-token cap on tool results. MCP tools bypass
-            # koder's function_tool wrapper, so without this the cap is dead.
-            _install_output_truncation(server, config.name)
             return server
+
+        try:
+            if config.scope == MCPServerScope.PROJECT:
+                from .runtime_authorization import ProjectServerAuthorizationValidator
+
+                # The authorization owner exists before tool-filter creation,
+                # OAuth, headersHelper, transport construction, or any other
+                # fallible connection preparation. The whole preparation is an
+                # admitted operation, and server callbacks still run lock-free.
+                validator = ProjectServerAuthorizationValidator(config)
+                try:
+                    return await validator.run_authorized(_prepare_server, validator)
+                except BaseException:
+                    if validator.server is not None:
+                        await validator.disable()
+                    raise
+
+            return await _prepare_server()
 
         except Exception as e:
             logger.error(f"Failed to create MCP server '{config.name}': {e}")
@@ -339,6 +524,7 @@ class MCPServerFactory:
             command=config.command,
             args=config.args or [],
             env=config.env_vars or {},
+            cwd=config.execution_cwd,
         )
 
         if channel_callback is not None:
@@ -405,19 +591,51 @@ class MCPServerFactory:
     @staticmethod
     async def create_servers_from_configs(
         configs: List[MCPServerConfig],
+        *,
+        existing_servers: List[MCPServer] | None = None,
     ) -> List[MCPServer]:
-        """Create multiple MCP server instances from configurations."""
-        servers = []
+        """Create stable, authorization-aware handles for agent-specific configs."""
+        from .prompts import normalize_mcp_name
+
+        runtime_names: dict[str, str] = {}
+        for server in existing_servers or []:
+            name = str(getattr(server, "name", ""))
+            normalized = normalize_mcp_name(name).lower()
+            if normalized:
+                runtime_names[normalized] = name
         for config in configs:
-            try:
-                server = await MCPServerFactory.create_server(config)
-                await server.connect()
-                servers.append(server)
-                logger.info(f"Created MCP server '{config.name}' ({config.transport_type})")
-            except Exception as e:
-                logger.error(f"Failed to create MCP server '{config.name}': {e}")
-                # Continue with other servers even if one fails
-                continue
+            normalized = normalize_mcp_name(config.name).lower()
+            existing_name = runtime_names.get(normalized)
+            if not normalized:
+                raise ValueError(
+                    f"MCP server name '{config.name}' normalizes to an empty runtime name"
+                )
+            if existing_name is not None:
+                raise ValueError(
+                    f"MCP server name collision for runtime name '{normalized}': "
+                    f"'{config.name}' conflicts with '{existing_name}'"
+                )
+            runtime_names[normalized] = config.name
+
+        servers: list[MCPServer] = []
+        try:
+            for config in configs:
+                try:
+                    server, _manager = await MCPServerFactory.create_and_connect_with_retry(config)
+                    servers.append(server)
+                    logger.info(f"Created MCP server '{config.name}' ({config.transport_type})")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(f"Failed to create MCP server '{config.name}': {exc}")
+                    continue
+        except BaseException:
+            await cleanup_mcp_servers(
+                servers,
+                logger=logger,
+                propagate_cancellation=False,
+            )
+            raise
 
         return servers
 
@@ -437,34 +655,123 @@ class MCPServerFactory:
             factory closure so callers can trigger a fresh connect later.
         """
         reconnection_mgr = ReconnectionManager(reconnection_config)
+        retirement_owner = reconnection_mgr._retirement_owner
+        authorization_validator = None
+        if config.scope == MCPServerScope.PROJECT:
+            from .runtime_authorization import ProjectServerAuthorizationValidator
 
-        async def connect_fn():
-            server = await MCPServerFactory.create_server(config, channel_callback, trusted=trusted)
-            await server.connect()
+            authorization_validator = ProjectServerAuthorizationValidator(config)
+
+        async def _retire_candidate(server: MCPServer) -> None:
+            retirement = retirement_owner.retire(server)
+            if retirement is None:
+                return
+            try:
+                await asyncio.shield(retirement)
+            except asyncio.CancelledError:
+                retain_orphaned_retirements(retirement_owner)
+                raise
+            except Exception:
+                logger.warning(
+                    "Failed to clean up MCP connection candidate '%s'",
+                    config.name,
+                    exc_info=True,
+                )
+            except BaseException:
+                retain_orphaned_retirements(retirement_owner)
+                raise
+
+        async def connect_fn() -> MCPServer:
+            if retirement_owner.pending_count:
+                await retirement_owner.drain(max_attempts=1)
+            server: MCPServer | None = None
+            try:
+                if authorization_validator is not None:
+                    # The stable validator owns the surrounding admission. The
+                    # concrete candidate itself stays unwrapped so retirement can
+                    # retry cleanup independently of authorization state.
+                    server = await MCPServerFactory._build_concrete_server(
+                        config,
+                        channel_callback,
+                        trusted=trusted,
+                    )
+                else:
+                    # Keep the public factory seam for non-project providers and
+                    # existing transport retry tests.
+                    server = await MCPServerFactory.create_server(
+                        config,
+                        channel_callback,
+                        trusted=trusted,
+                    )
+                _install_cleanup_guard(server)
+                retirement_owner.hold(server)
+                await server.connect()
+            except BaseException:
+                if server is not None:
+                    await _retire_candidate(server)
+                raise
             return server
 
         # Try initial connection with retry
-        server = None
+        live_server: LiveMCPServer | None = None
         success = False
 
-        async def retry_connect():
-            nonlocal server
-            server = await connect_fn()
+        async def _connect_initial_handle() -> LiveMCPServer:
+            candidate = await connect_fn()
+            handle = LiveMCPServer(
+                config.name,
+                candidate,
+                retirement_owner=retirement_owner,
+            )
+            try:
+                if authorization_validator is not None:
+                    _install_project_authorization_guard(
+                        handle,
+                        config,
+                        validator=authorization_validator,
+                    )
+            except BaseException:
+                try:
+                    await handle.cleanup()
+                except BaseException:
+                    retain_orphaned_retirements(retirement_owner)
+                raise
+            return handle
 
-        success = await reconnection_mgr.reconnect_with_backoff(retry_connect)
+        async def retry_connect() -> None:
+            nonlocal live_server
+            if authorization_validator is not None:
+                live_server = await authorization_validator.run_authorized(_connect_initial_handle)
+            else:
+                live_server = await _connect_initial_handle()
 
-        if not success or server is None:
+        try:
+            success = await reconnection_mgr.reconnect_with_backoff(retry_connect)
+        except BaseException:
+            retain_orphaned_retirements(retirement_owner)
+            raise
+
+        if not success or live_server is None:
+            try:
+                await retirement_owner.drain()
+            except asyncio.CancelledError:
+                retain_orphaned_retirements(retirement_owner)
+                raise
+            except Exception:
+                retain_orphaned_retirements(retirement_owner)
+            except BaseException:
+                retain_orphaned_retirements(retirement_owner)
+                raise
             raise ConnectionError(
                 f"Failed to connect to MCP server '{config.name}' after "
                 f"{reconnection_mgr.config.max_attempts} attempts"
             )
 
-        # Retain the (server, config, connect closure) on the manager so a later
-        # health check can rebuild a dropped connection without re-deriving the
-        # trust/channel wiring. Used by MCPServerRegistry.reconnect_if_needed().
-        reconnection_mgr.bind(config=config, server=server, connect_fn=connect_fn)
+        # Retain the stable handle plus the raw candidate factory. Reconnect wraps
+        # construction, connect, and publication in the same long-lived validator.
+        reconnection_mgr.bind(config=config, server=live_server, connect_fn=connect_fn)
 
-        return server, reconnection_mgr
+        return live_server, reconnection_mgr
 
     @staticmethod
     def validate_config(config: MCPServerConfig) -> Optional[str]:

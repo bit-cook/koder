@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
 
 from koder_agent.harness.session_env import is_probably_secret_env_name
 
 from .backend import SandboxExecutionContext, SandboxExecutionResult
+from .enforcement import autoapproval_blockers, sandbox_degradation_reason
 from .policy import SandboxPolicy
 from .registry import create_backend_client_and_options, get_backend_status, select_backend_id
 from .workspace import protected_write_violation, read_only_violation
@@ -31,10 +34,32 @@ def _scrub_env(env: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in env.items() if not is_probably_secret_env_name(key)}
 
 
-def _build_manifest(root: Path, env: dict[str, str]):
+DELETE_TIMEOUT_SECONDS = 5.0
+
+
+def _build_manifest(root: Path, env: dict[str, str], *, backend_id: str):
     from agents.sandbox.manifest import Environment, Manifest
 
-    return Manifest(root=str(root), environment=Environment(value=_scrub_env(env)))
+    manifest_root = "/workspace" if backend_id == "cloudflare" else str(root)
+    return Manifest(root=manifest_root, environment=Environment(value=_scrub_env(env)))
+
+
+async def _delete_created_session(client, session) -> None:
+    """Delete a client-owned sandbox even while the caller is being cancelled."""
+
+    task = asyncio.create_task(client.delete(session))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=DELETE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=DELETE_TIMEOUT_SECONDS)
+        raise
+    except asyncio.TimeoutError:
+        task.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await task
+    except Exception:
+        pass
 
 
 async def execute_with_sdk_backend(
@@ -79,51 +104,58 @@ async def execute_with_sdk_backend(
         return SandboxExecutionResult(
             status="policy_violation",
             backend_id=backend_id,
-            sandboxed=True,
+            sandboxed=False,
+            created=False,
+            executed=False,
             violation=violation,
             reason=violation,
         )
 
-    # Honesty-first (finding #4): the resolved backend may be unable to enforce
-    # the network policy the user configured. The SDK Manifest exposes no network
-    # controls, so we cannot silently claim enforcement — surface it explicitly.
-    network_note = None
-    if policy.network_restricted_but_unenforced:
-        network_note = (
-            f"[sandbox] network policy is NOT enforced by backend {backend_id}; "
-            "network_access/allowed_domains/denied_domains are advisory only"
+    blockers = autoapproval_blockers(policy, status.capabilities)
+    if blockers and not context.degradation_approved:
+        reason = sandbox_degradation_reason(backend_id, blockers)
+        return SandboxExecutionResult(
+            status="policy_violation",
+            backend_id=backend_id,
+            sandboxed=False,
+            created=False,
+            executed=False,
+            violation=reason,
+            reason=reason,
         )
 
     client = None
     session = None
+    created = False
+    executed = False
     try:
-        client, options = create_backend_client_and_options(backend_id)
-        manifest = _build_manifest(context.cwd, context.env)
+        client, options = create_backend_client_and_options(backend_id, policy=policy)
+        manifest = _build_manifest(context.cwd, context.env, backend_id=backend_id)
         session = await client.create(manifest=manifest, options=options)
+        created = True
         async with session:
+            executed = True
             result = await session.exec(context.command, timeout=context.timeout, shell=True)
-        await client.delete(session)
-        stderr = _decode(result.stderr)
-        if network_note:
-            stderr = f"{network_note}\n{stderr}" if stderr else network_note
         return SandboxExecutionResult(
             status="success" if result.exit_code == 0 else "error",
             stdout=_decode(result.stdout),
-            stderr=stderr,
+            stderr=_decode(result.stderr),
             exit_code=result.exit_code,
             backend_id=backend_id,
             sandboxed=True,
+            created=True,
+            executed=True,
         )
     except Exception as exc:
-        if client is not None and session is not None:
-            try:
-                await client.delete(session)
-            except Exception:
-                pass
         return SandboxExecutionResult(
             status="error",
             backend_id=backend_id,
-            sandboxed=True,
+            sandboxed=created,
+            created=created,
+            executed=executed,
             reason=f"{type(exc).__name__}: {exc}",
             stderr=f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        if client is not None and session is not None:
+            await _delete_created_session(client, session)
