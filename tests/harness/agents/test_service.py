@@ -22,6 +22,7 @@ if str(project_root) not in sys.path:
 from koder_agent.harness.agents.definitions import AgentDefinition  # noqa: E402
 from koder_agent.harness.agents.service import (  # noqa: E402
     AgentService,
+    _execute_agent_run,
     agent_definition_matches_record,
     resolve_agent_record_origin,
 )
@@ -60,6 +61,15 @@ def _init_git_repo(repo_root: Path) -> None:
         check=True,
         capture_output=True,
         text=True,
+    )
+
+
+def _general_purpose_definition() -> AgentDefinition:
+    return AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
     )
 
 
@@ -688,6 +698,172 @@ def test_agent_service_can_cancel_background_agent(tmp_path, monkeypatch):
         assert Path(cancelled.output_path).read_text(encoding="utf-8") == "Cancelled"
 
     asyncio.run(run_case())
+
+
+def test_agent_service_background_detaches_parent_display_context(tmp_path):
+    from koder_agent.core.display_context import (
+        SubagentDisplayEvent,
+        SubagentDisplayIdentity,
+        current_tool_display_call,
+        emit_subagent_display_event,
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
+
+    observed_calls = []
+    parent_events = []
+
+    async def fake_execute(**_kwargs):
+        observed_calls.append(current_tool_display_call())
+        emit_subagent_display_event(
+            SubagentDisplayEvent(
+                identity=SubagentDisplayIdentity(
+                    group_id="late-group",
+                    agent_id="late-agent",
+                    label="late event",
+                ),
+                kind="started",
+            )
+        )
+        return "done"
+
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    async def run_case():
+        with (
+            subagent_display_scope(parent_events.append),
+            tool_display_call_scope("agent_tool", "parent-call"),
+        ):
+            record = await service.launch_background(
+                agent_definition=definition,
+                prompt="Run later",
+                description="Detached display",
+                executor=fake_execute,
+            )
+        await service.wait(record.id)
+
+    asyncio.run(run_case())
+
+    assert observed_calls == [None]
+    assert parent_events == []
+
+
+def test_execute_agent_run_preserves_cancellation_when_cleanup_fails(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from koder_agent.tools.todo import TodoRuntimeIdentity, TodoStore
+
+    running = asyncio.Event()
+    never = asyncio.Event()
+
+    async def fake_create_dev_agent(*args, **kwargs):
+        return SimpleNamespace(_koder_mcp_servers=[])
+
+    async def fake_run(*args, **kwargs):
+        running.set()
+        await never.wait()
+
+    async def failing_cleanup(*args, **kwargs):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        "koder_agent.harness.agents.service.create_dev_agent", fake_create_dev_agent
+    )
+    monkeypatch.setattr("koder_agent.harness.agents.service.Runner.run", fake_run)
+    monkeypatch.setattr("koder_agent.harness.agents.service.get_all_tools", lambda: [])
+    monkeypatch.setattr(
+        "koder_agent.harness.agents.service._cleanup_agent_mcp_servers", failing_cleanup
+    )
+
+    definition = _general_purpose_definition()
+    session_id = "cleanup-cancellation-test"
+
+    async def run_case():
+        task = asyncio.create_task(
+            _execute_agent_run(
+                agent_definition=definition,
+                prompt="wait",
+                session_id=session_id,
+                seed_items=None,
+                cwd=str(tmp_path),
+                todo_store=TodoStore(
+                    TodoRuntimeIdentity(
+                        session_id=session_id,
+                        agent_id="test-agent",
+                        run_id=session_id,
+                    )
+                ),
+            )
+        )
+        await asyncio.wait_for(running.wait(), timeout=1)
+        task.cancel("stop agent")
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await task
+        assert cancellation.value.args == ("stop agent",)
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_run_sync_uses_direct_display_without_parent_sink(tmp_path, monkeypatch):
+    captured = []
+
+    async def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    result = asyncio.run(
+        service.run_sync(
+            agent_definition=definition,
+            prompt="Inspect directly",
+            display_label="Direct inspection",
+        )
+    )
+
+    assert result == "done"
+    [call] = captured
+    assert call["display_identity"] is None
+    assert call["direct_display"] is True
+
+
+def test_agent_service_run_sync_uses_parent_display_when_attached(tmp_path, monkeypatch):
+    from koder_agent.core.display_context import (
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
+
+    captured = []
+
+    async def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    async def run_case():
+        with (
+            subagent_display_scope(lambda _event: None),
+            tool_display_call_scope("agent_tool", "call-parent"),
+        ):
+            return await service.run_sync(
+                agent_definition=definition,
+                prompt="Inspect as child",
+                display_label="Child inspection",
+            )
+
+    assert asyncio.run(run_case()) == "done"
+    [call] = captured
+    identity = call["display_identity"]
+    assert identity is not None
+    assert identity.parent_call_id == "call-parent"
+    assert identity.label == "general-purpose · Child inspection"
+    assert call["direct_display"] is False
 
 
 def test_agent_service_applies_plan_mode_per_background_run(tmp_path, monkeypatch):

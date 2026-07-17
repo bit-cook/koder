@@ -152,6 +152,7 @@ async def _agent_tool_impl(
         prompt=prompt,
         seed_items=seed_items,
         cwd=cwd,
+        display_label=description,
     )
     return json.dumps(
         {

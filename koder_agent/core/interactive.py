@@ -27,6 +27,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, 
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import AppendAutoSuggestion, BeforeInput
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import confirm
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame, SearchToolbar
@@ -1421,7 +1422,11 @@ class InteractivePrompt:
                     await stop_task
 
         try:
-            return await _run_until_stopped()
+            # The prompt application is the only terminal renderer while it is
+            # mounted. Any legacy or third-party stdout writes are routed above
+            # the prompt instead of overwriting the composer/status region.
+            with patch_stdout():
+                return await _run_until_stopped()
         finally:
             if queue_manager is not None:
                 queue_manager.approval_broker.deactivate()

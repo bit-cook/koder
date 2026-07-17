@@ -35,9 +35,17 @@ TURN_ASSERTION_KEYS = (
     "expect_tmux_any_pane_any",
     "expect_tmux_any_pane_all",
 )
-POST_ASSERTION_KEYS = {"path_exists", "path_not_exists", "file_contains", "file_not_contains"}
-POST_ASSERTION_KEYS.update({"path_glob_exists", "file_glob_contains", "file_glob_not_contains"})
-POST_ASSERTION_KEYS.add("sqlite_contains")
+POST_ASSERTION_KEYS = {
+    "file_contains",
+    "file_glob_contains",
+    "file_glob_not_contains",
+    "file_not_contains",
+    "file_occurrences",
+    "path_exists",
+    "path_glob_exists",
+    "path_not_exists",
+    "sqlite_contains",
+}
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,27 @@ def _validate_post_assertions(ref: ScenarioRef) -> list[str]:
                 errors.append(
                     f"{ref.suite}/{ref.name}: post_assertion {index} {keys[0]} needs a path"
                 )
+        elif keys[0] == "file_occurrences":
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or not isinstance(value[0], str)
+                or not value[0].strip()
+                or not isinstance(value[1], dict)
+                or not value[1]
+                or not all(
+                    isinstance(text, str)
+                    and bool(text.strip())
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                    for text, count in value[1].items()
+                )
+            ):
+                errors.append(
+                    f"{ref.suite}/{ref.name}: post_assertion {index} file_occurrences "
+                    "needs [path, {text: exact-nonnegative-count}]"
+                )
         elif keys[0] == "sqlite_contains":
             if (
                 not isinstance(value, list)
@@ -275,8 +304,13 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
             if not isinstance(fake_openai, dict):
                 errors.append(f"{ref.suite}/{ref.name}: fake_openai must be an object")
             else:
-                if not isinstance(fake_openai.get("port"), int):
+                port = fake_openai.get("port")
+                if not isinstance(port, int) or isinstance(port, bool):
                     errors.append(f"{ref.suite}/{ref.name}: fake_openai.port must be an integer")
+                elif not 0 <= port <= 65535:
+                    errors.append(
+                        f"{ref.suite}/{ref.name}: fake_openai.port must be from 0 through 65535"
+                    )
                 if (
                     not isinstance(fake_openai.get("response"), str)
                     or not fake_openai["response"].strip()
@@ -289,6 +323,7 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                 if scenario_name is not None and scenario_name not in {
                     "single",
                     "sandbox_shell_tool",
+                    "streaming_subagent_tool",
                     "streaming_tool_error",
                     "streaming_tool_queue",
                 }:
@@ -296,11 +331,12 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                         f"{ref.suite}/{ref.name}: fake_openai.scenario must be single "
                         "or a supported streaming tool scenario"
                     )
-                stream_delay = fake_openai.get("stream_delay")
-                if stream_delay is not None and not isinstance(stream_delay, (int, float)):
-                    errors.append(
-                        f"{ref.suite}/{ref.name}: fake_openai.stream_delay must be a number"
-                    )
+                for option in ("stream_delay", "subagent_delay"):
+                    option_value = fake_openai.get(option)
+                    if option_value is not None and not isinstance(option_value, (int, float)):
+                        errors.append(
+                            f"{ref.suite}/{ref.name}: fake_openai.{option} must be a number"
+                        )
                 stream_lines = fake_openai.get("stream_lines")
                 if stream_lines is not None and (
                     not isinstance(stream_lines, int)
@@ -311,6 +347,14 @@ def validate_manifest(manifest: dict[str, Any], *, strict_acceptance: bool = Fal
                         f"{ref.suite}/{ref.name}: fake_openai.stream_lines must be a "
                         "positive integer"
                     )
+        if (
+            isinstance(env, dict)
+            and any(
+                isinstance(value, str) and "$FAKE_OPENAI_URL" in value for value in env.values()
+            )
+            and not isinstance(fake_openai, dict)
+        ):
+            errors.append(f"{ref.suite}/{ref.name}: $FAKE_OPENAI_URL requires fake_openai")
         turns = payload.get("turns")
         if not isinstance(turns, list) or len(turns) < 2:
             errors.append(f"{ref.suite}/{ref.name}: at least two interactive turns are required")
@@ -442,12 +486,23 @@ def _expand_scenario_glob(value: str, *, home: Path, repo: Path) -> list[Path]:
     return [Path(path) for path in sorted(glob.glob(str(Path(expanded).expanduser())))]
 
 
-def _expand_scenario_env_value(value: str, *, home: Path, repo: Path) -> str:
-    return (
+def _expand_scenario_env_value(
+    value: str,
+    *,
+    home: Path,
+    repo: Path,
+    fake_openai_url: str | None = None,
+) -> str:
+    expanded = (
         value.replace("$HOME", str(home))
         .replace("$REPO", str(repo))
         .replace("$PATH", os.environ.get("PATH", ""))
     )
+    if "$FAKE_OPENAI_URL" not in expanded:
+        return expanded
+    if fake_openai_url is None:
+        raise RuntimeError("$FAKE_OPENAI_URL used without a fake OpenAI provider")
+    return expanded.replace("$FAKE_OPENAI_URL", fake_openai_url)
 
 
 def _expected_strings(value: str | list[str], *, home: Path, repo: Path) -> list[str]:
@@ -484,6 +539,26 @@ def _run_post_assertions(scenario: ScenarioRef, *, home: Path, repo: Path) -> li
                 failures.append(
                     f"post_assertion {index}: {path} missing "
                     + ", ".join(repr(item) for item in missing)
+                )
+            continue
+        if "file_occurrences" in assertion:
+            raw_path, expected = assertion["file_occurrences"]
+            path = _expand_scenario_path(raw_path, home=home, repo=repo)
+            if not path.exists():
+                failures.append(f"post_assertion {index}: expected file to exist: {path}")
+                continue
+            content = path.read_text(encoding="utf-8")
+            mismatches = []
+            for item, expected_count in expected.items():
+                expanded_item = _expand_scenario_text(item, home=home, repo=repo)
+                actual_count = content.count(expanded_item)
+                if actual_count != expected_count:
+                    mismatches.append(
+                        f"{expanded_item!r}: expected {expected_count}, found {actual_count}"
+                    )
+            if mismatches:
+                failures.append(
+                    f"post_assertion {index}: {path} occurrence mismatch: " + "; ".join(mismatches)
                 )
             continue
         if "path_glob_exists" in assertion:
@@ -616,10 +691,12 @@ def _write_prelaunch_files(scenario: ScenarioRef, *, home: Path, repo: Path) -> 
         path.write_text(item["content"], encoding="utf-8")
 
 
-def _start_fake_openai(scenario: ScenarioRef, *, home: Path, repo: Path) -> subprocess.Popen | None:
+def _start_fake_openai(
+    scenario: ScenarioRef, *, home: Path, repo: Path
+) -> tuple[subprocess.Popen | None, str | None]:
     fake_openai = scenario.payload.get("fake_openai")
     if not isinstance(fake_openai, dict):
-        return None
+        return None, None
 
     log_file = _expand_scenario_path(fake_openai["log_file"], home=home, repo=repo)
     ready_file = _expand_scenario_path(fake_openai["ready_file"], home=home, repo=repo)
@@ -640,12 +717,18 @@ def _start_fake_openai(scenario: ScenarioRef, *, home: Path, repo: Path) -> subp
         "--ready-file",
         str(ready_file),
     ]
-    if fake_openai.get("scenario"):
-        command.extend(["--scenario", str(fake_openai["scenario"])])
-    if fake_openai.get("stream_delay") is not None:
-        command.extend(["--stream-delay", str(fake_openai["stream_delay"])])
-    if fake_openai.get("stream_lines") is not None:
-        command.extend(["--stream-lines", str(fake_openai["stream_lines"])])
+    scenario_name = fake_openai.get("scenario")
+    if scenario_name:
+        command.extend(["--scenario", str(scenario_name)])
+    optional_args = {
+        "stream_delay": "--stream-delay",
+        "subagent_delay": "--subagent-delay",
+        "stream_lines": "--stream-lines",
+    }
+    for option, flag in optional_args.items():
+        value = fake_openai.get(option)
+        if value is not None:
+            command.extend([flag, str(value)])
 
     proc = subprocess.Popen(
         command,
@@ -656,7 +739,9 @@ def _start_fake_openai(scenario: ScenarioRef, *, home: Path, repo: Path) -> subp
     deadline = time.time() + 5.0
     while time.time() < deadline:
         if ready_file.exists():
-            return proc
+            ready_text = ready_file.read_text(encoding="utf-8").strip()
+            if ready_text.startswith("ready http"):
+                return proc, ready_text.removeprefix("ready ")
         if proc.poll() is not None:
             raise RuntimeError(f"fake OpenAI provider exited for {scenario.suite}/{scenario.name}")
         time.sleep(0.1)
@@ -677,7 +762,26 @@ def _stop_fake_openai(proc: subprocess.Popen | None) -> None:
         proc.wait(timeout=5)
 
 
-def _launch_session(home: Path, repo: Path, scenario: ScenarioRef) -> str:
+def _copy_fake_openai_log(
+    scenario: ScenarioRef, *, home: Path, repo: Path, output_dir: Path
+) -> None:
+    fake_openai = scenario.payload.get("fake_openai")
+    if not isinstance(fake_openai, dict):
+        return
+    source = _expand_scenario_path(fake_openai["log_file"], home=home, repo=repo)
+    if not source.exists():
+        return
+    target = output_dir / f"{scenario.suite}-{scenario.name}-fake-openai.log"
+    shutil.copyfile(source, target)
+
+
+def _launch_session(
+    home: Path,
+    repo: Path,
+    scenario: ScenarioRef,
+    *,
+    fake_openai_url: str | None,
+) -> str:
     session = f"koder-scenario-{scenario.suite[:3]}-{scenario.name[:18]}-{uuid.uuid4().hex[:6]}"
     env_assignments = {
         "HOME": str(home),
@@ -686,7 +790,12 @@ def _launch_session(home: Path, repo: Path, scenario: ScenarioRef) -> str:
     }
     env_assignments.update(
         {
-            key: _expand_scenario_env_value(value, home=home, repo=repo)
+            key: _expand_scenario_env_value(
+                value,
+                home=home,
+                repo=repo,
+                fake_openai_url=fake_openai_url,
+            )
             for key, value in scenario.payload.get("env", {}).items()
         }
     )
@@ -899,11 +1008,17 @@ def run_scenario(scenario: ScenarioRef, *, output_dir: Path) -> bool:
         home, repo = _prepare_workspace(Path(tmp))
         _write_prelaunch_files(scenario, home=home, repo=repo)
         fake_openai_proc: subprocess.Popen | None = None
+        fake_openai_url: str | None = None
         session: str | None = None
         ok = True
         try:
-            fake_openai_proc = _start_fake_openai(scenario, home=home, repo=repo)
-            session = _launch_session(home, repo, scenario)
+            fake_openai_proc, fake_openai_url = _start_fake_openai(scenario, home=home, repo=repo)
+            session = _launch_session(
+                home,
+                repo,
+                scenario,
+                fake_openai_url=fake_openai_url,
+            )
             for index, turn in enumerate(scenario.payload["turns"], start=1):
                 _dispatch_turn_input_actions(session, turn)
                 if turn.get("resize"):
@@ -971,6 +1086,12 @@ def run_scenario(scenario: ScenarioRef, *, output_dir: Path) -> bool:
             if session is not None:
                 _tmux("kill-session", "-t", session, timeout=5)
             _stop_fake_openai(fake_openai_proc)
+            _copy_fake_openai_log(
+                scenario,
+                home=home,
+                repo=repo,
+                output_dir=output_dir,
+            )
         return ok
 
 

@@ -4199,6 +4199,21 @@ def test_fake_openai_fixture_is_checked():
     assert "slash_commands/btw: fake_openai.stream_lines must be a positive integer" in errors
 
 
+def test_fake_openai_fixture_accepts_dynamic_port_and_rejects_invalid_range():
+    manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
+    fixture = manifest["features"]["fixed-bottom-subagent-progress"]["fake_openai"]
+    assert fixture["port"] == 0
+    assert validate_manifest(manifest) == []
+
+    fixture["port"] = 65536
+    errors = validate_manifest(manifest)
+
+    assert (
+        "features/fixed-bottom-subagent-progress: fake_openai.port must be from 0 through 65535"
+        in errors
+    )
+
+
 def test_streaming_tool_queue_fixture_continuation_uses_latest_user_turn():
     completed_previous_tool_turn = {
         "messages": [
@@ -4309,6 +4324,54 @@ def test_fixed_bottom_queued_input_scenario_uses_streaming_tool_fixture():
     ]
 
 
+def test_fixed_bottom_subagent_progress_uses_compact_dynamic_fixture():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["fixed-bottom-subagent-progress"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["env"]["KODER_BASE_URL"] == "$FAKE_OPENAI_URL"
+    assert scenario["fake_openai"]["port"] == 0
+    assert scenario["fake_openai"]["scenario"] == "streaming_subagent_tool"
+    assert scenario["turns"][0]["resize"] == {"width": 60, "height": 12}
+    assert "2 running" in scenario["turns"][1]["expect_all"]
+    assert "Succeeded (2 agents, 2 tool uses)" in scenario["turns"][2]["expect_all"]
+    assert scenario["post_assertions"] == [
+        {
+            "file_occurrences": [
+                "$HOME/fake-openai-subagent-display.log",
+                {
+                    "subagent-alpha-read_file-request": 1,
+                    "subagent-alpha-read_file-result": 1,
+                    "subagent-beta-read_file-request": 1,
+                    "subagent-beta-read_file-result": 1,
+                    "call_koder_subagent_alpha_read_file": 2,
+                    "call_koder_subagent_beta_read_file": 2,
+                },
+            ]
+        }
+    ]
+
+
+def test_fake_openai_subagent_scenario_emits_child_specific_read_calls():
+    handler = object.__new__(FakeOpenAIHandler)
+    handler.scenario = "streaming_subagent_tool"
+
+    alpha_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Read sample.txt. Marker: KODER_SUBAGENT_ALPHA.",
+            }
+        ],
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+    }
+    payload = handler._tool_call_payload(alpha_body)
+
+    assert payload["id"] == "call_koder_subagent_alpha_read_file"
+    assert payload["function"]["name"] == "read_file"
+    assert json.loads(payload["function"]["arguments"]) == {"path": "sample.txt"}
+
+
 def test_fixed_bottom_error_history_scenario_uses_failing_stream_fixture():
     manifest = _load_manifest(DEFAULT_MANIFEST)
     scenario = manifest["features"]["fixed-bottom-error-history"]
@@ -4401,6 +4464,20 @@ def test_post_assertions_are_validated():
     assert any("file_contains needs [path, text-or-text-list]" in error for error in errors)
 
 
+def test_file_occurrence_post_assertions_are_validated():
+    manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
+    manifest["teams"]["tmux-pane"]["post_assertions"] = [
+        {"file_occurrences": ["$HOME/x.txt", {"marker": -1}]}
+    ]
+
+    errors = validate_manifest(manifest)
+
+    assert any(
+        "file_occurrences needs [path, {text: exact-nonnegative-count}]" in error
+        for error in errors
+    )
+
+
 def test_sqlite_post_assertions_are_validated():
     manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
     manifest["features"]["memory-and-session"]["post_assertions"] = [
@@ -4440,6 +4517,28 @@ def test_post_assertions_check_filesystem_state(tmp_path):
     failures = scenarios._run_post_assertions(scenario, home=home, repo=repo)
 
     assert failures == []
+
+
+def test_post_assertions_check_exact_file_occurrences(tmp_path):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    log_file = home / "provider.log"
+    log_file.write_text("alpha\nbeta\nalpha\n", encoding="utf-8")
+    counts = {"alpha": 2, "beta": 1}
+    scenario = scenarios.ScenarioRef(
+        suite="features",
+        name="subagents",
+        payload={"post_assertions": [{"file_occurrences": ["$HOME/provider.log", counts]}]},
+    )
+
+    assert scenarios._run_post_assertions(scenario, home=home, repo=repo) == []
+
+    counts["alpha"] = 1
+    [failure] = scenarios._run_post_assertions(scenario, home=home, repo=repo)
+
+    assert "'alpha': expected 1, found 2" in failure
 
 
 def test_post_assertions_check_globbed_filesystem_state(tmp_path):
@@ -4520,6 +4619,20 @@ def test_scenario_env_expansion_replaces_repo_home_and_path(monkeypatch, tmp_pat
     )
 
     assert value == f"{repo}/bin:{home}/tools:/usr/bin:/bin"
+
+
+def test_scenario_env_expansion_replaces_dynamic_fake_openai_url(tmp_path):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+
+    value = scenarios._expand_scenario_env_value(
+        "$FAKE_OPENAI_URL/chat",
+        home=home,
+        repo=repo,
+        fake_openai_url="http://127.0.0.1:43210/v1",
+    )
+
+    assert value == "http://127.0.0.1:43210/v1/chat"
 
 
 def test_tmux_pane_assertion_helper_matches_any_worker_pane(monkeypatch):

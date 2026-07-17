@@ -8651,6 +8651,116 @@
         }
       ]
     },
+    "fixed-bottom-subagent-progress": {
+      "validation_level": "acceptance",
+      "purpose": "Verify parallel subagent activity stays inside the parent streaming renderer without overwriting the fixed input and status area.",
+      "env": {
+        "KODER_MODEL": "openai/claude-sonnet-4-6",
+        "KODER_BASE_URL": "$FAKE_OPENAI_URL",
+        "KODER_API_KEY": "subagent-display-secret-token"
+      },
+      "fake_openai": {
+        "port": 0,
+        "response": "parent response after delegated work",
+        "log_file": "$HOME/fake-openai-subagent-display.log",
+        "ready_file": "$HOME/fake-openai-subagent-display.ready",
+        "scenario": "streaming_subagent_tool",
+        "stream_delay": 0.01,
+        "subagent_delay": 3.0,
+        "stream_lines": 2
+      },
+      "acceptance_criteria": [
+        "parallel child activity renders as one compact delegated-agent group",
+        "child tool hooks do not print raw Agent or tool blocks into the terminal",
+        "the aggregate child header and fixed input/status frame remain visible at 60x12 while children are running",
+        "the completed delegated-agent summary and fixed input/status frame remain visible at 60x12 after the parent finishes"
+      ],
+      "acceptance_artifacts": [
+        "live subagent visible capture with fixed prompt",
+        "completed parent visible capture with compact child summary",
+        "fake provider log proving two child read_file calls"
+      ],
+      "turns": [
+        {
+          "resize": {
+            "width": 60,
+            "height": 12
+          },
+          "capture": "visible",
+          "expect_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "Window too small"
+          ]
+        },
+        {
+          "send": "Delegate two inspections of sample.txt before answering.",
+          "capture": "visible",
+          "expect_all": [
+            "Delegated agents",
+            "2 running",
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "● Agent:",
+            "● read_file"
+          ],
+          "timeout": 12
+        },
+        {
+          "wait": 5,
+          "capture": "visible",
+          "expect_all": [
+            "parent response after delegated work",
+            "Delegated agents",
+            "Succeeded (2 agents, 2 tool uses)",
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "● Agent:",
+            "● read_file"
+          ],
+          "timeout": 12
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_occurrences": [
+            "$HOME/fake-openai-subagent-display.log",
+            {
+              "subagent-alpha-read_file-request": 1,
+              "subagent-alpha-read_file-result": 1,
+              "subagent-beta-read_file-request": 1,
+              "subagent-beta-read_file-result": 1,
+              "call_koder_subagent_alpha_read_file": 2,
+              "call_koder_subagent_beta_read_file": 2
+            }
+          ]
+        }
+      ]
+    },
     "fixed-bottom-queued-input": {
       "validation_level": "acceptance",
       "purpose": "Validate that interactive streaming keeps output above a fixed bottom input/status area, accepts mid-stream input, displays queued rows, and injects queued prompts into the next tool result.",

@@ -37,6 +37,19 @@ def _array_schema():
     return next(branch for branch in tasks_schema["anyOf"] if branch.get("type") == "array")
 
 
+def _patch_delegate_runtime(monkeypatch, fake_run, *, cleanup=None) -> None:
+    async def fake_create_dev_agent(*args, **kwargs):
+        return SimpleNamespace(_koder_mcp_servers=[])
+
+    monkeypatch.setattr("koder_agent.agentic.create_dev_agent", fake_create_dev_agent)
+    monkeypatch.setattr("agents.Runner.run", fake_run)
+    if cleanup is not None:
+        monkeypatch.setattr(
+            "koder_agent.harness.agents.service._cleanup_agent_mcp_servers",
+            cleanup,
+        )
+
+
 def test_task_delegate_schema_advertises_default_batch_limit(monkeypatch):
     monkeypatch.delenv("KODER_TASK_DELEGATE_MAX_BATCH_SIZE", raising=False)
 
@@ -268,6 +281,98 @@ def test_task_delegate_preserves_input_order_mixed_results_and_cleans_resources(
     assert len(set(seen_max_turns)) == 1
 
 
+@pytest.mark.asyncio
+async def test_task_delegate_routes_child_tools_to_parent_display(monkeypatch, capsys):
+    from koder_agent.core.display_context import (
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
+
+    events = []
+
+    async def fake_run(agent, prompt, **kwargs):
+        hooks = kwargs["hooks"]
+        child = SimpleNamespace(name="child")
+        tool = SimpleNamespace(name="read_file")
+        await hooks.on_agent_start(None, child)
+        await hooks.on_tool_start(None, child, tool)
+        await hooks.on_tool_end(None, child, tool, "contents")
+        return SimpleNamespace(final_output="done")
+
+    _patch_delegate_runtime(monkeypatch, fake_run)
+
+    with (
+        subagent_display_scope(events.append),
+        tool_display_call_scope("task_delegate", "call-parent"),
+    ):
+        output = await _task_delegate_impl(
+            TaskModel(description="Inspect renderer", prompt="inspect")
+        )
+
+    assert "done" in output
+    assert capsys.readouterr().out == ""
+    assert [event.kind for event in events] == [
+        "started",
+        "tool_started",
+        "tool_finished",
+        "completed",
+    ]
+    assert all(event.identity.parent_call_id == "call-parent" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_task_delegate_display_sink_failure_does_not_change_result(monkeypatch):
+    from koder_agent.core.display_context import subagent_display_scope
+
+    async def fake_run(*args, **kwargs):
+        return SimpleNamespace(final_output="child succeeded")
+
+    def failing_sink(event):
+        raise RuntimeError("display sink failed")
+
+    _patch_delegate_runtime(monkeypatch, fake_run)
+
+    with subagent_display_scope(failing_sink):
+        output = await _task_delegate_impl(
+            TaskModel(description="Inspect renderer", prompt="inspect")
+        )
+
+    assert "child succeeded" in output
+    assert "display sink failed" not in output
+
+
+@pytest.mark.asyncio
+async def test_task_delegate_preserves_child_error_when_cleanup_also_fails(monkeypatch):
+    async def fake_run(*args, **kwargs):
+        raise RuntimeError("child failed")
+
+    async def failing_cleanup(*args, **kwargs):
+        raise RuntimeError("cleanup failed")
+
+    _patch_delegate_runtime(monkeypatch, fake_run, cleanup=failing_cleanup)
+
+    output = await _task_delegate_impl(TaskModel(description="Inspect child", prompt="inspect"))
+
+    assert "Error: child failed" in output
+    assert "cleanup failed" not in output
+
+
+@pytest.mark.asyncio
+async def test_task_delegate_converts_result_formatting_failure_to_child_error(monkeypatch):
+    class UnprintableResult:
+        def __str__(self):
+            raise RuntimeError("result formatting failed")
+
+    async def fake_run(*args, **kwargs):
+        return SimpleNamespace(final_output=UnprintableResult())
+
+    _patch_delegate_runtime(monkeypatch, fake_run)
+
+    output = await _task_delegate_impl(TaskModel(description="Inspect child", prompt="inspect"))
+
+    assert "Error: result formatting failed" in output
+
+
 def test_task_delegate_parent_cancellation_cancels_running_and_queued_children(monkeypatch):
     monkeypatch.setenv("KODER_TASK_DELEGATE_MAX_BATCH_SIZE", "3")
     monkeypatch.setenv("KODER_TASK_DELEGATE_MAX_CONCURRENCY", "1")
@@ -398,6 +503,32 @@ def test_task_delegate_parent_recancellation_waits_for_slow_child_cleanup(monkey
     assert cleanup_calls == 1
     assert cleanup_completed == 1
     assert active_lifecycles == 0
+
+
+def test_task_delegate_preserves_cancellation_when_cleanup_fails(monkeypatch):
+    running = asyncio.Event()
+    never = asyncio.Event()
+
+    async def fake_run(*args, **kwargs):
+        running.set()
+        await never.wait()
+
+    async def failing_cleanup(*args, **kwargs):
+        raise RuntimeError("cleanup failed")
+
+    _patch_delegate_runtime(monkeypatch, fake_run, cleanup=failing_cleanup)
+
+    async def scenario():
+        parent = asyncio.create_task(
+            _task_delegate_impl(TaskModel(description="wait", prompt="wait"))
+        )
+        await asyncio.wait_for(running.wait(), timeout=1)
+        parent.cancel("stop delegation")
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await parent
+        assert cancellation.value.args == ("stop delegation",)
+
+    asyncio.run(scenario())
 
 
 def test_task_delegate_can_target_named_agent(monkeypatch):

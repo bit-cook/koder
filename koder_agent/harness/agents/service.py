@@ -8,6 +8,7 @@ import json
 import logging
 import tempfile
 import uuid
+from collections.abc import Coroutine
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,8 +16,14 @@ from typing import Any, Awaitable, Callable
 
 from agents import RunConfig, Runner
 
-from koder_agent.agentic import create_dev_agent, get_display_hooks
+from koder_agent.agentic import create_dev_agent, get_display_hooks, get_subagent_display_hooks
 from koder_agent.core.constants import get_max_turns
+from koder_agent.core.display_context import (
+    SubagentDisplayIdentity,
+    current_tool_display_call,
+    detached_display_context,
+    has_subagent_display_sink,
+)
 from koder_agent.core.session import EnhancedSQLiteSession
 from koder_agent.harness.agents.hooks import SubagentLifecycleHooks
 from koder_agent.harness.paths import worktrees_dir
@@ -64,6 +71,12 @@ async def _deny_approver(tool_name, arguments, decision):
     "deny" is the verdict enforce_tool_permission understands as a block.
     """
     return "deny"
+
+
+def _create_detached_task(coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """Create a background task without retaining parent display routing."""
+
+    return detached_display_context().run(asyncio.create_task, coroutine)
 
 
 def _utc_now_iso() -> str:
@@ -185,6 +198,33 @@ async def _cleanup_agent_mcp_servers(
     )
 
 
+def _sync_display_identity(
+    agent_definition: AgentDefinition,
+    session_id: str,
+    display_label: str | None,
+) -> SubagentDisplayIdentity | None:
+    """Build parent-managed display identity for a synchronous agent tool run."""
+
+    parent_call = current_tool_display_call()
+    if (
+        not has_subagent_display_sink()
+        or parent_call is None
+        or parent_call.tool_name != "agent_tool"
+    ):
+        return None
+
+    label = agent_definition.agent_type
+    if display_label:
+        label = f"{label} · {display_label}"
+    return SubagentDisplayIdentity(
+        group_id=f"agent-tool-{uuid.uuid4().hex}",
+        agent_id=session_id,
+        label=label,
+        parent_call_id=parent_call.call_id,
+        order=0,
+    )
+
+
 async def _execute_agent_run(
     *,
     agent_definition: AgentDefinition,
@@ -195,6 +235,8 @@ async def _execute_agent_run(
     team_context: TeamToolContext | None = None,
     permission_service: Any = None,
     todo_store: TodoStore | None = None,
+    display_identity: SubagentDisplayIdentity | None = None,
+    direct_display: bool = False,
 ) -> str:
     if todo_store is None:
         todo_store = TodoStore(
@@ -211,7 +253,21 @@ async def _execute_agent_run(
     agent = None
     perm_token = None
     todo_token = None
-    propagate_cleanup_cancellation = True
+    if display_identity is not None:
+        display_hooks = get_subagent_display_hooks(
+            group_id=display_identity.group_id,
+            agent_id=display_identity.agent_id,
+            label=display_identity.label,
+            parent_call_id=display_identity.parent_call_id,
+            order=display_identity.order,
+        )
+    else:
+        display_hooks = get_display_hooks()
+        if hasattr(display_hooks, "streaming_mode"):
+            display_hooks.streaming_mode = not direct_display
+    display_status = "failed"
+    display_detail = None
+    primary_error: BaseException | None = None
     try:
         agent = await create_dev_agent(
             tools,
@@ -238,7 +294,7 @@ async def _execute_agent_run(
             lifecycle_hooks = SubagentLifecycleHooks(
                 agent_definition=agent_definition,
                 cwd=cwd or Path.cwd(),
-                wrapped_hooks=get_display_hooks(),
+                wrapped_hooks=display_hooks,
                 permission_service=effective_service,
             )
             with skill_run_scope(lifecycle_hooks) as run_hooks:
@@ -250,19 +306,39 @@ async def _execute_agent_run(
                     hooks=run_hooks,
                     max_turns=agent_definition.max_turns or get_max_turns(),
                 )
-    except BaseException:
-        propagate_cleanup_cancellation = False
+        display_status = "completed"
+    except BaseException as exc:
+        primary_error = exc
+        display_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+        display_detail = str(exc)
         raise
     finally:
-        if todo_token is not None:
-            reset_todo_context(todo_token)
-        if perm_token is not None:
-            reset_tool_permission_context(perm_token)
-        if agent is not None:
-            await _cleanup_agent_mcp_servers(
-                agent,
-                propagate_cancellation=propagate_cleanup_cancellation,
+        try:
+            if todo_token is not None:
+                reset_todo_context(todo_token)
+            if perm_token is not None:
+                reset_tool_permission_context(perm_token)
+            if agent is not None:
+                await _cleanup_agent_mcp_servers(
+                    agent,
+                    propagate_cancellation=primary_error is None,
+                )
+        except BaseException as exc:
+            if primary_error is None:
+                display_status = (
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                )
+                display_detail = str(exc)
+                raise
+            logger.debug(
+                "Suppressed subagent cleanup failure while preserving %s",
+                type(primary_error).__name__,
+                exc_info=True,
             )
+        finally:
+            finish_display = getattr(display_hooks, "finish", None)
+            if callable(finish_display):
+                finish_display(display_status, display_detail)
     return str(result.final_output)
 
 
@@ -388,7 +464,7 @@ class AgentService:
         self._mailboxes[agent_id] = []
         self._save_record(record)
         team_context = team_context_builder(record) if team_context_builder is not None else None
-        self._tasks[agent_id] = asyncio.create_task(
+        self._tasks[agent_id] = _create_detached_task(
             self._run_background(
                 agent_id=agent_id,
                 agent_definition=agent_definition,
@@ -411,6 +487,7 @@ class AgentService:
         seed_items: list[dict[str, Any]] | None = None,
         cwd: str | Path | None = None,
         permission_mode: str | None = None,
+        display_label: str | None = None,
     ) -> str:
         effective_cwd = str(cwd) if cwd is not None else None
         worktree_service: WorktreeService | None = None
@@ -429,6 +506,11 @@ class AgentService:
                 scoped_service.enter_plan_mode(permission_mode="plan")
             with plan_service_scope(scoped_service):
                 session_id = f"subagent-sync-{uuid.uuid4().hex[:8]}"
+                display_identity = _sync_display_identity(
+                    agent_definition,
+                    session_id,
+                    display_label,
+                )
                 return await _execute_agent_run(
                     agent_definition=agent_definition,
                     prompt=prompt,
@@ -436,6 +518,8 @@ class AgentService:
                     seed_items=seed_items,
                     cwd=effective_cwd,
                     permission_service=self._permission_service,
+                    display_identity=display_identity,
+                    direct_display=display_identity is None,
                     todo_store=TodoStore(
                         TodoRuntimeIdentity(
                             session_id=session_id,
@@ -490,7 +574,7 @@ class AgentService:
             updated, summary_timestamp=timestamp, record_timestamp=timestamp
         )
         self._save_record(self._agents[agent_id])
-        self._tasks[agent_id] = asyncio.create_task(
+        self._tasks[agent_id] = _create_detached_task(
             self._run_background(
                 agent_id=agent_id,
                 agent_definition=agent_definition,

@@ -30,6 +30,7 @@ from rich.text import Text
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
 from ..agentic.api_errors import ApiErrorCategory, classify_api_error
 from ..core.constants import get_max_turns, get_turn_timeout
+from ..core.display_context import SubagentDisplayEvent, subagent_display_scope
 from ..core.goal_prompts import GOAL_CONTEXT_MARKER
 from ..core.goal_runtime import GoalRuntime
 from ..core.goals import GoalStore
@@ -1391,6 +1392,15 @@ class AgentScheduler:
             ),
             config_getter=self._runtime_config_service.load,
         )
+        refresh_subagent_display = (
+            (lambda: streaming_ui.update_output(live_renderable))
+            if streaming_ui is not None
+            else (lambda: None)
+        )
+
+        def handle_subagent_display_event(event: SubagentDisplayEvent) -> None:
+            if display_manager.handle_subagent_event(event):
+                refresh_subagent_display()
 
         # Add space before streaming starts
         if streaming_ui is None:
@@ -1405,6 +1415,7 @@ class AgentScheduler:
 
         skill_scope = ExitStack()
         run_hooks = skill_scope.enter_context(skill_run_scope(self.hooks))
+        skill_scope.enter_context(subagent_display_scope(handle_subagent_display_event))
         try:
             result = Runner.run_streamed(
                 self.dev_agent,
@@ -1553,7 +1564,11 @@ class AgentScheduler:
                                 on_update()
 
                         except Exception as e:
-                            console.print(f"[dim red]Event processing error: {e}[/dim red]")
+                            logger.debug("Event processing error", exc_info=True)
+                            if streaming_ui is None:
+                                console.print(f"[dim red]Event processing error: {e}[/dim red]")
+                            elif display_manager.handle_notice(f"Event processing error: {e}"):
+                                on_update()
 
             except Exception as e:
                 execution_error = e
@@ -1569,6 +1584,7 @@ class AgentScheduler:
                         transient=True,
                         vertical_overflow="crop",
                     ) as live:
+                        refresh_subagent_display = live.refresh
                         await consume_stream_events(live.refresh)
                 else:
                     await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))

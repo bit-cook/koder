@@ -1,6 +1,7 @@
 """Task delegation operations."""
 
 import asyncio
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from .skill_context import skill_run_scope
 TASK_DELEGATE_CHILD_RESULT_MAX_CHARS = 10_000
 TASK_DELEGATE_AGGREGATE_MAX_CHARS = 30_000
 TASK_DELEGATE_DESCRIPTION_MAX_CHARS = 500
+
+logger = logging.getLogger(__name__)
 
 
 class TaskModel(BaseModel):
@@ -217,6 +220,15 @@ async def _task_delegate_impl(tasks: TaskInput) -> str:
         ]
         result_budgets = _result_budgets(display_descriptions)
         semaphore = asyncio.Semaphore(limits.max_concurrency)
+        from ..core.display_context import current_tool_display_call
+
+        parent_display_call = current_tool_display_call()
+        parent_call_id = (
+            parent_display_call.call_id
+            if parent_display_call is not None and parent_display_call.tool_name == "task_delegate"
+            else None
+        )
+        display_group_id = f"task-delegate-{uuid.uuid4().hex}"
 
         async def run_single_task(index: int, task: TaskModel) -> tuple[str, str]:
             """Run a single task and return (description, result)."""
@@ -224,12 +236,27 @@ async def _task_delegate_impl(tasks: TaskInput) -> str:
             result_budget = result_budgets[index]
             async with semaphore:
                 delegated_agent = None
+                display_hooks = None
+                display_status = "failed"
+                display_detail = None
                 permission_token = None
                 todo_token = None
-                propagate_cleanup_cancellation = True
+                primary_error: BaseException | None = None
+                had_handled_error = False
+
+                def bounded_outcome(value) -> tuple[str, str]:
+                    return (
+                        description,
+                        _bounded_report_text(
+                            value,
+                            result_budget,
+                            label="task result",
+                        ),
+                    )
+
                 try:
                     try:
-                        from ..agentic import create_dev_agent, get_display_hooks
+                        from ..agentic import create_dev_agent, get_subagent_display_hooks
                         from ..harness.agents.definitions import (
                             build_agent_system_prompt,
                             filter_tools_for_agent_definition,
@@ -249,6 +276,13 @@ async def _task_delegate_impl(tasks: TaskInput) -> str:
                         from .todo import get_todo_store
 
                         agent_definitions = get_agent_definitions(cwd=Path.cwd())
+                        display_hooks = get_subagent_display_hooks(
+                            group_id=display_group_id,
+                            agent_id=f"{display_group_id}:{index}",
+                            label=description,
+                            parent_call_id=parent_call_id,
+                            order=index,
+                        )
                         selected_agent = None
                         if task.agent_type:
                             selected_agent = next(
@@ -314,7 +348,7 @@ Return your findings or results directly without unnecessary explanation."""
                                 max_turns = selected_agent.max_turns
                             else:
                                 max_turns = get_max_turns()
-                            with skill_run_scope(get_display_hooks()) as run_hooks:
+                            with skill_run_scope(display_hooks) as run_hooks:
                                 result = await Runner.run(
                                     delegated_agent,
                                     task.prompt,
@@ -322,6 +356,7 @@ Return your findings or results directly without unnecessary explanation."""
                                     run_config=RunConfig(),
                                     hooks=run_hooks,
                                 )
+                            display_status = "completed"
                         finally:
                             if todo_token is not None:
                                 reset_todo_context(todo_token)
@@ -330,37 +365,51 @@ Return your findings or results directly without unnecessary explanation."""
                                 reset_tool_permission_context(permission_token)
                                 permission_token = None
 
-                        outcome = (
-                            description,
-                            _bounded_report_text(
-                                result.final_output,
-                                result_budget,
-                                label="task result",
-                            ),
-                        )
+                        outcome = bounded_outcome(result.final_output)
 
                     except Exception as exc:
-                        outcome = (
-                            description,
-                            _bounded_report_text(
-                                f"Error: {exc}",
-                                result_budget,
-                                label="task result",
-                            ),
-                        )
-                except BaseException:
-                    propagate_cleanup_cancellation = False
+                        had_handled_error = True
+                        display_detail = str(exc)
+                        outcome = bounded_outcome(f"Error: {exc}")
+                except BaseException as exc:
+                    primary_error = exc
+                    display_status = (
+                        "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    )
+                    display_detail = str(exc)
                     raise
                 finally:
-                    if todo_token is not None:
-                        reset_todo_context(todo_token)
-                    if permission_token is not None:
-                        reset_tool_permission_context(permission_token)
-                    if delegated_agent is not None:
-                        await _cleanup_agent_mcp_servers(
-                            delegated_agent,
-                            propagate_cancellation=propagate_cleanup_cancellation,
-                        )
+                    try:
+                        if todo_token is not None:
+                            reset_todo_context(todo_token)
+                        if permission_token is not None:
+                            reset_tool_permission_context(permission_token)
+                        if delegated_agent is not None:
+                            await _cleanup_agent_mcp_servers(
+                                delegated_agent,
+                                propagate_cancellation=primary_error is None,
+                            )
+                    except BaseException as exc:
+                        if primary_error is not None:
+                            logger.debug(
+                                "Suppressed delegated-agent cleanup failure while preserving %s",
+                                type(primary_error).__name__,
+                                exc_info=True,
+                            )
+                        elif had_handled_error and not isinstance(exc, asyncio.CancelledError):
+                            logger.debug(
+                                "Suppressed delegated-agent cleanup failure after task error",
+                                exc_info=True,
+                            )
+                        else:
+                            display_status = (
+                                "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                            )
+                            display_detail = str(exc)
+                            raise
+                    finally:
+                        if display_hooks is not None:
+                            display_hooks.finish(display_status, display_detail)
                 return outcome
 
         child_tasks = [

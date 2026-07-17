@@ -5,17 +5,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 _TOOL_SCENARIOS = (
+    "streaming_subagent_tool",
     "streaming_tool_queue",
     "streaming_tool_error",
     "sandbox_shell_tool",
 )
 _SCENARIOS = ("single", *_TOOL_SCENARIOS)
+_SUBAGENT_CHILD_MARKERS = {
+    "alpha": "KODER_SUBAGENT_ALPHA",
+    "beta": "KODER_SUBAGENT_BETA",
+}
 
 
 class _ReusableHTTPServer(ThreadingHTTPServer):
@@ -26,8 +32,10 @@ class _Handler(BaseHTTPRequestHandler):
     response_text: str = "fixture response"
     log_file: Path | None = None
     scenario: str = "single"
+    subagent_delay: float = 0.0
     stream_delay: float = 0.0
     stream_lines: int = 2
+    log_lock = threading.Lock()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         length = int(self.headers.get("content-length") or 0)
@@ -42,6 +50,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.scenario in _TOOL_SCENARIOS:
             if not body.get("tools"):
                 self._send_json(self._chat_completion(body, self.response_text))
+                return
+            if self.scenario == "streaming_subagent_tool":
+                self._handle_subagent_tool_scenario(body)
                 return
             if self.scenario == "streaming_tool_error" and self._request_has_tool_output(body):
                 self._send_error(self.response_text)
@@ -63,19 +74,30 @@ class _Handler(BaseHTTPRequestHandler):
     def _write_log(self, body: dict[str, Any]) -> None:
         if self.log_file is None:
             return
+        record: dict[str, Any] = {
+            "path": self.path,
+            "body": body,
+        }
+        marker = self._subagent_log_marker(body)
+        if marker is not None:
+            record["marker"] = marker
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_file.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "path": self.path,
-                        "body": body,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-                + "\n"
-            )
+        with self.log_lock, self.log_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _subagent_log_marker(self, body: dict[str, Any]) -> str | None:
+        if self.scenario != "streaming_subagent_tool":
+            return None
+        child = self._subagent_child(body)
+        if child is None:
+            return None
+        if not self._request_has_tool_output(body):
+            if body.get("tools") and self._has_tool(body, "read_file"):
+                return f"subagent-{child}-read_file-request"
+            return None
+        if self._request_has_tool_call(body, "read_file"):
+            return f"subagent-{child}-read_file-result"
+        return None
 
     def _request_has_tool_output(self, body: dict[str, Any]) -> bool:
         messages = body.get("messages")
@@ -95,6 +117,31 @@ class _Handler(BaseHTTPRequestHandler):
             if "Queued user input" in json.dumps(message, ensure_ascii=False):
                 return True
         return False
+
+    @staticmethod
+    def _request_has_tool_call(body: dict[str, Any], name: str) -> bool:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return False
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if isinstance(function, dict) and function.get("name") == name:
+                    return True
+        return False
+
+    @staticmethod
+    def _subagent_child(body: dict[str, Any]) -> str | None:
+        messages = body.get("messages")
+        serialized = json.dumps(messages, ensure_ascii=False) if isinstance(messages, list) else ""
+        matches = [
+            child for child, marker in _SUBAGENT_CHILD_MARKERS.items() if marker in serialized
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _chat_completion(self, body: dict[str, Any], content: str) -> dict[str, Any]:
         payload = {
@@ -119,29 +166,67 @@ class _Handler(BaseHTTPRequestHandler):
         payload["choices"][0]["message"] = {
             "role": "assistant",
             "content": None,
-            "tool_calls": [self._tool_call_payload()],
+            "tool_calls": [self._tool_call_payload(body)],
         }
         payload["choices"][0]["finish_reason"] = "tool_calls"
         return payload
 
-    def _tool_call_payload(self) -> dict[str, Any]:
-        if self.scenario == "sandbox_shell_tool":
-            return {
-                "id": "call_koder_sandbox_fixture",
-                "type": "function",
-                "function": {
-                    "name": "run_shell",
-                    "arguments": json.dumps({"command": "touch model-tool-created.txt"}),
-                },
-            }
+    @staticmethod
+    def _function_tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return {
-            "id": "call_koder_queue_fixture",
+            "id": call_id,
             "type": "function",
             "function": {
-                "name": "read_file",
-                "arguments": json.dumps({"path": "sample.txt"}),
+                "name": name,
+                "arguments": json.dumps(arguments),
             },
         }
+
+    def _tool_call_payload(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_body = body or {}
+        child = self._subagent_child(request_body)
+        if (
+            self.scenario == "streaming_subagent_tool"
+            and child is None
+            and self._has_tool(request_body, "task_delegate")
+        ):
+            return self._function_tool_call(
+                "call_koder_subagent_fixture",
+                "task_delegate",
+                {
+                    "tasks": [
+                        {
+                            "description": "Inspect sample alpha",
+                            "prompt": (
+                                "Read sample.txt and report alpha. Marker: KODER_SUBAGENT_ALPHA."
+                            ),
+                        },
+                        {
+                            "description": "Inspect sample beta",
+                            "prompt": (
+                                "Read sample.txt and report beta. Marker: KODER_SUBAGENT_BETA."
+                            ),
+                        },
+                    ]
+                },
+            )
+        if self.scenario == "streaming_subagent_tool" and child is not None:
+            return self._function_tool_call(
+                f"call_koder_subagent_{child}_read_file",
+                "read_file",
+                {"path": "sample.txt"},
+            )
+        if self.scenario == "sandbox_shell_tool":
+            return self._function_tool_call(
+                "call_koder_sandbox_fixture",
+                "run_shell",
+                {"command": "touch model-tool-created.txt"},
+            )
+        return self._function_tool_call(
+            "call_koder_queue_fixture",
+            "read_file",
+            {"path": "sample.txt"},
+        )
 
     def _stream_chunk(self, body: dict[str, Any], delta: dict[str, Any], finish_reason=None):
         return {
@@ -173,7 +258,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_tool_call_stream(self, body: dict[str, Any]) -> None:
-        tool_payload = self._tool_call_payload()
+        tool_payload = self._tool_call_payload(body)
         function_payload = tool_payload["function"]
         argument_json = function_payload["arguments"]
         if self.stream_lines <= 2:
@@ -216,10 +301,41 @@ class _Handler(BaseHTTPRequestHandler):
         ]
         self._send_sse(chunks)
 
-    def _send_text_stream(self, body: dict[str, Any]) -> None:
+    def _handle_subagent_tool_scenario(self, body: dict[str, Any]) -> None:
+        child = self._subagent_child(body)
+        is_parent = child is None
+        has_tool_output = self._request_has_tool_output(body)
+        if has_tool_output:
+            if not is_parent and self.subagent_delay:
+                time.sleep(self.subagent_delay)
+            content = self.response_text if is_parent else f"subagent {child} fixture result"
+            if body.get("stream"):
+                self._send_text_stream(body, content=content)
+            else:
+                self._send_json(self._chat_completion(body, content))
+            return
+
+        if body.get("stream"):
+            self._send_tool_call_stream(body)
+        else:
+            self._send_json(self._tool_call_completion(body))
+
+    @staticmethod
+    def _has_tool(body: dict[str, Any], name: str) -> bool:
+        for tool in body.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if isinstance(function, dict) and function.get("name") == name:
+                return True
+            if tool.get("name") == name:
+                return True
+        return False
+
+    def _send_text_stream(self, body: dict[str, Any], *, content: str | None = None) -> None:
         chunks = [
             self._stream_chunk(body, {"role": "assistant"}),
-            self._stream_chunk(body, {"content": self.response_text}),
+            self._stream_chunk(body, {"content": content or self.response_text}),
             self._stream_chunk(body, {}, "stop"),
         ]
         self._send_sse(chunks)
@@ -265,18 +381,21 @@ def main() -> None:
         choices=_SCENARIOS,
     )
     parser.add_argument("--stream-delay", type=float, default=0.0)
+    parser.add_argument("--subagent-delay", type=float, default=0.0)
     parser.add_argument("--stream-lines", type=int, default=2)
     args = parser.parse_args()
 
     _Handler.response_text = args.response
     _Handler.log_file = args.log_file
     _Handler.scenario = args.scenario
+    _Handler.subagent_delay = max(0.0, args.subagent_delay)
     _Handler.stream_delay = max(0.0, args.stream_delay)
     _Handler.stream_lines = max(1, args.stream_lines)
 
     server = _ReusableHTTPServer(("127.0.0.1", args.port), _Handler)
+    bound_port = int(server.server_address[1])
     args.ready_file.parent.mkdir(parents=True, exist_ok=True)
-    args.ready_file.write_text(f"ready http://127.0.0.1:{args.port}/v1\n", encoding="utf-8")
+    args.ready_file.write_text(f"ready http://127.0.0.1:{bound_port}/v1\n", encoding="utf-8")
     try:
         server.serve_forever()
     finally:

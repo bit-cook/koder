@@ -14,6 +14,7 @@ from agents import function_tool as _agents_function_tool
 from agents.tool import default_tool_error_function
 from agents.tool_context import ToolContext
 
+from ..core.display_context import tool_display_call_scope
 from .permission_context import (
     begin_tool_invocation,
     enforce_tool_permission,
@@ -325,17 +326,18 @@ def _wrap_none_context(tool: FunctionTool) -> FunctionTool:
                     tool_call_id=f"manual-{tool.name}",
                     tool_arguments=input_json,
                 )
-            argument_error = _validate_declared_tool_arguments(tool, input_json)
-            if argument_error is not None:
-                return _bound_tool_output(argument_error, max_chars)
-            # Argument-level permission enforcement for the main agent chain. Returns a
-            # denial string (fed back to the model) when the active permission service
-            # blocks this specific call; None when allowed or when no service is active.
-            blocked = await enforce_tool_permission(tool.name, input_json)
-            if blocked is not None:
-                return _bound_tool_output(blocked, max_chars)
-            result = await original_on_invoke_tool(ctx, input_json)
-            return _bound_tool_output(result, max_chars)
+            with tool_display_call_scope(tool.name, getattr(ctx, "tool_call_id", None)):
+                argument_error = _validate_declared_tool_arguments(tool, input_json)
+                if argument_error is not None:
+                    return _bound_tool_output(argument_error, max_chars)
+                # Argument-level permission enforcement for the main agent chain. Returns a
+                # denial string (fed back to the model) when the active permission service
+                # blocks this specific call; None when allowed or when no service is active.
+                blocked = await enforce_tool_permission(tool.name, input_json)
+                if blocked is not None:
+                    return _bound_tool_output(blocked, max_chars)
+                result = await original_on_invoke_tool(ctx, input_json)
+                return _bound_tool_output(result, max_chars)
         finally:
             reset_tool_invocation(invocation_token)
 

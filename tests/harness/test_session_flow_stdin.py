@@ -144,6 +144,7 @@ class _FakeEnhancedSQLiteSession:
 
     def close(self) -> None:
         return None
+
     @staticmethod
     async def record_session_cwd(_session_id: str, _cwd: str) -> None:
         return None
@@ -1217,9 +1218,7 @@ def test_switch_cancellation_requested_inside_no_await_commit_is_fully_committed
                 nonlocal queued_dispatch
                 self.status_line.update_session(session_id)
                 asyncio.current_task().cancel()
-                queued_dispatch = asyncio.create_task(
-                    state.dispatch_handle("queued-after-commit")
-                )
+                queued_dispatch = asyncio.create_task(state.dispatch_handle("queued-after-commit"))
 
             def reset_history(self):
                 self.history = []
