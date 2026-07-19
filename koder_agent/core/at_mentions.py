@@ -11,7 +11,7 @@ _AT_MENTION_RE = re.compile(r'@"([^"]+)"|@(\S+)')
 
 # Matches ``server:protocol://...`` — the colon-then-scheme separator
 # distinguishes MCP resource references from plain file paths.
-_MCP_RESOURCE_RE = re.compile(r"^([A-Za-z0-9_-]+):([a-zA-Z][a-zA-Z0-9+.-]*://.*)$")
+_MCP_RESOURCE_RE = re.compile(r"^([A-Za-z0-9_.-]+):([a-zA-Z][a-zA-Z0-9+.-]*://.*)$")
 
 MAX_FILE_CHARS = 100_000
 
@@ -91,13 +91,12 @@ async def _read_mcp_resource(
 
     Returns the text content or *None* on failure.
     """
-    session = getattr(server, "session", None)
-    if session is None:
-        return None
     try:
         from pydantic import AnyUrl
 
-        result = await session.read_resource(AnyUrl(uri))
+        from koder_agent.mcp.runtime_authorization import call_authorized_server_method
+
+        result = await call_authorized_server_method(server, "read_resource", AnyUrl(uri))
         parts: list[str] = []
         for item in result.contents:
             text = getattr(item, "text", None)
@@ -117,12 +116,17 @@ def _find_mcp_server(
     server_name: str,
     mcp_servers: list[Any],
 ) -> Any | None:
-    """Find a connected MCP server by name."""
+    """Find one connected MCP server by its exact raw name."""
+    matches: list[Any] = []
     for server in mcp_servers:
         name = getattr(server, "name", None)
+        if not name:
+            params = getattr(server, "params", None)
+            if params is not None:
+                name = getattr(params, "name", None)
         if name == server_name:
-            return server
-    return None
+            matches.append(server)
+    return matches[0] if len(matches) == 1 else None
 
 
 async def _resolve_mcp_resources(

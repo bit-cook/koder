@@ -19,7 +19,10 @@ from typing import Awaitable, Callable, List, Optional, Union
 from pydantic import BaseModel
 
 from ..core.security import SecurityGuard
+from ..harness.tools import shell_executor as harness_shell_executor
 from .compat import function_tool
+from .permission_context import approve_sandbox_degradation, required_sandbox_execution
+from .todo import TodoRuntimeIdentity, get_todo_store_or_none
 
 # Signature of the callback threaded into the harness shell executor to decide,
 # at runtime, whether a command may fall back to UNSANDBOXED execution when the
@@ -148,11 +151,13 @@ class BackgroundShell:
         command: str,
         process: "asyncio.subprocess.Process",
         start_time: float,
+        owner: TodoRuntimeIdentity | None = None,
     ):
         self.shell_id = shell_id
         self.command = command
         self.process = process
         self.start_time = start_time
+        self.owner = owner
         # Bounded ring buffer: old lines are evicted from the left once the cap
         # is hit, keeping session memory bounded for verbose processes.
         self.output_lines: "deque[str]" = deque(maxlen=_bg_shell_max_lines())
@@ -241,6 +246,11 @@ class BackgroundShellManager:
     def get_available_ids(cls) -> List[str]:
         """Get all available shell IDs."""
         return list(cls._shells.keys())
+
+    @classmethod
+    def get_owned_ids(cls, owner: TodoRuntimeIdentity) -> List[str]:
+        """Get shell IDs created within one explicit runtime owner scope."""
+        return [shell_id for shell_id, shell in cls._shells.items() if shell.owner == owner]
 
     @classmethod
     def _remove(cls, shell_id: str) -> None:
@@ -337,6 +347,9 @@ class BackgroundShellManager:
 
 def build_sandbox_unavailable_approval(
     approver: Optional[Callable[[str], Union[bool, Awaitable[bool]]]] = None,
+    *,
+    tool_name: str | None = None,
+    arguments: dict | None = None,
 ) -> SandboxUnavailableApproval:
     """Build a sandbox-degradation approval callback for the shell executor.
 
@@ -353,12 +366,14 @@ def build_sandbox_unavailable_approval(
     """
 
     async def _approval(reason: str) -> bool:
-        if approver is None:
+        if approver is not None:
+            result = approver(reason)
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        if tool_name is None:
             return False
-        result = approver(reason)
-        if inspect.isawaitable(result):
-            result = await result
-        return bool(result)
+        return await approve_sandbox_degradation(tool_name, arguments or {}, reason)
 
     return _approval
 
@@ -434,11 +449,13 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
                 )
 
             # Create background shell and add to manager
+            todo_store = get_todo_store_or_none()
             bg_shell = BackgroundShell(
                 shell_id=shell_id,
                 command=command,
                 process=process,
                 start_time=time.time(),
+                owner=todo_store.identity if todo_store is not None else None,
             )
             BackgroundShellManager.add(bg_shell)
 
@@ -453,61 +470,20 @@ async def run_shell(command: str, timeout: int = 120, run_in_background: bool = 
             )
 
         else:
-            # Foreground execution. Place the child in its own process group so
-            # a timeout can kill the whole tree (wrapper + grandchildren) instead
-            # of orphaning grandchildren by only killing the sh wrapper.
-            if IS_WINDOWS:
-                process = await asyncio.create_subprocess_exec(
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-Command",
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **_new_session_kwargs(),
-                )
-            else:
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **_new_session_kwargs(),
-                )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                # Kill the entire process group, then drain any buffered output
-                # under a hard timeout so a surviving pipe holder can't block us.
-                _kill_process_group(process)
-                partial_stdout, partial_stderr = await _drain_after_kill(process, timeout=1)
-                if partial_stdout or partial_stderr:
-                    msg = f"Command timed out after {timeout} seconds. Partial output:\n{partial_stdout}"
-                    if partial_stderr:
-                        msg += f"\n[stderr]: {partial_stderr}"
-                    return msg
-                return f"Command timed out after {timeout} seconds"
-            except asyncio.CancelledError:
-                # ESC/cancel: kill the detached process tree before propagating
-                _kill_process_group(process)
-                # Brief drain so killpg's SIGKILL has time to reap
-                try:
-                    await asyncio.wait_for(process.communicate(), timeout=2)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                raise  # Re-raise so the SDK knows the turn was cancelled
-
-            # Decode output
-            output = stdout.decode("utf-8", errors="replace").strip()
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace").strip()
-                if stderr_text:
-                    output += f"\n[stderr]: {stderr_text}"
-
-            if process.returncode != 0:
-                output += f"\n[exit code]: {process.returncode}"
-
-            return output or "(no output)"
+            result = await harness_shell_executor.execute_shell_command(
+                command,
+                timeout=timeout,
+                sandbox_unavailable_approval=build_sandbox_unavailable_approval(
+                    tool_name="run_shell",
+                    arguments={
+                        "command": command,
+                        "timeout": timeout,
+                        "run_in_background": run_in_background,
+                    },
+                ),
+                required_sandbox=required_sandbox_execution("run_shell", command),
+            )
+            return result.output
 
     except Exception as e:
         return f"Error executing command: {str(e)}"
@@ -604,6 +580,7 @@ async def git_command(command: str, timeout: int = 60) -> str:
     try:
         # Clamp timeout to valid range
         timeout = max(1, min(timeout, 300))
+        requested_command = command
 
         # Ensure command starts with 'git'
         if not command.strip().startswith("git"):
@@ -614,45 +591,17 @@ async def git_command(command: str, timeout: int = 60) -> str:
         if error:
             return error
 
-        # Execute git command (always foreground). Own process group so a
-        # timeout kills the whole tree, not just the sh wrapper.
-        if IS_WINDOWS:
-            process = await asyncio.create_subprocess_exec(
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **_new_session_kwargs(),
-            )
-        else:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **_new_session_kwargs(),
-            )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            _kill_process_group(process)
-            await _drain_after_kill(process, timeout=1)
-            return f"Git command timed out after {timeout} seconds"
-
-        # Decode output
-        output = stdout.decode("utf-8", errors="replace").strip()
-        if stderr:
-            # Git often uses stderr for informational messages
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            if stderr_text:
-                output += f"\n{stderr_text}"
-
-        if process.returncode != 0 and not output:
-            output = f"Git command failed with exit code {process.returncode}"
-
-        return output or "(no output)"
+        result = await harness_shell_executor.execute_shell_command(
+            command,
+            timeout=timeout,
+            sandbox_unavailable_approval=build_sandbox_unavailable_approval(
+                tool_name="git_command",
+                arguments={"command": requested_command, "timeout": timeout},
+            ),
+            required_sandbox=required_sandbox_execution("git_command", requested_command),
+            output_style="git",
+        )
+        return result.output
 
     except Exception as e:
         return f"Error executing git command: {str(e)}"

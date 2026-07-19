@@ -95,6 +95,14 @@ class TestPlanMode:
         assert not result.allowed and not result.requires_approval
         assert "plan mode" in result.reason.lower()
 
+    def test_plan_mode_blocks_notebook_edit(self, tmp_path: Path):
+        svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
+        result = svc.evaluate_tool_call(
+            "notebook_edit", {"notebook_path": str(tmp_path / "book.ipynb")}
+        )
+        assert not result.allowed and not result.requires_approval
+        assert "plan mode" in result.reason.lower()
+
     def test_plan_mode_blocks_run_shell(self, tmp_path: Path):
         """PLAN mode blocks run_shell."""
         svc = PermissionService.default(mode=PermissionMode.PLAN, workspace_root=tmp_path)
@@ -125,6 +133,59 @@ class TestAcceptEditsMode:
         assert result.allowed and not result.requires_approval
         assert "acceptEdits" in result.reason or "workspace write auto-allowed" in result.reason
 
+    def test_accept_edits_auto_allows_workspace_notebook_edit(self, tmp_path: Path):
+        svc = PermissionService.default(mode=PermissionMode.ACCEPT_EDITS, workspace_root=tmp_path)
+        result = svc.evaluate_tool_call(
+            "notebook_edit", {"notebook_path": str(tmp_path / "book.ipynb")}
+        )
+        assert result.allowed and not result.requires_approval
+        assert "acceptEdits" in result.reason or "workspace write auto-allowed" in result.reason
+
+    def test_accept_edits_rejects_notebook_path_spoof(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        svc = PermissionService.default(
+            mode=PermissionMode.ACCEPT_EDITS,
+            workspace_root=workspace,
+        )
+
+        result = svc.evaluate_tool_call(
+            "notebook_edit",
+            {
+                "path": str(workspace / "decoy.ipynb"),
+                "notebook_path": str(tmp_path / "outside.ipynb"),
+            },
+        )
+
+        assert not result.allowed
+        assert not result.requires_approval
+        assert "unexpected path field" in result.reason
+
+    def test_write_aliases_must_match_exactly(self, tmp_path: Path):
+        svc = PermissionService.default(
+            mode=PermissionMode.ACCEPT_EDITS,
+            workspace_root=tmp_path,
+        )
+        target = str(tmp_path / "target.txt")
+
+        matching = svc.evaluate_tool_call(
+            "write_file",
+            {"path": target, "file_path": target, "content": "ok"},
+        )
+        conflicting = svc.evaluate_tool_call(
+            "write_file",
+            {
+                "path": target,
+                "file_path": str(tmp_path.parent / "outside.txt"),
+                "content": "blocked",
+            },
+        )
+
+        assert matching.allowed and not matching.requires_approval
+        assert not conflicting.allowed
+        assert not conflicting.requires_approval
+        assert "must be exactly equal" in conflicting.reason
+
     def test_accept_edits_blocks_write_outside_workspace(self, tmp_path: Path):
         """ACCEPT_EDITS mode blocks writes outside workspace."""
         svc = PermissionService.default(mode=PermissionMode.ACCEPT_EDITS, workspace_root=tmp_path)
@@ -136,6 +197,39 @@ class TestAcceptEditsMode:
         assert not (result.allowed and not result.requires_approval)
         if result.requires_approval:
             assert "outside workspace" in result.reason.lower()
+
+    def test_notebook_path_policies_match_edit_file(self, tmp_path: Path):
+        svc = PermissionService.default(workspace_root=tmp_path)
+        cases = [
+            tmp_path.parent / "outside.ipynb",
+            tmp_path / ".git" / "protected.ipynb",
+        ]
+
+        for path in cases:
+            edit_result = svc.evaluate_tool_call("edit_file", {"path": str(path)})
+            notebook_result = svc.evaluate_tool_call("notebook_edit", {"notebook_path": str(path)})
+            assert (
+                notebook_result.allowed,
+                notebook_result.requires_approval,
+                notebook_result.reason,
+            ) == (
+                edit_result.allowed,
+                edit_result.requires_approval,
+                edit_result.reason,
+            )
+
+    def test_notebook_path_rules_match_edit_file(self, tmp_path: Path):
+        target = str(tmp_path / "blocked.ipynb")
+        svc = PermissionService.default(workspace_root=tmp_path)
+        svc.add_rule("edit_file", "deny", target)
+        svc.add_rule("notebook_edit", "deny", target)
+
+        edit_result = svc.evaluate_tool_call("edit_file", {"path": target})
+        notebook_result = svc.evaluate_tool_call("notebook_edit", {"notebook_path": target})
+
+        assert not edit_result.allowed
+        assert not notebook_result.allowed
+        assert edit_result.reason == notebook_result.reason
 
     def test_accept_edits_still_classifies_shell_commands_normally(self, tmp_path: Path):
         """ACCEPT_EDITS mode still classifies shell commands normally (doesn't auto-allow)."""

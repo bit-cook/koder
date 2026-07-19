@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import os
 import re
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from rich.panel import Panel
 from rich.text import Text
@@ -38,6 +42,421 @@ console = get_adaptive_console()
 DIRECT_COMMAND_PASSTHROUGHS = {"commit"}
 
 
+@dataclass(frozen=True)
+class _SchedulerBuilder:
+    """Immutable constructor state shared by initial and switched sessions."""
+
+    scheduler_type: type
+    streaming: bool
+    agent_definition: Any
+    instructions_override: str | None
+    instructions_append: str | None
+    permission_service: Any
+    approver: Any
+    agent_definitions: Any
+    plugin_root: Path | None = None
+    cli_agents_json: Any = None
+    wire_approver: Callable[[Any], None] | None = None
+
+    def build(self, session_id: str, *, target: "_SessionSwitchTarget | None" = None):
+        if target is None:
+            project_root = Path.cwd()
+            agent_definition = self.agent_definition
+            agent_definitions = self.agent_definitions
+            todo_store = None
+        else:
+            project_root = target.cwd or Path.cwd()
+            agent_definition = target.agent_definition
+            agent_definitions = target.agent_definitions
+            todo_store = target.todo_store
+        constructor_kwargs = {
+            "session_id": session_id,
+            "streaming": self.streaming,
+            "agent_definition": agent_definition,
+            "instructions_override": self.instructions_override,
+            "instructions_append": self.instructions_append,
+            "permission_service": self.permission_service,
+            "approver": self.approver,
+            "todo_store": todo_store,
+            "project_root": project_root,
+        }
+        signature = inspect.signature(self.scheduler_type)
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            constructor_kwargs = {
+                key: value
+                for key, value in constructor_kwargs.items()
+                if key in signature.parameters
+            }
+        scheduler = self.scheduler_type(**constructor_kwargs)
+        if self.wire_approver is not None:
+            self.wire_approver(scheduler)
+        scheduler.agent_definitions = agent_definitions
+        return scheduler
+
+    def load_agent_definitions(self, cwd: Path) -> Any:
+        """Load definitions from the target project without mutating process cwd."""
+        return get_agent_definitions(
+            cwd=cwd,
+            plugin_root=self.plugin_root,
+            cli_agents_json=self.cli_agents_json,
+        )
+
+
+@dataclass(frozen=True)
+class _SessionSwitchTarget:
+    """Cancellable target metadata resolved before replacement construction."""
+
+    cwd: Path | None
+    agent_name: str | None
+    agent_definition: Any
+    agent_definitions: Any = None
+    todo_store: Any = None
+    todo_key: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class _SessionSwitchCommit:
+    """Fully prepared values applied synchronously at the switch linearization point."""
+
+    target: _SessionSwitchTarget
+    display_name: str | None
+
+
+class _SchedulerState:
+    """Own scheduler dispatch, replacement, and exact-once retirement."""
+
+    def __init__(self, builder: _SchedulerBuilder, scheduler: Any):
+        self.builder = builder
+        self._scheduler = scheduler
+        self._lifecycle_lock = asyncio.Lock()
+        self._cleanup_tasks: dict[int, tuple[Any, asyncio.Task[None]]] = {}
+        self._closed = False
+        self.agent_definitions = getattr(
+            scheduler,
+            "agent_definitions",
+            getattr(builder, "agent_definitions", None),
+        )
+        self.selected_agent = getattr(
+            scheduler,
+            "agent_definition",
+            getattr(builder, "agent_definition", None),
+        )
+        self.todo_stores_by_identity: dict[tuple[str, str], Any] = {}
+        todo_store = getattr(scheduler, "todo_store", None)
+        identity = getattr(todo_store, "identity", None)
+        if identity is not None:
+            self.todo_stores_by_identity[(identity.session_id, identity.agent_id)] = todo_store
+
+    @classmethod
+    def create(cls, builder: _SchedulerBuilder, session_id: str) -> "_SchedulerState":
+        return cls(builder=builder, scheduler=builder.build(session_id))
+
+    @property
+    def scheduler(self) -> Any:
+        """Return the current scheduler for non-turn UI and command plumbing."""
+        return self._scheduler
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward non-lifecycle scheduler APIs to the current scheduler."""
+        return getattr(self._scheduler, name)
+
+    @property
+    def session_id(self) -> str:
+        return self._scheduler.session.session_id
+
+    async def dispatch_handle(self, prompt: str, **kwargs) -> str:
+        """Run one producer turn against the scheduler active after lock acquisition."""
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Scheduler state is closed")
+            return await self._scheduler.handle(prompt, **kwargs)
+
+    async def dispatch_stream_json(self, prompt: str, **kwargs) -> str:
+        """Run one stream-json turn under the shared lifecycle lock."""
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Scheduler state is closed")
+            return await self._scheduler.handle_stream_json(prompt, **kwargs)
+
+    async def handle(self, prompt: str, **kwargs) -> str:
+        """Scheduler-compatible entry point for interactive command producers."""
+        return await self.dispatch_handle(prompt, **kwargs)
+
+    async def handle_stream_json(self, prompt: str, **kwargs) -> str:
+        return await self.dispatch_stream_json(prompt, **kwargs)
+
+    async def switch(
+        self,
+        session_id: str,
+        *,
+        prepare_target: Callable[[], Awaitable[_SessionSwitchTarget]] | None = None,
+        prepare_commit: Callable[[Any, _SessionSwitchTarget], Awaitable[Any]] | None = None,
+        commit: Callable[[Any, Any], None] | None = None,
+        post_commit: Callable[[Any, Any], None] | None = None,
+    ):
+        """Build and commit a replacement while producer admission is closed.
+
+        ``commit`` owns every external state update that must become visible with
+        the replacement (cwd, CLI args, prompt/status-line state). ``post_commit``
+        runs synchronously only after the replacement is authoritative, so caller
+        cancellation cannot skip committed event delivery or expose it for an
+        aborted switch. The old scheduler is retired only after that transaction
+        commits, and retirement failures are observed separately rather than
+        changing the switch result.
+        """
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Scheduler state is closed")
+            previous = self._scheduler
+            replacement = None
+            try:
+                if prepare_target is None:
+                    target = _SessionSwitchTarget(
+                        cwd=Path.cwd(),
+                        agent_name=None,
+                        agent_definition=getattr(self.builder, "agent_definition", None),
+                        agent_definitions=getattr(self.builder, "agent_definitions", None),
+                    )
+                else:
+                    target = await prepare_target()
+                if isinstance(self.builder, _SchedulerBuilder):
+                    replacement = self.builder.build(session_id, target=target)
+                else:
+                    replacement = self.builder.build(session_id)
+                prepared = (
+                    await prepare_commit(replacement, target)
+                    if prepare_commit is not None
+                    else target
+                )
+                if commit is not None:
+                    # This is the switch linearization point. It deliberately
+                    # contains no await: scheduler, CLI, prompt, history, status,
+                    # and cwd become visible as one lifecycle-lock transaction.
+                    commit(replacement, prepared)
+                self._scheduler = replacement
+
+                # Snapshot resources owned by the old scheduler before the
+                # lifecycle lock admits any work against the replacement. This
+                # prevents delayed retirement from selecting resources created
+                # by the new session after the switch commits.
+                prepare_retirement = getattr(previous, "prepare_retirement", None)
+                if callable(prepare_retirement):
+                    try:
+                        prepare_retirement()
+                    except BaseException:
+                        logger.warning(
+                            "Failed to snapshot retired scheduler resources",
+                            exc_info=True,
+                        )
+
+                if post_commit is not None:
+                    try:
+                        post_commit(replacement, prepared)
+                    except BaseException:
+                        # The switch is already committed. Event delivery is
+                        # best-effort and must never roll the authoritative state
+                        # back after externally visible hooks may have fired.
+                        logger.warning(
+                            "Failed to deliver committed session switch event",
+                            exc_info=True,
+                        )
+            except BaseException:
+                if replacement is not None:
+                    prepare_uncommitted_cleanup = getattr(
+                        replacement,
+                        "prepare_uncommitted_cleanup",
+                        None,
+                    )
+                    if callable(prepare_uncommitted_cleanup):
+                        prepare_uncommitted_cleanup()
+                    self._start_cleanup(replacement, reason="aborted session replacement")
+                raise
+            self._start_cleanup(previous, reason="retired session scheduler")
+            return replacement
+
+    async def cleanup(self) -> None:
+        async with self._lifecycle_lock:
+            self._closed = True
+            self._start_cleanup(self._scheduler, reason="active session scheduler")
+            cleanup_tasks = [task for _scheduler, task in self._cleanup_tasks.values()]
+        for task in cleanup_tasks:
+            await _await_task_resiliently(task)
+
+    def _start_cleanup(self, scheduler: Any, *, reason: str) -> asyncio.Task[None]:
+        key = id(scheduler)
+        owned = self._cleanup_tasks.get(key)
+        if owned is None:
+            task = asyncio.create_task(self._retire_scheduler(scheduler, reason=reason))
+            self._cleanup_tasks[key] = (scheduler, task)
+        else:
+            task = owned[1]
+        return task
+
+    @staticmethod
+    async def _retire_scheduler(scheduler: Any, *, reason: str) -> None:
+        try:
+            await scheduler.cleanup()
+        except BaseException:
+            logger.warning("Failed to clean %s", reason, exc_info=True)
+
+
+async def _await_task_resiliently(task: asyncio.Task[Any]) -> Any:
+    """Wait through repeated caller cancellation, then preserve cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+
+    try:
+        result = task.result()
+    except BaseException:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+class _SessionCleanupOwner:
+    """Own all session resources and finish cleanup despite repeated cancellation."""
+
+    def __init__(
+        self,
+        scheduler_state: _SchedulerState,
+        *,
+        bare_mode: bool,
+        previous_simple: str | None,
+    ) -> None:
+        self.scheduler_state = scheduler_state
+        self.bare_mode = bare_mode
+        self.previous_simple = previous_simple
+        self.pr_poller: Any = None
+        self.channel_task: asyncio.Task[Any] | None = None
+        self.unregister_channel_callback: Any = None
+        self.cron_prompt_runner: Any = None
+        self.skip_auto_dream = False
+        self._task: asyncio.Task[None] | None = None
+
+    async def finish(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        await _await_task_resiliently(self._task)
+
+    async def _run(self) -> None:
+        try:
+            await self._guard("PR status poller shutdown", self._stop_pr_poller)
+            await self._guard("Channel callback unregister", self._unregister_channel_callback)
+            await self._guard("Channel task cancellation", self._stop_channel_task)
+            await self._guard("Cron prompt runner shutdown", self._stop_cron_runner)
+            await self._guard("SessionEnd hook dispatch", self._dispatch_session_end)
+            await self._guard("AutoDream memory consolidation", self._run_auto_dream)
+            await self._guard("Scheduler cleanup", self.scheduler_state.cleanup)
+        finally:
+            self._restore_bare_mode()
+
+    async def _guard(self, label: str, action) -> None:
+        try:
+            result = action()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            logger.debug("%s failed", label, exc_info=True)
+
+    def _stop_pr_poller(self) -> None:
+        if self.pr_poller is not None:
+            self.pr_poller.stop()
+
+    def _unregister_channel_callback(self) -> None:
+        if self.unregister_channel_callback is not None:
+            self.unregister_channel_callback()
+            self.unregister_channel_callback = None
+
+    async def _stop_channel_task(self) -> None:
+        if self.channel_task is None:
+            return
+        self.channel_task.cancel()
+        results = await asyncio.gather(self.channel_task, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                logger.debug(
+                    "Channel task cancellation failed",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+        self.channel_task = None
+
+    async def _stop_cron_runner(self) -> None:
+        if self.cron_prompt_runner is not None:
+            await self.cron_prompt_runner.stop()
+
+    def _dispatch_session_end(self) -> None:
+        dispatch_command_hooks(
+            cwd=Path.cwd(),
+            event_name="SessionEnd",
+            match_value="other",
+            payload={
+                "event": "SessionEnd",
+                "reason": "other",
+                "session_id": self.scheduler_state.session_id,
+            },
+        )
+
+    async def _run_auto_dream(self) -> None:
+        from koder_agent.harness.memory.auto_dream import (
+            AutoDreamManager,
+            DreamConfig,
+            default_auto_dream_task_storage,
+            run_auto_dream_from_messages,
+        )
+
+        harness_config = getattr(get_config(), "harness", None)
+        write_mode = getattr(harness_config, "auto_dream_write_mode", "review")
+        dream_manager = AutoDreamManager(
+            config=DreamConfig(write_mode=write_mode),
+            state_path=Path.home() / ".koder" / "auto_dream_state.json",
+        )
+        dream_manager.record_session()
+        try:
+            if self.skip_auto_dream or not dream_manager.should_dream():
+                dream_manager.save()
+                return
+            result = await asyncio.wait_for(
+                run_auto_dream_from_messages(
+                    await self.scheduler_state.scheduler.session.get_items(),
+                    manager=dream_manager,
+                    origin_project_root=Path.cwd(),
+                    origin_session_id=self.scheduler_state.session_id,
+                    task_storage=default_auto_dream_task_storage(),
+                ),
+                timeout=AUTO_DREAM_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            logger.info(
+                "AutoDream completed: memories=%d saved=%s errors=%d",
+                result.memories_written,
+                str(result.saved_path) if result.saved_path else "none",
+                len(result.errors),
+            )
+        except BaseException:
+            try:
+                dream_manager.save()
+            except BaseException:
+                logger.debug("Failed to save dream manager state", exc_info=True)
+            raise
+
+    def _restore_bare_mode(self) -> None:
+        if not self.bare_mode:
+            return
+        if self.previous_simple is None:
+            os.environ.pop("KODER_SIMPLE", None)
+        else:
+            os.environ["KODER_SIMPLE"] = self.previous_simple
+
+
 def _parse_session_switch(slash_response: str) -> tuple[str, bool] | None:
     if slash_response.startswith("session_switch_clear:"):
         return slash_response.split(":", 1)[1], True
@@ -46,24 +465,63 @@ def _parse_session_switch(slash_response: str) -> tuple[str, bool] | None:
     return None
 
 
-async def restore_session_cwd(session_id: str) -> str | None:
-    """Restore the working directory recorded for *session_id*.
+async def _close_session_probe(session: Any) -> None:
+    """Close a temporary SQLite session without letting cancellation skip ownership."""
+    close = getattr(session, "close", None)
+    if not callable(close):
+        return
 
-    Returns the new cwd when the process directory actually changed, else
-    ``None``. A change dispatches ``CwdChanged`` hooks and registers any
-    watch paths they request, mirroring the payload contract used when the
-    cwd changes for any other reason.
-    """
-    from koder_agent.core.session import EnhancedSQLiteSession
+    async def close_owned() -> None:
+        if asyncio.iscoroutinefunction(close):
+            await close()
+        else:
+            error: list[BaseException] = []
 
-    recorded = await EnhancedSQLiteSession(session_id=session_id).get_cwd()
-    if not recorded:
-        return None
-    target = Path(recorded)
-    previous = Path.cwd()
+            def worker() -> None:
+                try:
+                    close()
+                except BaseException as exc:
+                    error.append(exc)
+
+            thread = threading.Thread(
+                target=worker,
+                name="koder-session-probe-close",
+                daemon=False,
+            )
+            thread.start()
+            while thread.is_alive():
+                await asyncio.sleep(0.01)
+            thread.join()
+            if error:
+                raise error[0]
+
+    task = asyncio.create_task(close_owned())
+    await _await_task_resiliently(task)
+
+
+def _resolve_hook_watch_paths(
+    paths: list[str] | None,
+    *,
+    base_dir: Path,
+) -> list[str]:
+    """Resolve hook watch paths relative to the directory that dispatched them."""
+    resolved_paths: list[str] = []
+    for raw in paths or []:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        resolved_paths.append(str(candidate.resolve()))
+    return resolved_paths
+
+
+def _change_working_directory(target: Path) -> str | None:
+    """Commit one cwd change, then deliver its hook from the old trust root."""
+    target = target.expanduser().resolve()
+    previous = Path.cwd().resolve()
     if not target.is_dir() or target == previous:
         return None
 
+    os.chdir(target)
     hook_result = dispatch_command_hooks(
         cwd=previous,
         event_name="CwdChanged",
@@ -74,9 +532,310 @@ async def restore_session_cwd(session_id: str) -> str | None:
             "cwd": str(target),
         },
     )
-    update_watch_paths(hook_result.watch_paths)
-    os.chdir(target)
+    update_watch_paths(
+        _resolve_hook_watch_paths(
+            hook_result.watch_paths,
+            base_dir=previous,
+        )
+    )
     return str(target)
+
+
+async def restore_session_cwd(session_id: str) -> str | None:
+    """Restore a recorded cwd with exact temporary-session cleanup."""
+    from koder_agent.core.session import EnhancedSQLiteSession
+
+    probe = EnhancedSQLiteSession(session_id=session_id)
+    try:
+        recorded = await probe.get_cwd()
+    finally:
+        await _close_session_probe(probe)
+    if not recorded:
+        return None
+    target = Path(recorded).expanduser()
+    if not target.is_absolute() or not target.is_dir():
+        return None
+    return _change_working_directory(target)
+
+
+def _todo_store_matches(todo_store, *, session_id: str, agent_id: str) -> bool:
+    identity = getattr(todo_store, "identity", None)
+    return (
+        identity is not None and identity.session_id == session_id and identity.agent_id == agent_id
+    )
+
+
+async def _prepare_session_switch_target(
+    builder: _SchedulerBuilder,
+    session_id: str,
+    *,
+    todo_stores_by_identity: dict[tuple[str, str], Any] | None = None,
+) -> _SessionSwitchTarget:
+    """Resolve target cwd and agent without changing visible state."""
+    from koder_agent.core.session import EnhancedSQLiteSession
+
+    probe = EnhancedSQLiteSession(session_id=session_id)
+    try:
+        recorded_cwd = await probe.get_cwd()
+        get_agent = getattr(probe, "get_agent", None)
+        if callable(get_agent):
+            agent_name = await get_agent()
+        else:
+            get_session_agent = getattr(EnhancedSQLiteSession, "get_session_agent", None)
+            agent_name = (
+                await get_session_agent(session_id) if callable(get_session_agent) else None
+            )
+    finally:
+        await _close_session_probe(probe)
+
+    if recorded_cwd:
+        target_cwd = Path(recorded_cwd).expanduser()
+        if not target_cwd.is_absolute() or not target_cwd.is_dir():
+            raise ValueError(
+                "Cannot switch sessions because its recorded directory is unavailable: "
+                f"{recorded_cwd}"
+            )
+        target_cwd = target_cwd.resolve()
+    else:
+        target_cwd = Path.cwd().resolve()
+
+    load_definitions = getattr(builder, "load_agent_definitions", None)
+    if callable(load_definitions):
+        agent_definitions = load_definitions(target_cwd)
+    else:
+        agent_definitions = getattr(builder, "agent_definitions", None)
+
+    agent_definition = None
+    if agent_name:
+        if agent_definitions is None:
+            raise ValueError(
+                f"Session agent '{agent_name}' cannot be resolved without target definitions."
+            )
+        agent_definition = next(
+            (
+                definition
+                for definition in agent_definitions.active_agents
+                if definition.agent_type == agent_name
+            ),
+            None,
+        )
+        if agent_definition is None:
+            raise ValueError(
+                "Cannot switch sessions because its recorded agent is unavailable: "
+                f"{agent_name} (target project: {target_cwd})."
+            )
+
+    agent_id = agent_definition.agent_type if agent_definition is not None else "main"
+    todo_key = (session_id, agent_id)
+    todo_store = (todo_stores_by_identity or {}).get(todo_key)
+    if todo_store is not None and not _todo_store_matches(
+        todo_store,
+        session_id=session_id,
+        agent_id=agent_id,
+    ):
+        raise ValueError("Target TodoStore identity does not match its session and agent")
+    return _SessionSwitchTarget(
+        cwd=target_cwd,
+        agent_name=agent_name,
+        agent_definition=agent_definition,
+        agent_definitions=agent_definitions,
+        todo_store=todo_store,
+        todo_key=todo_key,
+    )
+
+
+async def _switch_active_session(
+    scheduler_state: _SchedulerState,
+    args: Any,
+    session_id: str,
+    *,
+    interactive_prompt: Any = None,
+    clear_viewport: bool = False,
+) -> Any:
+    """Switch the owned scheduler and update common CLI/UI session state."""
+    committed_cwd: str | None = None
+    committed_previous_cwd: Path | None = None
+
+    async def prepare_target() -> _SessionSwitchTarget:
+        return await _prepare_session_switch_target(
+            scheduler_state.builder,
+            session_id,
+            todo_stores_by_identity=scheduler_state.todo_stores_by_identity,
+        )
+
+    async def prepare_commit(
+        scheduler: Any,
+        target: _SessionSwitchTarget,
+    ) -> _SessionSwitchCommit:
+        display_name = None
+        if interactive_prompt is not None and interactive_prompt.status_line:
+            try:
+                display_name = await scheduler.session.get_display_name()
+            except Exception:
+                logger.debug(
+                    "Failed to prepare display name for session switch",
+                    exc_info=True,
+                )
+        return _SessionSwitchCommit(target=target, display_name=display_name)
+
+    def commit(scheduler: Any, prepared: _SessionSwitchCommit) -> None:
+        nonlocal committed_cwd, committed_previous_cwd
+        missing = object()
+        previous_cwd = Path.cwd()
+        previous_args_session = getattr(args, "session", missing)
+        previous_args_agent = getattr(args, "agent", missing)
+        status_line = getattr(interactive_prompt, "status_line", None)
+        previous_history = getattr(interactive_prompt, "history", missing)
+        auto_suggest = getattr(interactive_prompt, "auto_suggest", None)
+        previous_auto_history = (
+            list(auto_suggest._history) if hasattr(auto_suggest, "_history") else missing
+        )
+        previous_speculative = getattr(auto_suggest, "_speculative_suggestion", missing)
+        previous_status_session = getattr(status_line, "session_id", missing)
+        previous_status_display = getattr(status_line, "_display_name", missing)
+        previous_usage_tracker = getattr(status_line, "usage_tracker", missing)
+        previous_agent_definitions = scheduler_state.agent_definitions
+        previous_selected_agent = scheduler_state.selected_agent
+        previous_target_todo = (
+            scheduler_state.todo_stores_by_identity.get(prepared.target.todo_key)
+            if prepared.target.todo_key is not None
+            else missing
+        )
+        at_completer = getattr(interactive_prompt, "at_completer", None)
+        previous_agent_names = (
+            list(getattr(at_completer, "_agent_names", [])) if at_completer is not None else missing
+        )
+        previous_file_index = (
+            getattr(at_completer, "_file_index", missing) if at_completer is not None else missing
+        )
+
+        try:
+            replacement_agent_id = (
+                prepared.target.agent_definition.agent_type
+                if prepared.target.agent_definition is not None
+                else "main"
+            )
+            if not _todo_store_matches(
+                scheduler.todo_store,
+                session_id=session_id,
+                agent_id=replacement_agent_id,
+            ):
+                raise ValueError("Replacement TodoStore identity is invalid")
+            if prepared.target.cwd is not None and prepared.target.cwd != previous_cwd:
+                os.chdir(prepared.target.cwd)
+                committed_cwd = str(prepared.target.cwd)
+                committed_previous_cwd = previous_cwd
+            if interactive_prompt is not None:
+                interactive_prompt.update_session(session_id)
+                interactive_prompt.reset_history()
+                if status_line is not None:
+                    status_line.usage_tracker = scheduler.usage_tracker
+                    if prepared.display_name is not None:
+                        status_line.update_display_name(prepared.display_name)
+                if at_completer is not None:
+                    from koder_agent.core.file_index import ProjectFileIndex
+
+                    at_completer._file_index = ProjectFileIndex(
+                        cwd=prepared.target.cwd or previous_cwd
+                    )
+                    at_completer.update_agents(
+                        [
+                            (definition.agent_type, (definition.when_to_use or "")[:60])
+                            for definition in prepared.target.agent_definitions.active_agents
+                        ]
+                    )
+            args.session = session_id
+            if hasattr(args, "agent"):
+                args.agent = prepared.target.agent_name
+            scheduler.agent_definitions = prepared.target.agent_definitions
+            scheduler_state.agent_definitions = prepared.target.agent_definitions
+            scheduler_state.selected_agent = prepared.target.agent_definition
+            if prepared.target.todo_key is not None:
+                scheduler_state.todo_stores_by_identity[prepared.target.todo_key] = (
+                    scheduler.todo_store
+                )
+        except BaseException:
+            if Path.cwd() != previous_cwd:
+                os.chdir(previous_cwd)
+            if previous_args_session is missing:
+                vars(args).pop("session", None)
+            else:
+                args.session = previous_args_session
+            if previous_args_agent is missing:
+                vars(args).pop("agent", None)
+            else:
+                args.agent = previous_args_agent
+            if interactive_prompt is not None and previous_history is not missing:
+                interactive_prompt.history = previous_history
+            if auto_suggest is not None and previous_auto_history is not missing:
+                auto_suggest._history[:] = previous_auto_history
+            if auto_suggest is not None and previous_speculative is not missing:
+                auto_suggest._speculative_suggestion = previous_speculative
+            if status_line is not None:
+                if previous_status_session is not missing:
+                    status_line.session_id = previous_status_session
+                if previous_status_display is not missing:
+                    status_line._display_name = previous_status_display
+                if previous_usage_tracker is not missing:
+                    status_line.usage_tracker = previous_usage_tracker
+            if at_completer is not None and previous_agent_names is not missing:
+                at_completer.update_agents(previous_agent_names)
+            if at_completer is not None and previous_file_index is not missing:
+                at_completer._file_index = previous_file_index
+            scheduler_state.agent_definitions = previous_agent_definitions
+            scheduler_state.selected_agent = previous_selected_agent
+            if prepared.target.todo_key is not None:
+                if previous_target_todo is missing:
+                    scheduler_state.todo_stores_by_identity.pop(prepared.target.todo_key, None)
+                else:
+                    scheduler_state.todo_stores_by_identity[prepared.target.todo_key] = (
+                        previous_target_todo
+                    )
+            committed_cwd = None
+            committed_previous_cwd = None
+            raise
+
+    def post_commit(_scheduler: Any, prepared: _SessionSwitchCommit) -> None:
+        if prepared.target.cwd is None or committed_previous_cwd is None:
+            return
+        hook_result = dispatch_command_hooks(
+            cwd=committed_previous_cwd,
+            event_name="CwdChanged",
+            match_value=None,
+            payload={
+                "event": "CwdChanged",
+                "old_cwd": str(committed_previous_cwd),
+                "cwd": str(prepared.target.cwd),
+            },
+        )
+        update_watch_paths(
+            _resolve_hook_watch_paths(
+                hook_result.watch_paths,
+                base_dir=committed_previous_cwd,
+            )
+        )
+
+    scheduler = await scheduler_state.switch(
+        session_id,
+        prepare_target=prepare_target,
+        prepare_commit=prepare_commit,
+        commit=commit,
+        post_commit=post_commit,
+    )
+
+    if interactive_prompt is not None:
+        try:
+            if clear_viewport:
+                _clear_interactive_viewport()
+            if committed_cwd:
+                print_reflowable(
+                    console,
+                    f"[dim]Working directory restored: {committed_cwd}[/dim]",
+                )
+        except Exception:
+            logger.debug("Failed to render committed session switch", exc_info=True)
+
+    return scheduler
 
 
 def _clear_interactive_viewport() -> None:
@@ -397,6 +1156,9 @@ async def _print_json_output(
     return 0
 
 
+AUTO_DREAM_SHUTDOWN_TIMEOUT_SECONDS = 30
+
+
 async def run_harness_session_flow(
     *,
     first_arg: Optional[str],
@@ -425,9 +1187,6 @@ async def run_harness_session_flow(
         "completion",
         "upgrade",
     }
-    # Subcommands that must not require model/client setup (offline/diagnostic).
-    is_offline_subcommand = first_arg in {"config", "doctor", "completion", "upgrade"}
-
     if not is_subcommand:
         from koder_agent.utils import setup_openai_client
 
@@ -439,6 +1198,15 @@ async def run_harness_session_flow(
 
     config_manager = get_config_manager()
     config = get_config() if not is_config_command else None
+    try:
+        from koder_agent.harness.memory.auto_dream import (
+            default_auto_dream_task_storage,
+            reconcile_stale_auto_dream_tasks,
+        )
+
+        reconcile_stale_auto_dream_tasks(default_auto_dream_task_storage())
+    except Exception:
+        logger.debug("AutoDream startup reconciliation failed", exc_info=True)
 
     from koder_agent.cli import _build_cli_parser
 
@@ -612,17 +1380,45 @@ async def run_harness_session_flow(
             or default_session_local_ms()
         )
 
-    await EnhancedSQLiteSession.record_session_cwd(args.session, os.getcwd())
+    startup_cwd = Path.cwd().resolve()
+    startup_probe = EnhancedSQLiteSession(session_id=args.session)
+    try:
+        recorded_cwd = await startup_probe.get_cwd()
+        get_agent = getattr(startup_probe, "get_agent", None)
+        if callable(get_agent):
+            recorded_agent_name = await get_agent()
+        else:
+            get_session_agent = getattr(EnhancedSQLiteSession, "get_session_agent", None)
+            recorded_agent_name = (
+                await get_session_agent(args.session) if callable(get_session_agent) else None
+            )
+    finally:
+        await _close_session_probe(startup_probe)
+
+    target_cwd = startup_cwd
+    if recorded_cwd:
+        recorded_path = Path(recorded_cwd).expanduser()
+        if not recorded_path.is_absolute() or not recorded_path.is_dir():
+            console.print(
+                Panel(
+                    f"Cannot resume session because its recorded directory is unavailable: "
+                    f"{recorded_cwd}",
+                    title="Error",
+                    border_style="red",
+                )
+            )
+            return 1
+        target_cwd = recorded_path.resolve()
 
     selected_agent_name = getattr(args, "agent", None)
-    if not selected_agent_name and getattr(args, "session", None):
-        selected_agent_name = await EnhancedSQLiteSession.get_session_agent(args.session)
     if not selected_agent_name:
-        selected_agent_name = get_configured_agent_name(os.getcwd())
+        selected_agent_name = recorded_agent_name
+    if not selected_agent_name:
+        selected_agent_name = get_configured_agent_name(str(target_cwd))
 
     selected_agent = None
     agent_definitions = get_agent_definitions(
-        cwd=Path(os.getcwd()),
+        cwd=target_cwd,
         plugin_root=effective_plugin_root,
         cli_agents_json=cli_agents_json,
     )
@@ -644,7 +1440,16 @@ async def run_harness_session_flow(
                 )
             )
             return 1
+
+    if target_cwd != startup_cwd:
+        _change_working_directory(target_cwd)
+    if selected_agent_name:
         await EnhancedSQLiteSession.record_session_agent(args.session, selected_agent_name)
+
+    # Metadata is updated only after the target project and recorded agent have
+    # both resolved successfully.  A failed resume therefore cannot rewrite
+    # the saved cwd to the directory from which Koder was invoked.
+    await EnhancedSQLiteSession.record_session_cwd(args.session, os.getcwd())
 
     # --- Channel setup ---
     from koder_agent.harness.channels.state import (
@@ -770,115 +1575,128 @@ async def run_harness_session_flow(
         interactive_stdin = sys.stdin.isatty()
     except Exception:
         interactive_stdin = False
-    tool_approver = build_interactive_approver() if interactive_stdin else None
 
-    scheduler = AgentScheduler(
-        session_id=args.session,
+    def _wire_interactive_approver(active_scheduler) -> None:
+        if not interactive_stdin:
+            return
+        queued_input = getattr(active_scheduler, "queued_input", None)
+        approval_broker = getattr(queued_input, "approval_broker", None)
+        active_scheduler.approver = build_interactive_approver(approval_broker=approval_broker)
+
+    scheduler_builder = _SchedulerBuilder(
+        scheduler_type=AgentScheduler,
         streaming=streaming,
         agent_definition=selected_agent,
         instructions_override=system_prompt_override,
         instructions_append=system_prompt_append,
         permission_service=permission_service,
-        approver=tool_approver,
+        approver=None,
+        agent_definitions=agent_definitions,
+        plugin_root=effective_plugin_root,
+        cli_agents_json=cli_agents_json,
+        wire_approver=_wire_interactive_approver,
     )
-    scheduler.agent_definitions = agent_definitions
+    scheduler_state = _SchedulerState.create(scheduler_builder, args.session)
+    scheduler = scheduler_state.scheduler
+    cleanup_owner = _SessionCleanupOwner(
+        scheduler_state,
+        bare_mode=bare_mode,
+        previous_simple=previous_simple,
+    )
 
     # Wire channel messages into scheduler if channels are active.
     # The router is created eagerly here so the callback is ready BEFORE
     # load_mcp_servers() runs (which happens lazily on first agent call).
     # load_mcp_servers() will pick up the existing router from the handler.
-    _channel_task = None
-    _cron_prompt_runner = None
-    if channel_entries:
-        import asyncio
-
-        from koder_agent.harness.channels.notification import (
-            ChannelNotificationRouter,
-            wrap_channel_message,
-        )
-        from koder_agent.mcp.notifications import get_notification_handler
-
-        _notif_handler = get_notification_handler()
-        if _notif_handler.channel_router is None:
-            _notif_handler.set_channel_router(ChannelNotificationRouter())
-
-        _channel_queue: asyncio.Queue[str] = asyncio.Queue()
-
-        async def _on_channel_msg(server_name: str, content: str, meta: dict | None) -> None:
-            wrapped = wrap_channel_message(server_name, content, meta)
-            await _channel_queue.put(wrapped)
-            logging.getLogger(__name__).info(
-                "Channel message queued from '%s' (%d bytes)", server_name, len(wrapped)
-            )
-
-        _notif_handler.channel_router.on_channel_message(_on_channel_msg)
-
-        async def _channel_consumer() -> None:
-            """Background task that drains channel messages into the scheduler."""
-            while True:
-                try:
-                    msg = await _channel_queue.get()
-                    logging.getLogger(__name__).info("Processing channel message...")
-                    await scheduler.handle(msg)
-                except asyncio.CancelledError:
-                    break
-                except Exception as exc:
-                    logging.getLogger(__name__).error("Channel message error: %s", exc)
-
-        # Bootstrap MCP servers eagerly so channels start receiving
-        # immediately — don't wait for the first user prompt.
-        await scheduler._ensure_agent_initialized()
-
-        _channel_task = asyncio.create_task(_channel_consumer())
-
-    if getattr(args, "name", None):
-        await scheduler.session.set_title(args.name)
-    command_handler = HarnessInteractiveCommandHandler(
-        cli_agents_json=cli_agents_json,
-        plugin_root=effective_plugin_root,
-        teammate_mode=getattr(args, "teammate_mode", None),
-        emit_console=getattr(args, "output_format", "text") == "text",
-        permission_service=permission_service,
-    )
-    if not bare_mode:
-        session_start_source = "resume" if resume_value else "startup"
-        session_start_result = dispatch_command_hooks(
-            cwd=Path.cwd(),
-            event_name="SessionStart",
-            match_value=session_start_source,
-            payload={
-                "event": "SessionStart",
-                "source": session_start_source,
-                "session_id": args.session,
-            },
-        )
-        if session_start_result.blocked:
-            console.print(
-                Panel(
-                    session_start_result.block_reason or "Blocked by SessionStart hook.",
-                    title="Error",
-                    border_style="red",
-                )
-            )
-            return 1
-        update_watch_paths(session_start_result.watch_paths)
-    existing_session_items = await scheduler.session.get_items()
-    initial_agent_prompt = (
-        selected_agent.initial_prompt.strip()
-        if selected_agent is not None
-        and selected_agent.initial_prompt
-        and not existing_session_items
-        else None
-    )
-    skip_exit_auto_dream = False
-
     try:
+        if channel_entries:
+            from koder_agent.harness.channels.notification import (
+                ChannelNotificationRouter,
+                wrap_channel_message,
+            )
+            from koder_agent.mcp.notifications import get_notification_handler
+
+            _notif_handler = get_notification_handler()
+            if _notif_handler.channel_router is None:
+                _notif_handler.set_channel_router(ChannelNotificationRouter())
+
+            _channel_queue: asyncio.Queue[str] = asyncio.Queue()
+
+            async def _on_channel_msg(server_name: str, content: str, meta: dict | None) -> None:
+                wrapped = wrap_channel_message(server_name, content, meta)
+                await _channel_queue.put(wrapped)
+                logging.getLogger(__name__).info(
+                    "Channel message queued from '%s' (%d bytes)", server_name, len(wrapped)
+                )
+
+            cleanup_owner.unregister_channel_callback = (
+                _notif_handler.channel_router.on_channel_message(_on_channel_msg)
+            )
+
+            async def _channel_consumer() -> None:
+                """Background task that drains channel messages into the active scheduler."""
+                while True:
+                    try:
+                        msg = await _channel_queue.get()
+                        logging.getLogger(__name__).info("Processing channel message...")
+                        await scheduler_state.dispatch_handle(msg)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as exc:
+                        logging.getLogger(__name__).error("Channel message error: %s", exc)
+
+            # Bootstrap MCP servers eagerly so channels start receiving
+            # immediately — don't wait for the first user prompt.
+            await scheduler._ensure_agent_initialized()
+
+            cleanup_owner.channel_task = asyncio.create_task(_channel_consumer())
+
+        if getattr(args, "name", None):
+            await scheduler.session.set_title(args.name)
+        command_handler = HarnessInteractiveCommandHandler(
+            cli_agents_json=cli_agents_json,
+            plugin_root=effective_plugin_root,
+            teammate_mode=getattr(args, "teammate_mode", None),
+            emit_console=getattr(args, "output_format", "text") == "text",
+            permission_service=permission_service,
+            mcp_owner_provider=lambda: getattr(scheduler_state.scheduler, "_mcp_servers", None),
+        )
+        if not bare_mode:
+            session_start_source = "resume" if resume_value else "startup"
+            session_start_result = dispatch_command_hooks(
+                cwd=Path.cwd(),
+                event_name="SessionStart",
+                match_value=session_start_source,
+                payload={
+                    "event": "SessionStart",
+                    "source": session_start_source,
+                    "session_id": scheduler_state.session_id,
+                },
+            )
+            if session_start_result.blocked:
+                console.print(
+                    Panel(
+                        session_start_result.block_reason or "Blocked by SessionStart hook.",
+                        title="Error",
+                        border_style="red",
+                    )
+                )
+                return 1
+            update_watch_paths(session_start_result.watch_paths)
+        existing_session_items = await scheduler.session.get_items()
+        initial_agent_prompt = (
+            scheduler_state.selected_agent.initial_prompt.strip()
+            if scheduler_state.selected_agent is not None
+            and scheduler_state.selected_agent.initial_prompt
+            and not existing_session_items
+            else None
+        )
 
         async def _run_explicit_agent(agent_name: str, agent_prompt: str) -> str:
             agent = next(
                 (
                     candidate
-                    for candidate in agent_definitions.active_agents
+                    for candidate in scheduler_state.agent_definitions.active_agents
                     if candidate.agent_type == agent_name
                 ),
                 None,
@@ -913,7 +1731,8 @@ async def run_harness_session_flow(
 
         file_index = ProjectFileIndex(cwd=Path.cwd())
         agent_list = [
-            (a.agent_type, (a.when_to_use or "")[:60]) for a in agent_definitions.active_agents
+            (a.agent_type, (a.when_to_use or "")[:60])
+            for a in scheduler_state.agent_definitions.active_agents
         ]
         interactive_prompt = InteractivePrompt(
             commands_dict,
@@ -997,12 +1816,12 @@ async def run_harness_session_flow(
             prompt = _build_prompt_text(prompt_text=prompt_text, stdin_text=stdin_text)
         if initial_agent_prompt:
             if command_handler.is_slash_command(initial_agent_prompt):
-                await command_handler.handle_slash_input(initial_agent_prompt, scheduler)
+                await command_handler.handle_slash_input(initial_agent_prompt, scheduler_state)
             else:
                 seeded_prompt = initial_agent_prompt
                 if context:
                     seeded_prompt = f"Context:\n{context}\n\nUser request: {seeded_prompt}"
-                await scheduler.handle(
+                await scheduler_state.dispatch_handle(
                     seeded_prompt,
                     render_output=getattr(args, "output_format", "text") == "text",
                 )
@@ -1030,13 +1849,31 @@ async def run_harness_session_flow(
                         )
                     )
                     return 1
-                slash_response = await command_handler.handle_slash_input(prompt, scheduler)
+                slash_response = await command_handler.handle_slash_input(prompt, scheduler_state)
                 if slash_response:
                     if slash_response == "__EXIT__":
                         return 0
                     session_switch = _parse_session_switch(slash_response)
                     if session_switch:
                         new_session_id, _clear_viewport = session_switch
+                        try:
+                            scheduler = await _switch_active_session(
+                                scheduler_state,
+                                args,
+                                new_session_id,
+                            )
+                        except ValueError as exc:
+                            if getattr(args, "output_format", "text") in {"json", "stream-json"}:
+                                return await _print_json_output(
+                                    scheduler=scheduler,
+                                    result=str(exc),
+                                    output_format=getattr(args, "output_format", "text"),
+                                )
+                            print_reflowable(
+                                console,
+                                Panel(str(exc), title="Error", border_style="red"),
+                            )
+                            return 1
                         if getattr(args, "output_format", "text") in {"json", "stream-json"}:
                             return await _print_json_output(
                                 scheduler=scheduler,
@@ -1125,7 +1962,7 @@ async def run_harness_session_flow(
                             scheduler=scheduler,
                             messages=stream_json_messages,
                         )
-                    response = await scheduler.handle_stream_json(
+                    response = await scheduler_state.dispatch_stream_json(
                         prompt,
                         on_event=_write_json_line,
                         include_partial_messages=getattr(args, "include_partial_messages", False),
@@ -1140,7 +1977,8 @@ async def run_harness_session_flow(
                             prompt,
                             cwd=Path.cwd(),
                             active_agent_names={
-                                a.agent_type for a in agent_definitions.active_agents
+                                a.agent_type
+                                for a in scheduler_state.agent_definitions.active_agents
                             },
                             mcp_servers=getattr(scheduler, "_mcp_servers", []),
                         )
@@ -1177,7 +2015,7 @@ async def run_harness_session_flow(
                             # the plain text (leave the plain-text path intact).
                             if isinstance(built, list):
                                 multimodal_input = built
-                        response = await scheduler.handle(
+                        response = await scheduler_state.dispatch_handle(
                             prompt,
                             render_output=getattr(args, "output_format", "text") == "text",
                             multimodal_input=multimodal_input,
@@ -1215,6 +2053,8 @@ async def run_harness_session_flow(
             # so autocomplete has resources from the start.
             try:
                 await scheduler._ensure_agent_initialized()
+                commands_dict.clear()
+                commands_dict.update(command_handler.get_command_list())
                 if scheduler._mcp_servers and interactive_prompt.at_completer is not None:
                     from koder_agent.mcp import discover_mcp_resources
 
@@ -1228,14 +2068,15 @@ async def run_harness_session_flow(
             from koder_agent.harness.pr_status import PrStatusPoller
 
             _pr_poller = PrStatusPoller()
+            cleanup_owner.pr_poller = _pr_poller
             if interactive_prompt.status_line is not None:
                 interactive_prompt.status_line.pr_poller = _pr_poller
             _pr_poller.start()
 
             from koder_agent.harness.cron.runtime import CronPromptRunner
 
-            _cron_prompt_runner = CronPromptRunner(lambda: scheduler)
-            _cron_prompt_runner.start()
+            cleanup_owner.cron_prompt_runner = CronPromptRunner(scheduler_state.dispatch_handle)
+            cleanup_owner.cron_prompt_runner.start()
 
             if args.debug:
                 print_reflowable(
@@ -1273,7 +2114,7 @@ async def run_harness_session_flow(
                 except EOFError:
                     break
                 except KeyboardInterrupt:
-                    skip_exit_auto_dream = True
+                    cleanup_owner.skip_auto_dream = True
                     break
                 _pr_poller.touch()
                 poll_file_change_hooks(Path.cwd())
@@ -1298,7 +2139,7 @@ async def run_harness_session_flow(
                         if cmd_name and hasattr(interactive_prompt, "usage_tracker_skills"):
                             interactive_prompt.usage_tracker_skills.record(cmd_name)
                         slash_response = await command_handler.handle_slash_input(
-                            user_input, scheduler
+                            user_input, scheduler_state
                         )
                         if slash_response:
                             if slash_response == "__EXIT__":
@@ -1306,37 +2147,20 @@ async def run_harness_session_flow(
                             session_switch = _parse_session_switch(slash_response)
                             if session_switch:
                                 new_session_id, clear_viewport = session_switch
-                                await scheduler.cleanup()
-                                restored_cwd = await restore_session_cwd(new_session_id)
-                                if restored_cwd:
+                                try:
+                                    scheduler = await _switch_active_session(
+                                        scheduler_state,
+                                        args,
+                                        new_session_id,
+                                        interactive_prompt=interactive_prompt,
+                                        clear_viewport=clear_viewport,
+                                    )
+                                except ValueError as exc:
                                     print_reflowable(
                                         console,
-                                        f"[dim]Working directory restored: {restored_cwd}[/dim]",
+                                        Panel(str(exc), title="Error", border_style="red"),
                                     )
-                                scheduler = AgentScheduler(
-                                    session_id=new_session_id,
-                                    streaming=streaming,
-                                    permission_service=permission_service,
-                                    approver=tool_approver,
-                                )
-                                interactive_prompt.update_session(new_session_id)
-                                interactive_prompt.reset_history()
-                                if interactive_prompt.status_line:
-                                    interactive_prompt.status_line.usage_tracker = (
-                                        scheduler.usage_tracker
-                                    )
-                                    try:
-                                        display_name = await scheduler.session.get_display_name()
-                                        interactive_prompt.status_line.update_display_name(
-                                            display_name
-                                        )
-                                    except Exception:
-                                        logger.debug(
-                                            "Failed to update display name after session switch",
-                                            exc_info=True,
-                                        )
-                                if clear_viewport:
-                                    _clear_interactive_viewport()
+                                    continue
                                 print_reflowable(
                                     console,
                                     f"[dim]Switched to session: {new_session_id}[/dim]",
@@ -1423,7 +2247,8 @@ async def run_harness_session_flow(
                                     user_input,
                                     cwd=Path.cwd(),
                                     active_agent_names={
-                                        a.agent_type for a in agent_definitions.active_agents
+                                        a.agent_type
+                                        for a in scheduler_state.agent_definitions.active_agents
                                     },
                                     mcp_servers=getattr(scheduler, "_mcp_servers", []),
                                 )
@@ -1433,12 +2258,14 @@ async def run_harness_session_flow(
                                     async with interactive_prompt.capture_queued_input(
                                         scheduler.queued_input
                                     ) as streaming_ui:
-                                        response = await scheduler.handle(
+                                        response = await scheduler_state.dispatch_handle(
                                             processed_input,
                                             streaming_ui=streaming_ui,
                                         )
                                 else:
-                                    response = await scheduler.handle(processed_input)
+                                    response = await scheduler_state.dispatch_handle(
+                                        processed_input
+                                    )
                                 # Mark response complete, show tip, send notification if long-running
                                 interactive_prompt.mark_response_complete(
                                     show_tip=True,
@@ -1493,87 +2320,6 @@ async def run_harness_session_flow(
                                 )
                             scheduler._title_generation_task = None
     finally:
-        # Stop PR status poller if it was started.
-        if "_pr_poller" in locals():
-            _pr_poller.stop()
-        if _channel_task is not None:
-            _channel_task.cancel()
-            results = await asyncio.gather(_channel_task, return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException) and not isinstance(
-                    result, asyncio.CancelledError
-                ):
-                    logger.debug(
-                        "Channel task cancellation failed",
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
-        if _cron_prompt_runner is not None:
-            try:
-                await _cron_prompt_runner.stop()
-            except Exception:
-                logger.debug("Cron prompt runner shutdown failed", exc_info=True)
-        try:
-            dispatch_command_hooks(
-                cwd=Path.cwd(),
-                event_name="SessionEnd",
-                match_value="other",
-                payload={
-                    "event": "SessionEnd",
-                    "reason": "other",
-                    "session_id": args.session if "args" in locals() else None,
-                },
-            )
-        except Exception:
-            logger.debug("SessionEnd hook dispatch failed", exc_info=True)
-        # Record session for AutoDream memory consolidation
-        dream_manager = None
-        try:
-            import asyncio
-
-            from koder_agent.harness.memory.auto_dream import (
-                AutoDreamManager,
-                default_auto_dream_task_storage,
-                run_auto_dream_from_messages,
-            )
-
-            dream_state_path = Path.home() / ".koder" / "auto_dream_state.json"
-            dream_manager = AutoDreamManager(state_path=dream_state_path)
-            dream_manager.record_session()
-            if skip_exit_auto_dream:
-                dream_manager.save()
-            elif dream_manager.should_dream() and "scheduler" in locals():
-                _logger = logging.getLogger(__name__)
-                result = await asyncio.wait_for(
-                    run_auto_dream_from_messages(
-                        await scheduler.session.get_items(),
-                        manager=dream_manager,
-                        task_storage=default_auto_dream_task_storage(),
-                    ),
-                    timeout=30,
-                )
-                _logger.info(
-                    "AutoDream completed: memories=%d saved=%s errors=%d",
-                    result.memories_written,
-                    str(result.saved_path) if result.saved_path else "none",
-                    len(result.errors),
-                )
-            else:
-                dream_manager.save()
-        except Exception:
-            logger.debug("AutoDream memory consolidation failed", exc_info=True)
-            if dream_manager is not None:
-                try:
-                    dream_manager.save()
-                except Exception:
-                    logger.debug("Failed to save dream manager state", exc_info=True)
-        try:
-            await scheduler.cleanup()
-        except Exception:
-            logger.debug("Scheduler cleanup failed", exc_info=True)
-        if bare_mode:
-            if previous_simple is None:
-                os.environ.pop("KODER_SIMPLE", None)
-            else:
-                os.environ["KODER_SIMPLE"] = previous_simple
+        await cleanup_owner.finish()
 
     return 0

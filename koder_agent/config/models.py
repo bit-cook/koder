@@ -23,11 +23,27 @@ class ModelConfig(BaseModel):
     )
     api_key: Optional[str] = Field(default=None, description="API key for the provider")
     base_url: Optional[str] = Field(default=None, description="Custom base URL")
+    context_window: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Authoritative context window override for custom/unknown main models. "
+            "Env: KODER_CONTEXT_WINDOW"
+        ),
+    )
 
     # Small model for auxiliary calls (title generation, compaction, etc.)
     small_model: Optional[str] = Field(
         default=None,
         description="Small/cheap model for auxiliary LLM calls (title gen, compaction). Env: KODER_SMALL_MODEL",
+    )
+    small_model_context_window: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Authoritative context window override for the auxiliary small model. "
+            "Env: KODER_SMALL_MODEL_CONTEXT_WINDOW"
+        ),
     )
 
     # Azure-specific settings

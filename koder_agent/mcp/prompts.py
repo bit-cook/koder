@@ -55,8 +55,13 @@ class MCPPromptRegistry:
     def __init__(self):
         self._prompts: dict[str, MCPPrompt] = {}
 
-    def register(self, prompt: MCPPrompt) -> None:
-        self._prompts[prompt.command_name] = prompt
+    def register(self, prompt: MCPPrompt) -> bool:
+        """Register *prompt*, keeping the first deterministic collision winner."""
+        command_name = prompt.command_name
+        if command_name in self._prompts:
+            return False
+        self._prompts[command_name] = prompt
+        return True
 
     def get(self, command_name: str) -> MCPPrompt | None:
         return self._prompts.get(command_name)
@@ -81,8 +86,10 @@ class MCPPromptRegistry:
 _registry = MCPPromptRegistry()
 
 
-def get_prompt_registry() -> MCPPromptRegistry:
-    return _registry
+def get_prompt_registry(owner: object | None = None) -> MCPPromptRegistry:
+    """Return an owner's prompt registry, or the legacy standalone registry."""
+    registry = getattr(owner, "prompt_registry", None)
+    return registry if isinstance(registry, MCPPromptRegistry) else _registry
 
 
 def _parse_prompt_arguments(prompt: MCPPrompt, raw_args: list[str]) -> dict[str, str]:
@@ -113,22 +120,43 @@ def _parse_prompt_arguments(prompt: MCPPrompt, raw_args: list[str]) -> dict[str,
     return arguments
 
 
-def _find_server_session(server_name: str, mcp_servers: List[MCPServer]) -> object | None:
-    """Find the MCP ClientSession for *server_name* among live servers."""
+def _raw_server_name(server: MCPServer) -> str:
+    name = getattr(server, "name", "")
+    if not name:
+        # MCPServerStdio stores the name in params.
+        params = getattr(server, "params", None)
+        if params is not None:
+            name = getattr(params, "name", "")
+    return str(name) if name else ""
+
+
+def _find_server(server_name: str, mcp_servers: List[MCPServer]) -> object | None:
+    """Find one unambiguous stable server handle, preferring its exact raw name."""
+    named_servers = [(name, server) for server in mcp_servers if (name := _raw_server_name(server))]
+
+    exact_matches = [server for name, server in named_servers if name == server_name]
+    if exact_matches:
+        if len(exact_matches) != 1:
+            return None
+        return exact_matches[0]
+
     normalized = normalize_mcp_name(server_name)
-    for server in mcp_servers:
-        name = getattr(server, "name", "")
-        if not name:
-            # MCPServerStdio stores the name in params
-            params = getattr(server, "params", None)
-            if params is not None:
-                name = getattr(params, "name", "")
-        # Try matching either the raw name or the normalized form
-        if normalize_mcp_name(name) == normalized or name == server_name:
-            session = getattr(server, "session", None)
-            if session is not None:
-                return session
-    return None
+    normalized_matches = [
+        server for name, server in named_servers if normalize_mcp_name(name) == normalized
+    ]
+    if len(normalized_matches) != 1:
+        return None
+    return normalized_matches[0]
+
+
+def _find_server_session(server_name: str, mcp_servers: List[MCPServer]) -> object | None:
+    """Compatibility helper returning the authorized session for *server_name*."""
+    server = _find_server(server_name, mcp_servers)
+    if server is None:
+        return None
+    from .runtime_authorization import get_authorized_session
+
+    return get_authorized_session(server)
 
 
 async def execute_prompt(
@@ -144,14 +172,29 @@ async def execute_prompt(
 
     Raises :class:`RuntimeError` on failure.
     """
-    session = _find_server_session(prompt.server_name, mcp_servers)
-    if session is None:
+    server = _find_server(prompt.server_name, mcp_servers)
+    if server is None:
+        raise RuntimeError(f"No active session found for MCP server '{prompt.server_name}'")
+    has_server_method = callable(getattr(type(server), "get_prompt", None))
+    if not has_server_method and _find_server_session(prompt.server_name, mcp_servers) is None:
         raise RuntimeError(f"No active session found for MCP server '{prompt.server_name}'")
 
     arguments = _parse_prompt_arguments(prompt, raw_args) or None
 
     try:
-        result = await session.get_prompt(prompt.prompt_name, arguments=arguments)
+        from .runtime_authorization import (
+            MCPAuthorizationError,
+            call_authorized_server_method,
+        )
+
+        result = await call_authorized_server_method(
+            server,
+            "get_prompt",
+            prompt.prompt_name,
+            arguments=arguments,
+        )
+    except MCPAuthorizationError as exc:
+        raise RuntimeError(str(exc)) from exc
     except Exception as exc:
         raise RuntimeError(
             f"Failed to get prompt '{prompt.prompt_name}' from server '{prompt.server_name}': {exc}"

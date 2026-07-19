@@ -66,7 +66,7 @@ _koder_completion() {{
             return 0
             ;;
         mcp)
-            COMPREPLY=( $(compgen -W "add add-json list get remove reset-project-choices serve" -- "$cur") )
+            COMPREPLY=( $(compgen -W "add add-json list get remove approve reset-project-choices serve" -- "$cur") )
             return 0
             ;;
         plugin|plugins)
@@ -103,7 +103,7 @@ _koder() {{
             compadd show list path edit init set validate export import
             ;;
         mcp)
-            compadd add add-json list get remove reset-project-choices serve
+            compadd add add-json list get remove approve reset-project-choices serve
             ;;
         plugin|plugins)
             compadd list install uninstall enable disable validate marketplace
@@ -127,7 +127,7 @@ complete -c koder -f
 complete -c koder -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
 complete -c koder -n '__fish_seen_subcommand_from auth' -a 'login list revoke status'
 complete -c koder -n '__fish_seen_subcommand_from config' -a 'show list path edit init set validate export import'
-complete -c koder -n '__fish_seen_subcommand_from mcp' -a 'add add-json list get remove reset-project-choices serve'
+complete -c koder -n '__fish_seen_subcommand_from mcp' -a 'add add-json list get remove approve reset-project-choices serve'
 complete -c koder -n '__fish_seen_subcommand_from plugin plugins' -a 'list install uninstall enable disable validate marketplace'
 """
 

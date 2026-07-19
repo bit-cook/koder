@@ -8,6 +8,10 @@ from pathlib import Path
 from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
 from koder_agent.harness.plugins.manifest import find_manifest, parse_manifest
 from koder_agent.harness.plugins.marketplace import MarketplaceStore
+from koder_agent.harness.plugins.path_safety import (
+    PluginPathError,
+    open_plugin_component,
+)
 from koder_agent.harness.plugins.registry import PluginRegistry
 
 
@@ -156,17 +160,28 @@ def _handle_validate(plugin_dir: Path) -> int:
         return 1
 
     component_checks = [
-        ("skills", manifest.skills),
-        ("agents", manifest.agents),
-        ("hooks", manifest.hooks),
-        ("mcpServers", manifest.mcp_servers),
+        ("skills", manifest.skills, "directory"),
+        ("agents", manifest.agents, "directory"),
+        ("hooks", manifest.hooks, "file"),
+        ("mcpServers", manifest.mcp_servers, "file"),
     ]
     has_component_warning = False
-    for field_name, path_val in component_checks:
+    for field_name, path_val, expect in component_checks:
         if path_val is None:
             continue
-        full_path = plugin_dir / path_val
-        if not full_path.exists():
+        try:
+            with open_plugin_component(
+                plugin_dir,
+                path_val,
+                default=path_val,
+                field_name=field_name,
+                expect=expect,
+            ) as full_path:
+                missing = full_path is None
+        except PluginPathError as exc:
+            print(f"  Error: unsafe declared {field_name} path '{path_val}': {exc}")
+            return 1
+        if missing:
             print(f"  Warning: declared {field_name} path '{path_val}' does not exist")
             has_component_warning = True
 

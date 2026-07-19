@@ -18,6 +18,7 @@ project_root = Path(__file__).resolve().parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from koder_agent.harness.permissions.modes import PermissionMode
 from koder_agent.harness.permissions.service import PermissionService
 from koder_agent.harness.sandbox.registry import get_backend_status
 from koder_agent.harness.tools.registry import ToolRegistry
@@ -55,11 +56,14 @@ def test_shell_tool_sandbox_returns_error_before_execution(tmp_path, monkeypatch
 
     result = asyncio.run(registry.get("run_shell").invoke({"command": "touch foo.txt"}))
 
-    assert result["status"] == "error"
-    assert "configured backend is unavailable" in result["content"]
+    assert result["status"] == "approval_required"
+    assert "sandbox backend is unavailable" in result["permission"]["reason"]
+    assert "second explicit approval" in result["permission"]["reason"]
 
 
-def test_shell_tool_runs_mutating_command_in_real_sandbox(tmp_path, monkeypatch):
+def test_shell_tool_without_degradation_approver_fails_closed_in_real_sandbox(
+    tmp_path, monkeypatch
+):
     status = get_backend_status("unix-local")
     if not status.available:
         pytest.skip(status.reason)
@@ -72,6 +76,7 @@ def test_shell_tool_runs_mutating_command_in_real_sandbox(tmp_path, monkeypatch)
                 "sandbox": {
                     "enabled": True,
                     "backend": "unix-local",
+                    "networkAccess": True,
                 }
             }
         ),
@@ -79,15 +84,17 @@ def test_shell_tool_runs_mutating_command_in_real_sandbox(tmp_path, monkeypatch)
     )
     monkeypatch.chdir(project)
 
-    registry = ToolRegistry.with_permission_service(PermissionService.default())
+    registry = ToolRegistry.with_permission_service(
+        PermissionService.default(mode=PermissionMode.BYPASS)
+    )
     registry.register_module("shell")
 
     result = asyncio.run(registry.get("run_shell").invoke({"command": "touch sandboxed.txt"}))
 
-    assert result["status"] == "success"
-    assert "sandboxed: true" in result["content"]
-    assert "backend: unix-local" in result["content"]
-    assert (project / "sandboxed.txt").exists()
+    assert result["status"] == "error"
+    assert "executed: false" in str(result["content"])
+    assert "explicit sandbox degradation approval required" in str(result["content"])
+    assert not (project / "sandboxed.txt").exists()
 
 
 def test_shell_tool_reports_argument_error_for_missing_command():

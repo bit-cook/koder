@@ -7,11 +7,12 @@ from .agent import (
     # create_planner_agent,
 )
 from .approval_hooks import ApprovalHooks
-from .hooks import ToolDisplayHooks, get_display_hooks
+from .hooks import ToolDisplayHooks, get_display_hooks, get_subagent_display_hooks
 
 __all__ = [
     "ToolDisplayHooks",
     "get_display_hooks",
+    "get_subagent_display_hooks",
     "ApprovalHooks",
     # "create_planner_agent",
     "create_dev_agent",

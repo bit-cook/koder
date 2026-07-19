@@ -18,7 +18,9 @@ from koder_agent.harness.paths import (
     user_agent_memory_dir,
     user_agents_dir,
 )
-from koder_agent.mcp.server_config import MCPServerConfig, MCPServerType
+from koder_agent.harness.permissions.modes import FILE_WRITE_TOOLS
+from koder_agent.mcp.server_config import MCPServerConfig, MCPServerScope, MCPServerType
+from koder_agent.mcp.server_manager import MCPServerManager
 
 AgentSource = Literal[
     "built-in",
@@ -48,6 +50,9 @@ class AgentDefinition:
     source: AgentSource
     filename: str | None = None
     base_dir: str | None = None
+    source_path: str | None = None
+    project_root: str | None = None
+    execution_cwd: str | None = None
     plugin: str | None = None
     tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
@@ -353,7 +358,25 @@ def parse_agent_markdown_file(
     base_dir: Path,
     source: AgentSource,
     plugin_name: str | None = None,
+    project_root: str | Path | None = None,
+    execution_cwd: str | Path | None = None,
 ) -> AgentDefinition | None:
+    resolved_project_root = None
+    resolved_execution_cwd = None
+    if source == "projectSettings":
+        project_root_path = (
+            Path(project_root).expanduser().resolve(strict=True)
+            if project_root is not None
+            else MCPServerManager.project_boundary(base_dir)
+        )
+        execution_cwd_path = (
+            Path(execution_cwd).expanduser().resolve(strict=True)
+            if execution_cwd is not None
+            else project_root_path
+        )
+        file_path = MCPServerManager.validate_project_source_path(file_path, project_root_path)
+        resolved_project_root = str(project_root_path)
+        resolved_execution_cwd = str(execution_cwd_path)
     raw = file_path.read_text(encoding="utf-8")
     frontmatter, body = _parse_frontmatter(raw)
     agent_name = frontmatter.get("name")
@@ -385,6 +408,9 @@ def parse_agent_markdown_file(
         source=source,
         filename=file_path.stem,
         base_dir=str(base_dir),
+        source_path=str(file_path.resolve()),
+        project_root=resolved_project_root,
+        execution_cwd=resolved_execution_cwd,
         plugin=plugin_name,
         **values,
     )
@@ -490,9 +516,13 @@ def resolve_agent_mcp_server_configs(agent_definition: AgentDefinition) -> list[
                 env_vars=server.get("env_vars") or {},
                 url=server.get("url"),
                 headers=server.get("headers") or {},
+                headers_helper=server.get("headers_helper"),
+                oauth=server.get("oauth"),
                 cache_tools_list=bool(server.get("cache_tools_list", False)),
                 allowed_tools=server.get("allowed_tools"),
                 blocked_tools=server.get("blocked_tools"),
+                scope=MCPServerScope.USER,
+                source_path=str(config_path),
             )
             for server in raw_servers
             if isinstance(server, dict) and "name" in server and "transport_type" in server
@@ -500,6 +530,7 @@ def resolve_agent_mcp_server_configs(agent_definition: AgentDefinition) -> list[
     except Exception:
         existing = {}
 
+    inline_mappings: dict[str, dict[str, Any]] = {}
     for spec in agent_definition.mcp_servers:
         if isinstance(spec, str):
             config = existing.get(spec)
@@ -510,6 +541,9 @@ def resolve_agent_mcp_server_configs(agent_definition: AgentDefinition) -> list[
             continue
         for name, value in spec.items():
             if not isinstance(value, dict):
+                continue
+            if agent_definition.source == "projectSettings":
+                inline_mappings[str(name)] = value
                 continue
             transport = value.get("transport_type") or value.get("type") or "stdio"
             env_vars = value.get("env_vars") or value.get("env") or {}
@@ -527,10 +561,31 @@ def resolve_agent_mcp_server_configs(agent_definition: AgentDefinition) -> list[
                         cache_tools_list=bool(value.get("cache_tools_list", False)),
                         allowed_tools=value.get("allowed_tools"),
                         blocked_tools=value.get("blocked_tools"),
+                        scope=MCPServerScope.USER,
+                        source_path=agent_definition.source_path,
                     )
                 )
             except Exception:
                 continue
+
+    if inline_mappings:
+        if not (
+            agent_definition.source_path
+            and agent_definition.project_root
+            and agent_definition.execution_cwd
+        ):
+            return configs
+        try:
+            configs.extend(
+                MCPServerManager().build_project_source_configs(
+                    inline_mappings,
+                    source_path=agent_definition.source_path,
+                    project_root=agent_definition.project_root,
+                    execution_cwd=agent_definition.execution_cwd,
+                )
+            )
+        except (OSError, ValueError):
+            pass
     return configs
 
 
@@ -600,6 +655,8 @@ def _load_markdown_agents_from_dir(
     *,
     source: AgentSource,
     plugin_name: str | None = None,
+    project_root: Path | None = None,
+    execution_cwd: Path | None = None,
 ) -> tuple[list[AgentDefinition], list[dict[str, str]]]:
     agents: list[AgentDefinition] = []
     failed: list[dict[str, str]] = []
@@ -613,6 +670,8 @@ def _load_markdown_agents_from_dir(
                 base_dir=directory,
                 source=source,
                 plugin_name=plugin_name,
+                project_root=project_root,
+                execution_cwd=execution_cwd,
             )
         except Exception as exc:  # pragma: no cover - defensive
             failed.append({"path": str(file_path), "error": str(exc)})
@@ -623,36 +682,43 @@ def _load_markdown_agents_from_dir(
 
 
 def _load_plugin_agents(plugin_root: Path) -> tuple[list[AgentDefinition], list[dict[str, str]]]:
-    from koder_agent.harness.plugins.manifest import find_manifest
-    from koder_agent.harness.plugins.state import PluginStateStore
+    from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
+    from koder_agent.harness.plugins.path_safety import (
+        PluginPathError,
+        open_plugin_component,
+    )
 
     agents: list[AgentDefinition] = []
     failed: list[dict[str, str]] = []
-    if not plugin_root.exists():
+    try:
+        lifecycle = PluginLifecycleService(plugin_root)
+    except (OSError, ValueError):
         return agents, failed
-
-    state_store = PluginStateStore(plugin_root / "state.json")
-
-    for plugin_dir in sorted(path for path in plugin_root.iterdir() if path.is_dir()):
-        manifest_path = find_manifest(plugin_dir)
-        if manifest_path is None:
+    failed.extend(
+        {"path": str(path), "error": error} for path, error in lifecycle.manifest_errors()
+    )
+    for manifest, state in lifecycle.installed_plugins():
+        if not state.enabled:
             continue
+        plugin_dir = lifecycle.resolve_plugin_target(manifest.name)
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            failed.append({"path": str(manifest_path), "error": str(exc)})
+            with open_plugin_component(
+                plugin_dir,
+                manifest.agents,
+                default="agents",
+                field_name="agents",
+                expect="directory",
+            ) as agents_dir:
+                if agents_dir is None:
+                    continue
+                plugin_agents, plugin_failed = _load_markdown_agents_from_dir(
+                    agents_dir,
+                    source="plugin",
+                    plugin_name=manifest.name,
+                )
+        except PluginPathError as exc:
+            failed.append({"path": str(plugin_dir), "error": str(exc)})
             continue
-        plugin_name = manifest.get("name")
-        if not isinstance(plugin_name, str) or not plugin_name.strip():
-            continue
-        plugin_name = plugin_name.strip()
-        if not state_store.is_enabled(plugin_name):
-            continue
-        plugin_agents, plugin_failed = _load_markdown_agents_from_dir(
-            plugin_dir / "agents",
-            source="plugin",
-            plugin_name=plugin_name,
-        )
         agents.extend(plugin_agents)
         failed.extend(plugin_failed)
     return agents, failed
@@ -679,10 +745,17 @@ def get_agent_definitions(
 
     project_agents: list[AgentDefinition] = []
     project_failed: list[dict[str, str]] = []
+    git_project_root = MCPServerManager.project_boundary(cwd_path)
+    has_git_project_root = (git_project_root / ".git").exists()
     for directory in _project_agent_dirs(cwd_path):
+        project_root = (
+            git_project_root if has_git_project_root else directory.parent.parent.resolve()
+        )
         agents, failed = _load_markdown_agents_from_dir(
             directory,
             source="projectSettings",
+            project_root=project_root,
+            execution_cwd=cwd_path,
         )
         project_agents.extend(agents)
         project_failed.extend(failed)
@@ -724,7 +797,7 @@ def filter_tools_for_agent_definition(agent_definition: AgentDefinition, tools) 
         allowed_map = {
             "Read": {"read_file"},
             "Write": {"write_file", "append_file"},
-            "Edit": {"edit_file"},
+            "Edit": {"edit_file", "notebook_edit"},
             "Glob": {"glob_search"},
             "Grep": {"grep_search"},
             "Bash": {"run_shell", "shell_output", "shell_kill", "git_command"},
@@ -764,9 +837,7 @@ def filter_tools_for_agent_definition(agent_definition: AgentDefinition, tools) 
                 names.add(tool.name)
 
     if agent_definition.permission_mode == "plan":
-        filtered = [
-            tool for tool in filtered if tool.name not in {"write_file", "append_file", "edit_file"}
-        ]
+        filtered = [tool for tool in filtered if tool.name not in FILE_WRITE_TOOLS]
     return filtered
 
 

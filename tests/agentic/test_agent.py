@@ -2,9 +2,17 @@ import asyncio
 import copy
 
 import litellm.exceptions
+import pytest
+from agents import ModelSettings
 from agents.extensions.models.litellm_model import LitellmModel
 
-from koder_agent.agentic.agent import RetryingLitellmModel, create_dev_agent
+from koder_agent.agentic.agent import (
+    PreflightOpenAIResponsesModel,
+    RetryingLitellmModel,
+    create_dev_agent,
+)
+from koder_agent.harness.memory.budget import ContextPreflightError
+from koder_agent.mcp.server_config import MCPServerConfig, MCPServerScope, MCPServerType
 
 _MISSING = object()
 
@@ -200,6 +208,9 @@ def test_get_response_retries(monkeypatch):
 
 
 class _DummySettings:
+    max_tokens = 20
+    reasoning = None
+
     def to_json_dict(self):
         return {}
 
@@ -214,6 +225,297 @@ class _DummyTracing:
 
 async def _no_sleep(_seconds):
     return None
+
+
+class _LargeOutputSchema:
+    def is_plain_text(self):
+        return False
+
+    def is_strict_json_schema(self):
+        return True
+
+    def json_schema(self):
+        return {
+            "type": "object",
+            "properties": {"payload": {"type": "string", "description": "s" * 20_000}},
+            "required": ["payload"],
+            "additionalProperties": False,
+        }
+
+
+class _NeverCalledResponses:
+    def __init__(self):
+        self.provider_calls = 0
+
+    async def create(self, **_kwargs):
+        self.provider_calls += 1
+        raise AssertionError("provider must not be called")
+
+
+class _FakeOpenAIClient:
+    def __init__(self):
+        self.responses = _NeverCalledResponses()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_native_responses_preflights_exact_large_schema_before_provider_io(streaming):
+    client = _FakeOpenAIClient()
+    model = PreflightOpenAIResponsesModel(
+        model="gpt-4.1",
+        openai_client=client,
+        context_window=200,
+    )
+
+    async def run():
+        if streaming:
+            async for _chunk in model.stream_response(
+                "system",
+                [{"role": "user", "content": "respond as json"}],
+                ModelSettings(max_tokens=20),
+                [],
+                _LargeOutputSchema(),
+                [],
+                _DummyTracing(),
+            ):
+                pass
+        else:
+            await model.get_response(
+                "system",
+                [{"role": "user", "content": "respond as json"}],
+                ModelSettings(max_tokens=20),
+                [],
+                _LargeOutputSchema(),
+                [],
+                _DummyTracing(),
+            )
+
+    with pytest.raises(ContextPreflightError) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.estimate.schema_tokens > 200
+    assert client.responses.provider_calls == 0
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_model_wrapper_preflights_each_tool_loop_request(monkeypatch, streaming):
+    model = _make_model("github_copilot/gpt-5.1-codex")
+    model.context_window = 128
+    model.base_url = None
+    model.should_replay_reasoning_content = None
+    provider_calls = 0
+    tool_loop_input = [
+        {"role": "user", "content": "read the file"},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": '{"path":"large.txt"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "x" * 100_000,
+        },
+    ]
+
+    async def fake_aresponses(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("provider must not be called")
+
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent.litellm.aresponses",
+        fake_aresponses,
+        raising=False,
+    )
+
+    async def run():
+        if streaming:
+            async for _chunk in model.stream_response(
+                "system",
+                tool_loop_input,
+                _DummySettings(),
+                [],
+                None,
+                [],
+                _DummyTracing(),
+            ):
+                pass
+        else:
+            await model.get_response(
+                "system",
+                tool_loop_input,
+                _DummySettings(),
+                [],
+                None,
+                [],
+                _DummyTracing(),
+            )
+
+    with pytest.raises(ContextPreflightError):
+        asyncio.run(run())
+
+    assert provider_calls == 0
+
+
+def test_create_dev_agent_cleans_connected_mcp_after_tool_construction_failure(monkeypatch):
+    class ConnectedServer:
+        name = "connected"
+
+        def __init__(self):
+            self.cleanup_calls = 0
+
+        async def cleanup(self):
+            self.cleanup_calls += 1
+
+    server = ConnectedServer()
+
+    async def load_servers():
+        return [server]
+
+    async def fail_tool_construction(*_args, **_kwargs):
+        raise RuntimeError("tool construction failed")
+
+    monkeypatch.delenv("KODER_SIMPLE", raising=False)
+    monkeypatch.setattr("koder_agent.agentic.agent.load_mcp_servers", load_servers)
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent._build_prefixed_mcp_tools",
+        fail_tool_construction,
+    )
+
+    with pytest.raises(RuntimeError, match="tool construction failed"):
+        asyncio.run(create_dev_agent([]))
+
+    assert server.cleanup_calls == 1
+
+
+def test_create_dev_agent_cleans_connected_mcp_after_agent_construction_failure(
+    monkeypatch,
+):
+    from koder_agent.harness.config.schema import RuntimeConfig
+
+    class ConnectedServer:
+        name = "connected"
+
+        def __init__(self):
+            self.cleanup_calls = 0
+
+        async def cleanup(self):
+            self.cleanup_calls += 1
+
+    server = ConnectedServer()
+    config = RuntimeConfig()
+    config.model.name = "gpt-4.1"
+    config.model.provider = "openai"
+    config.model.reasoning_effort = None
+
+    async def load_servers():
+        return [server]
+
+    async def no_mcp_tools(*_args, **_kwargs):
+        return []
+
+    def fail_agent_construction(*_args, **_kwargs):
+        raise RuntimeError("Agent construction failed")
+
+    monkeypatch.delenv("KODER_SIMPLE", raising=False)
+    monkeypatch.setattr("koder_agent.agentic.agent.load_mcp_servers", load_servers)
+    monkeypatch.setattr("koder_agent.agentic.agent.get_config", lambda: config)
+    monkeypatch.setattr("koder_agent.agentic.agent._build_prefixed_mcp_tools", no_mcp_tools)
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent.get_model_client_snapshot",
+        lambda _override: {
+            "model_name": "gpt-4.1",
+            "native_openai": True,
+            "litellm_kwargs": {},
+        },
+    )
+    monkeypatch.setattr("koder_agent.agentic.agent._get_skills_metadata", lambda _config: "")
+    monkeypatch.setattr("koder_agent.agentic.agent._get_agents_metadata", lambda: "")
+    monkeypatch.setattr("koder_agent.agentic.agent._get_environment_info", lambda _model: "")
+    monkeypatch.setattr("koder_agent.agentic.agent.Agent", fail_agent_construction)
+
+    with pytest.raises(RuntimeError, match="Agent construction failed"):
+        asyncio.run(create_dev_agent([]))
+
+    assert server.cleanup_calls == 1
+
+
+def test_agent_build_and_factory_cancellation_clean_each_mcp_server_once(monkeypatch):
+    from koder_agent import mcp as mcp_module
+    from koder_agent.agentic import agent as agent_module
+
+    class Server:
+        def __init__(self, name: str, *, connect_error: Exception | None = None):
+            self.name = name
+            self.connect_error = connect_error
+            self.cleanup_calls = 0
+            self.cleanup_started = asyncio.Event()
+            self.cleanup_release = asyncio.Event()
+
+        async def connect(self):
+            if self.connect_error is not None:
+                raise self.connect_error
+
+        async def cleanup(self):
+            self.cleanup_calls += 1
+            self.cleanup_started.set()
+            if self.name == "failed-extra":
+                await self.cleanup_release.wait()
+
+    base = Server("base")
+    connected_extra = Server("connected-extra")
+    failed_extra = Server("failed-extra", connect_error=RuntimeError("connect failed"))
+    created = iter([connected_extra, failed_extra])
+
+    async def create_server(*_args, **_kwargs):
+        return next(created)
+
+    async def load_servers(extra_configs=None):
+        owner = mcp_module.MCPServerSet([base])
+        try:
+            extra_servers = await mcp_module.MCPServerFactory.create_servers_from_configs(
+                list(extra_configs or [])
+            )
+            for server in extra_servers:
+                owner.adopt_server(server, server_name=server.name)
+            return owner
+        except BaseException:
+            await owner.aclose(propagate_cancellation=False)
+            raise
+
+    monkeypatch.delenv("KODER_SIMPLE", raising=False)
+    monkeypatch.setattr(agent_module, "load_mcp_servers", load_servers)
+    monkeypatch.setattr(mcp_module.MCPServerFactory, "create_server", create_server)
+
+    configs = [
+        MCPServerConfig(
+            name=name,
+            transport_type=MCPServerType.STDIO,
+            command="python",
+            args=[],
+            env_vars={},
+            scope=MCPServerScope.USER,
+            source_path="/tmp/test-agent-mcp.json",
+        )
+        for name in ("connected-extra", "failed-extra")
+    ]
+
+    async def scenario():
+        task = asyncio.create_task(create_dev_agent([], extra_mcp_server_configs=configs))
+        await failed_extra.cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        failed_extra.cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert base.cleanup_calls == 1
+    assert connected_extra.cleanup_calls == 1
+    assert failed_extra.cleanup_calls == 1
 
 
 def test_create_dev_agent_uses_model_client_snapshot_for_litellm(monkeypatch):
@@ -271,7 +573,8 @@ def test_create_dev_agent_requests_reasoning_summary_when_display_enabled(monkey
 
     agent = asyncio.run(create_dev_agent([]))
 
-    assert agent.model == "gpt-5"
+    assert isinstance(agent.model, PreflightOpenAIResponsesModel)
+    assert agent.model.model == "gpt-5"
     assert agent.model_settings.reasoning.summary == "detailed"
     assert agent.model_settings.reasoning.effort == "medium"
 
@@ -305,3 +608,103 @@ def test_create_dev_agent_passes_max_reasoning_effort_without_conversion(monkeyp
 
     assert agent.model_settings.reasoning.effort == "max"
     assert agent.model_settings.to_json_dict()["reasoning"]["effort"] == "max"
+
+
+def test_create_dev_agent_cleans_loaded_mcp_servers_when_construction_is_cancelled(monkeypatch):
+    entered_tool_build = asyncio.Event()
+    never = asyncio.Event()
+
+    class Server:
+        name = "construction-server"
+
+        def __init__(self):
+            self.cleaned = False
+
+        async def cleanup(self):
+            self.cleaned = True
+
+    server = Server()
+
+    async def fake_load_mcp_servers():
+        return [server]
+
+    async def blocking_tool_build(*args, **kwargs):
+        entered_tool_build.set()
+        await never.wait()
+
+    monkeypatch.delenv("KODER_SIMPLE", raising=False)
+    monkeypatch.setattr("koder_agent.agentic.agent.load_mcp_servers", fake_load_mcp_servers)
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent._build_prefixed_mcp_tools",
+        blocking_tool_build,
+    )
+
+    async def scenario():
+        construction = asyncio.create_task(create_dev_agent([]))
+        await asyncio.wait_for(entered_tool_build.wait(), timeout=1)
+        construction.cancel()
+        try:
+            await construction
+        except asyncio.CancelledError:
+            pass
+        else:  # pragma: no cover - cancellation must propagate
+            raise AssertionError("agent construction was not cancelled")
+
+    asyncio.run(scenario())
+
+    assert server.cleaned is True
+
+
+def test_create_dev_agent_preserves_initial_cancel_during_slow_cleanup(monkeypatch):
+    entered_tool_build = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    never = asyncio.Event()
+    cleanup_calls = 0
+    cleanup_completed = 0
+
+    class Server:
+        name = "construction-server"
+
+        async def cleanup(self):
+            nonlocal cleanup_calls, cleanup_completed
+            cleanup_calls += 1
+            cleanup_started.set()
+            await cleanup_release.wait()
+            cleanup_completed += 1
+
+    server = Server()
+
+    async def fake_load_mcp_servers():
+        return [server]
+
+    async def blocking_tool_build(*args, **kwargs):
+        entered_tool_build.set()
+        await never.wait()
+
+    monkeypatch.delenv("KODER_SIMPLE", raising=False)
+    monkeypatch.setattr("koder_agent.agentic.agent.load_mcp_servers", fake_load_mcp_servers)
+    monkeypatch.setattr(
+        "koder_agent.agentic.agent._build_prefixed_mcp_tools",
+        blocking_tool_build,
+    )
+
+    async def scenario():
+        construction = asyncio.create_task(create_dev_agent([]))
+        await asyncio.wait_for(entered_tool_build.wait(), timeout=1)
+        construction.cancel("initial-parent-cancel")
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        construction.cancel("repeat-parent-cancel")
+        await asyncio.sleep(0)
+        cleanup_release.set()
+        try:
+            await construction
+        except asyncio.CancelledError as exc:
+            return exc.args
+        raise AssertionError("agent construction was not cancelled")
+
+    cancel_args = asyncio.run(scenario())
+
+    assert cleanup_calls == 1
+    assert cleanup_completed == 1
+    assert cancel_args == ("initial-parent-cancel",)

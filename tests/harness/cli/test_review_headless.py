@@ -7,6 +7,10 @@ import pytest
 
 from koder_agent.harness import review_flow
 from koder_agent.harness.cli.headless import handle_review_command
+from koder_agent.utils.client import (
+    CompletionTruncationMetadata,
+    LLMCompletionResult,
+)
 
 
 def _fake_run_factory(mapping):
@@ -99,6 +103,36 @@ async def test_run_review_returns_findings(monkeypatch):
     text, has_findings = await review_flow.run_review(uncommitted=True)
     assert has_findings is True
     assert "Finding" in text
+
+
+@pytest.mark.asyncio
+async def test_review_reports_truncated_input(monkeypatch):
+    monkeypatch.setattr(
+        review_flow.subprocess,
+        "run",
+        _fake_run_factory({("git", "diff", "HEAD"): (0, "some-diff", "")}),
+    )
+
+    async def fake_completion(messages, **kwargs):
+        assert kwargs["overflow_policy"] == "truncate"
+        assert kwargs["return_metadata"] is True
+        return LLMCompletionResult(
+            text="Finding: partial review",
+            truncation=CompletionTruncationMetadata(
+                model="test",
+                context_window=100,
+                response_reserve=20,
+                original_input_tokens=150,
+                sent_input_tokens=80,
+            ),
+        )
+
+    monkeypatch.setattr("koder_agent.utils.client.llm_completion", fake_completion)
+    text, has_findings = await review_flow.run_review(uncommitted=True)
+
+    assert has_findings is True
+    assert "explicitly truncated input" in text
+    assert "150 -> 80 tokens" in text
 
 
 @pytest.mark.asyncio

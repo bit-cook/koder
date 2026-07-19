@@ -3484,7 +3484,7 @@
     },
     "memory": {
       "validation_level": "acceptance",
-      "purpose": "Inspect empty, seeded project/user, index-ignored, and /remember-created memory files through the real TUI.",
+      "purpose": "Inspect stored memories and review pending AutoDream memory and skill candidates through the real TUI.",
       "env": {
         "KODER_MEMORY_MARKER": "memory-seed-ok"
       },
@@ -3494,7 +3494,8 @@
         "/memory lists project and user memory types, filenames, and descriptions",
         "MEMORY.md index files are ignored by the listing",
         "/remember creates a new project memory file and index entry",
-        "post assertions prove project, user, index, and remembered memory files persist"
+        "/memory candidates supports list, show, approve, and reject",
+        "post assertions prove approved factual memory persists and rejected skill candidates are deleted"
       ],
       "acceptance_artifacts": [
         "empty /memory capture",
@@ -3502,7 +3503,8 @@
         "seeded /memory capture",
         "/remember capture",
         "final /memory capture",
-        "project and user memory files"
+        "candidate list/show/approve/reject captures",
+        "project, user, and approved candidate memory files"
       ],
       "turns": [
         {
@@ -3544,6 +3546,51 @@
             "[user] user-note.md: user memory marker",
             "remembered memory marker"
           ]
+        },
+        {
+          "send": "!mkdir -p \"$HOME/.koder/memory-candidates/pending\" \"$HOME/.koder/skill-candidates/pending\" && printf '%s\\n' '{\"id\":\"b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6\",\"kind\":\"memory\",\"created_at\":\"2026-01-01T00:00:00+00:00\",\"storage_scope\":\"user\",\"origin_project_root\":\"/private/tmp/koder-memory-scenario-origin\",\"origin_session_id\":\"memory-scenario-session\",\"payload\":{\"type\":\"user\",\"content\":\"approved candidate marker\",\"description\":\"candidate memory marker\"}}' > \"$HOME/.koder/memory-candidates/pending/b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6.json\" && printf '%s\\n' '{\"id\":\"0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6\",\"kind\":\"skill\",\"created_at\":\"2026-01-01T00:00:01+00:00\",\"storage_scope\":\"user\",\"origin_project_root\":\"/private/tmp/koder-memory-scenario-origin\",\"origin_session_id\":\"memory-scenario-session\",\"payload\":{\"name\":\"candidate-skill\",\"description\":\"candidate skill marker\",\"instructions\":\"Never activate automatically.\"}}' > \"$HOME/.koder/skill-candidates/pending/0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6.json\" && echo candidates-seeded",
+          "expect_all": [
+            "candidates-seeded"
+          ]
+        },
+        {
+          "send": "/memory candidates",
+          "expect_all": [
+            "memory candidates: 2 pending",
+            "b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6",
+            "kind=memory",
+            "scope=user",
+            "origin_project=/private/tmp/koder-memory-scenario-origin",
+            "origin_session=memory-scenario-session",
+            "0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6",
+            "kind=skill"
+          ]
+        },
+        {
+          "send": "/memory show b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6",
+          "expect_all": [
+            "kind: memory",
+            "storage_scope: user",
+            "origin_project_root: /private/tmp/koder-memory-scenario-origin",
+            "origin_session_id: memory-scenario-session",
+            "approved candidate marker",
+            "candidate memory marker"
+          ]
+        },
+        {
+          "send": "/memory approve b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6",
+          "expect_all": [
+            "memory candidate approved",
+            "status: approved",
+            "auto-dream-b5bfd0b63ffd1730"
+          ]
+        },
+        {
+          "send": "/memory reject 0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6",
+          "expect_all": [
+            "candidate rejected",
+            "0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6"
+          ]
         }
       ],
       "post_assertions": [
@@ -3582,6 +3629,21 @@
               "remembered memory marker"
             ]
           ]
+        },
+        {
+          "file_contains": [
+            "$HOME/.koder/memory/auto-dream-b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6.md",
+            [
+              "type: user",
+              "storage_scope: user",
+              "source_candidate: b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6",
+              "description: candidate memory marker",
+              "approved candidate marker"
+            ]
+          ]
+        },
+        {
+          "path_not_exists": "$HOME/.koder/skill-candidates/pending/0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6.json"
         }
       ]
     },
@@ -4103,7 +4165,7 @@
       "acceptance_criteria": [
         "permissions status renders mode, rules, denials, and working directories",
         "default mutating shell command requires approval",
-        "enabled sandbox mode auto-allows real sandboxed mutating shell commands",
+        "enabled sandbox mode does not auto-allow when its network restriction is unenforced",
         "safe read-only shell commands remain allowed",
         "persisted sandbox settings record the selected backend"
       ],
@@ -4141,10 +4203,13 @@
         },
         {
           "send": "/permissions check run_shell touch blocked.txt",
+          "wait": 4,
           "expect_all": [
             "permissions: check",
-            "allowed: true",
-            "requires_approval: false",
+            "allowed: false",
+            "requires_approval: true"
+          ],
+          "expect_not": [
             "sandboxed shell command auto-allowed"
           ]
         },
@@ -7616,10 +7681,11 @@
     },
     "auto-dream-task": {
       "validation_level": "acceptance",
-      "purpose": "Run a deterministic AutoDream consolidation, verify task and memory persistence, update task metadata, and report malformed task records through /tasks.",
+      "purpose": "Run deterministic scoped AutoDream consolidation, prove project isolation and user-global retrieval, update task metadata, and report malformed task records through /tasks.",
       "acceptance_criteria": [
         "AutoDream runtime path creates a persisted completed task",
-        "AutoDream runtime path writes a memory file with extracted content",
+        "AutoDream runtime path writes project and user memories with their actual governed types and scopes",
+        "a project-scoped memory is not retrieved from a different project while user memory remains global",
         "/tasks shows the AutoDream task with completed status, memory count, and saved path",
         "task metadata updates are reflected in /tasks",
         "malformed AutoDream task records are reported without hiding valid records"
@@ -7627,17 +7693,21 @@
       "acceptance_artifacts": [
         "leader turn captures",
         "AutoDream task json",
-        "AutoDream memory markdown",
+        "project-scoped and user-scoped AutoDream memory markdown",
         "malformed task json"
       ],
       "turns": [
         {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import asyncio; from pathlib import Path; from types import SimpleNamespace; import koder_agent.harness.memory.auto_dream as ad; ad.llm_extract_memories=lambda messages: asyncio.sleep(0, result=SimpleNamespace(memories=[{\"type\":\"preference\",\"content\":\"Prefer scenario-backed tmux validation\",\"description\":\"auto dream scenario\"}], errors=[])); result=asyncio.run(ad.run_auto_dream_from_messages([{\"role\":\"user\",\"content\":\"remember tmux validation\"}], manager=ad.AutoDreamManager(), memory_dir=Path.home()/\".koder\"/\"memory\", task_storage=ad.default_auto_dream_task_storage())); print(f\"auto-dream-runtime-ok task_id={result.task_id} memories={result.memories_written} saved={result.saved_path}\")'",
+          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'import asyncio; from pathlib import Path; from types import SimpleNamespace; import koder_agent.harness.memory.auto_dream as ad; from koder_agent.harness.memory.memory_files import parse_memory_file; from koder_agent.harness.memory.retrieval import retrieve_relevant_memories; home=Path.home(); project_a=home/\"auto-dream-project-a\"; project_b=home/\"auto-dream-project-b\"; project_a.mkdir(); project_b.mkdir(); ad.llm_extract_memories=lambda messages: asyncio.sleep(0, result=SimpleNamespace(memories=[{\"type\":\"project\",\"content\":\"projectonlyzxq\",\"description\":\"auto dream project scenario\"},{\"type\":\"user\",\"content\":\"userglobalqvx\",\"description\":\"auto dream user scenario\"}], errors=[])); result=asyncio.run(ad.run_auto_dream_from_messages([{\"role\":\"user\",\"content\":\"remember scoped validation\"}], manager=ad.AutoDreamManager(config=ad.DreamConfig(write_mode=\"automatic\")), origin_project_root=project_a, origin_session_id=\"auto-dream-scenario-session\", task_storage=ad.default_auto_dream_task_storage())); project_files=list((project_a/\".koder\"/\"memory\").glob(\"*.md\")); user_files=list((home/\".koder\"/\"memory\").glob(\"*.md\")); project_scope_ok=len(project_files)==1 and parse_memory_file(project_files[0].read_text()).memory_type==\"project\"; user_scope_ok=len(user_files)==1 and parse_memory_file(user_files[0].read_text()).memory_type==\"user\"; cross_project=retrieve_relevant_memories(\"projectonlyzxq\", [project_b/\".koder\"/\"memory\", home/\".koder\"/\"memory\"], max_tokens=1000); user_cross_project=retrieve_relevant_memories(\"userglobalqvx\", [project_b/\".koder\"/\"memory\", home/\".koder\"/\"memory\"], max_tokens=1000); print(f\"auto-dream-runtime-ok task_id={result.task_id} memories={result.memories_written} saved={result.saved_path} project_scope_ok={project_scope_ok} user_scope_ok={user_scope_ok} cross_project_retrieved={bool(cross_project.memories)} user_cross_project_retrieved={bool(user_cross_project.memories)}\")'",
           "expect_all": [
             "auto-dream-runtime-ok",
             "task_id=1",
-            "memories=1",
-            "saved="
+            "memories=2",
+            "saved=",
+            "project_scope_ok=True",
+            "user_scope_ok=True",
+            "cross_project_retrieved=False",
+            "user_cross_project_retrieved=True"
           ]
         },
         {
@@ -7646,12 +7716,12 @@
             "auto-dream/1",
             "AutoDream memory consolidation",
             "status=completed",
-            "memories=1",
+            "memories=2",
             "saved="
           ]
         },
         {
-          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'from koder_agent.harness.memory.auto_dream import default_auto_dream_task_storage; s=default_auto_dream_task_storage(); s.update(\"1\", metadata={\"errors\":[\"scenario warning\"],\"memories_written\":2}); (s.root/\"broken.json\").write_text(\"{not json\", encoding=\"utf-8\"); print(\"auto-dream-update-ok\")'",
+          "send": "!uv --project \"$PYTHONPATH\" run --no-sync python -c 'from koder_agent.harness.memory.auto_dream import default_auto_dream_task_storage; s=default_auto_dream_task_storage(); s.update(\"1\", metadata={\"errors\":[\"scenario warning\"],\"memories_written\":3}); (s.root/\"broken.json\").write_text(\"{not json\", encoding=\"utf-8\"); print(\"auto-dream-update-ok\")'",
           "expect_all": [
             "auto-dream-update-ok"
           ]
@@ -7662,7 +7732,7 @@
             "auto-dream/malformed: broken.json",
             "auto-dream/1",
             "status=completed",
-            "memories=2",
+            "memories=3",
             "errors=1"
           ]
         }
@@ -7670,16 +7740,39 @@
       "post_assertions": [
         {
           "file_glob_contains": [
-            "$HOME/.koder/memory/auto-dream-*.md",
-            "Prefer scenario-backed tmux validation"
+            "$HOME/auto-dream-project-a/.koder/memory/auto-dream-project-*.md",
+            [
+              "type: project",
+              "storage_scope: project",
+              "projectonlyzxq"
+            ]
           ]
+        },
+        {
+          "file_glob_contains": [
+            "$HOME/.koder/memory/auto-dream-user-*.md",
+            [
+              "type: user",
+              "storage_scope: user",
+              "userglobalqvx"
+            ]
+          ]
+        },
+        {
+          "file_glob_not_contains": [
+            "$HOME/.koder/memory/*.md",
+            "projectonlyzxq"
+          ]
+        },
+        {
+          "path_not_exists": "$HOME/auto-dream-project-b/.koder/memory"
         },
         {
           "file_contains": [
             "$HOME/.koder/tasks/auto-dream/1.json",
             [
               "\"status\": \"completed\"",
-              "\"memories_written\": 2",
+              "\"memories_written\": 3",
               "scenario warning",
               "\"saved_path\""
             ]
@@ -8079,7 +8172,7 @@
       "purpose": "Exercise sandbox policy changes and permission-engine decisions for approval-required, sandboxed, and excluded shell tool calls.",
       "acceptance_criteria": [
         "permissions status renders current mode and denial counts",
-        "enabled sandbox mode persists the backend and auto-allows real sandboxed model shell commands",
+        "enabled sandbox mode persists the backend without auto-allowing unenforced network restrictions",
         "excluded commands use normal permission classification",
         "read-only shell commands remain allowed",
         "sandbox status and settings file reflect the final local policy state"
@@ -8108,11 +8201,14 @@
         },
         {
           "send": "/permissions check run_shell touch blocked.txt",
+          "wait": 4,
           "expect_all": [
             "permissions: check",
             "tool: run_shell",
-            "allowed: true",
-            "requires_approval: false",
+            "allowed: false",
+            "requires_approval: true"
+          ],
+          "expect_not": [
             "sandboxed shell command auto-allowed"
           ]
         },
@@ -8126,6 +8222,7 @@
         },
         {
           "send": "/permissions check run_shell touch blocked.txt",
+          "wait": 4,
           "expect_all": [
             "permissions: check",
             "allowed: false",
@@ -8167,6 +8264,80 @@
               "\"backend\": \"unix-local\"",
               "\"excludedCommands\"",
               "\"touch *\""
+            ]
+          ]
+        }
+      ]
+    },
+    "sandbox-function-tool-approval": {
+      "validation_level": "acceptance",
+      "purpose": "Drive a deterministic model-issued run_shell FunctionTool call and prove unix-local cannot auto-approve it without host-process isolation.",
+      "acceptance_criteria": [
+        "the scripted model emits a real run_shell FunctionTool call",
+        "the call reaches the interactive permission prompt instead of auto-running",
+        "denial returns a tool result to the scripted model",
+        "the requested workspace mutation never occurs"
+      ],
+      "acceptance_artifacts": [
+        "interactive permission prompt capture",
+        "fake provider request log",
+        "workspace mutation absence"
+      ],
+      "env": {
+        "KODER_MODEL": "openai/koder-fixture",
+        "KODER_BASE_URL": "http://127.0.0.1:19095/v1",
+        "KODER_API_KEY": "sandbox-function-tool-secret-token"
+      },
+      "fake_openai": {
+        "port": 19095,
+        "response": "sandbox function tool result received",
+        "log_file": "$HOME/fake-openai-sandbox-function-tool.log",
+        "ready_file": "$HOME/fake-openai-sandbox-function-tool.ready",
+        "scenario": "sandbox_shell_tool",
+        "stream_delay": 0.01,
+        "stream_lines": 1
+      },
+      "prelaunch_files": [
+        {
+          "path": "$REPO/.koder/settings.local.json",
+          "content": "{\"sandbox\":{\"enabled\":true,\"backend\":\"unix-local\",\"networkAccess\":true,\"autoAllowBashIfSandboxed\":true}}\n"
+        }
+      ],
+      "turns": [
+        {
+          "send": "invoke the scripted sandbox shell tool",
+          "wait": 3,
+          "expect_all": [
+            "Permission required: run_shell",
+            "touch model-tool-created.txt",
+            "[y]allow once  [a]always allow  [n]deny"
+          ],
+          "expect_not": [
+            "sandboxed: true"
+          ]
+        },
+        {
+          "send": "n",
+          "wait": 4,
+          "expect_all": [
+            "Permission denied for run_shell",
+            "sandbox function tool result received"
+          ],
+          "expect_not": [
+            "sandboxed shell command auto-allowed"
+          ]
+        }
+      ],
+      "post_assertions": [
+        {
+          "path_not_exists": "$REPO/model-tool-created.txt"
+        },
+        {
+          "file_contains": [
+            "$HOME/fake-openai-sandbox-function-tool.log",
+            [
+              "run_shell",
+              "Permission denied for run_shell"
             ]
           ]
         }
@@ -8476,6 +8647,116 @@
           ],
           "expect_not": [
             "scenario-secret-worker-key"
+          ]
+        }
+      ]
+    },
+    "fixed-bottom-subagent-progress": {
+      "validation_level": "acceptance",
+      "purpose": "Verify parallel subagent activity stays inside the parent streaming renderer without overwriting the fixed input and status area.",
+      "env": {
+        "KODER_MODEL": "openai/claude-sonnet-4-6",
+        "KODER_BASE_URL": "$FAKE_OPENAI_URL",
+        "KODER_API_KEY": "subagent-display-secret-token"
+      },
+      "fake_openai": {
+        "port": 0,
+        "response": "parent response after delegated work",
+        "log_file": "$HOME/fake-openai-subagent-display.log",
+        "ready_file": "$HOME/fake-openai-subagent-display.ready",
+        "scenario": "streaming_subagent_tool",
+        "stream_delay": 0.01,
+        "subagent_delay": 3.0,
+        "stream_lines": 2
+      },
+      "acceptance_criteria": [
+        "parallel child activity renders as one compact delegated-agent group",
+        "child tool hooks do not print raw Agent or tool blocks into the terminal",
+        "the aggregate child header and fixed input/status frame remain visible at 60x12 while children are running",
+        "the completed delegated-agent summary and fixed input/status frame remain visible at 60x12 after the parent finishes"
+      ],
+      "acceptance_artifacts": [
+        "live subagent visible capture with fixed prompt",
+        "completed parent visible capture with compact child summary",
+        "fake provider log proving two child read_file calls"
+      ],
+      "turns": [
+        {
+          "resize": {
+            "width": 60,
+            "height": 12
+          },
+          "capture": "visible",
+          "expect_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "Window too small"
+          ]
+        },
+        {
+          "send": "Delegate two inspections of sample.txt before answering.",
+          "capture": "visible",
+          "expect_all": [
+            "Delegated agents",
+            "2 running",
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "● Agent:",
+            "● read_file"
+          ],
+          "timeout": 12
+        },
+        {
+          "wait": 5,
+          "capture": "visible",
+          "expect_all": [
+            "parent response after delegated work",
+            "Delegated agents",
+            "Succeeded (2 agents, 2 tool uses)",
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_bottom_all": [
+            "| ⚡ Koder |",
+            "│>",
+            "sonnet-4-6"
+          ],
+          "expect_not": [
+            "● Agent:",
+            "● read_file"
+          ],
+          "timeout": 12
+        }
+      ],
+      "post_assertions": [
+        {
+          "file_occurrences": [
+            "$HOME/fake-openai-subagent-display.log",
+            {
+              "subagent-alpha-read_file-request": 1,
+              "subagent-alpha-read_file-result": 1,
+              "subagent-beta-read_file-request": 1,
+              "subagent-beta-read_file-result": 1,
+              "call_koder_subagent_alpha_read_file": 2,
+              "call_koder_subagent_beta_read_file": 2
+            }
           ]
         }
       ]

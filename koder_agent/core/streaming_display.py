@@ -1,7 +1,7 @@
 """Comprehensive streaming display manager for interleaved tool calls and text output."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
@@ -9,9 +9,12 @@ from rich.console import Console, Group
 from rich.syntax import Syntax
 from rich.text import Text
 
+from .display_context import SubagentDisplayEvent
 from .queued_input import strip_queued_input_from_tool_output
 
 TODO_TOOL_NAMES = {"todo_read", "todo_write"}
+MAX_VISIBLE_SUBAGENTS = 4
+MIN_DETAILED_SUBAGENT_HEIGHT = 16
 
 
 class OutputType(Enum):
@@ -21,6 +24,8 @@ class OutputType(Enum):
     REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_OUTPUT = "tool_output"
+    SUBAGENT_GROUP = "subagent_group"
+    NOTICE = "notice"
 
 
 @dataclass
@@ -35,6 +40,28 @@ class ToolCallTracker:
 
 
 @dataclass
+class SubagentActivityTracker:
+    """Compact state for one child run displayed by the parent TUI."""
+
+    agent_id: str
+    label: str
+    order: Optional[int] = None
+    status: str = "running"
+    current_tool: Optional[str] = None
+    tool_uses: int = 0
+    detail: Optional[str] = None
+
+
+@dataclass
+class SubagentActivityGroup:
+    """A batch of child runs launched by one parent orchestration tool."""
+
+    group_id: str
+    parent_call_id: Optional[str] = None
+    agents: Dict[str, SubagentActivityTracker] = field(default_factory=dict)
+
+
+@dataclass
 class OutputSection:
     """Represents a section of output (text or tool)."""
 
@@ -43,6 +70,7 @@ class OutputSection:
     tool_tracker: Optional[ToolCallTracker] = None
     reasoning_key: Optional[str] = None
     reasoning_kind: str = "summary"
+    subagent_group: Optional[SubagentActivityGroup] = None
     complete: bool = False
 
 
@@ -58,6 +86,7 @@ class StreamingDisplayManager:
         self.current_text_section: Optional[OutputSection] = None
         self.active_tool_calls: Dict[str, ToolCallTracker] = {}  # Track by call_id
         self.reasoning_sections: Dict[str, OutputSection] = {}
+        self.subagent_groups: Dict[str, SubagentActivityGroup] = {}
 
         # Text streaming by output_index
         self.text_streams: Dict[int, str] = {}
@@ -243,6 +272,7 @@ class StreamingDisplayManager:
         # Create a preliminary tool call section for immediate feedback
         tool_section = OutputSection(type=OutputType.TOOL_CALL, tool_tracker=tracker)
         self.sections.append(tool_section)
+        self._move_subagent_groups_after_parent(actual_call_id)
 
         return True  # Allow display update for immediate tool call feedback
 
@@ -327,8 +357,13 @@ class StreamingDisplayManager:
 
             # Insert output section right after the corresponding tool call
             if tool_call_index != -1:
-                # Insert after the tool call section (at position tool_call_index + 1)
-                self.sections.insert(tool_call_index + 1, output_section)
+                # Keep parent-managed subagent progress between the orchestration
+                # call and its final output.
+                output_index = self._index_after_subagent_groups(
+                    tool_call_index + 1,
+                    tracker.call_id,
+                )
+                self.sections.insert(output_index, output_section)
             else:
                 # Fallback: append to end if tool call section not found
                 self.sections.append(output_section)
@@ -345,6 +380,121 @@ class StreamingDisplayManager:
             return True
 
         return False
+
+    def handle_subagent_event(self, event: SubagentDisplayEvent) -> bool:
+        """Merge child progress into the parent-owned render state."""
+
+        identity = event.identity
+        group = self.subagent_groups.get(identity.group_id)
+        if group is None:
+            group = SubagentActivityGroup(
+                group_id=identity.group_id,
+                parent_call_id=identity.parent_call_id,
+            )
+            self.subagent_groups[identity.group_id] = group
+            section = OutputSection(
+                type=OutputType.SUBAGENT_GROUP,
+                subagent_group=group,
+            )
+            self._insert_subagent_group_section(section, group.parent_call_id)
+
+        agent = group.agents.get(identity.agent_id)
+        identity_order = getattr(identity, "order", None)
+        if not isinstance(identity_order, int) or isinstance(identity_order, bool):
+            identity_order = None
+        if agent is None:
+            agent = SubagentActivityTracker(
+                agent_id=identity.agent_id,
+                label=identity.label,
+                order=identity_order,
+            )
+            group.agents[identity.agent_id] = agent
+        elif identity_order is not None:
+            agent.order = identity_order
+
+        if event.kind == "tool_started":
+            agent.status = "running"
+            agent.current_tool = event.tool_name
+        elif event.kind == "tool_finished":
+            agent.status = "running"
+            agent.current_tool = None
+            agent.tool_uses += 1
+        elif event.kind in {"completed", "failed", "cancelled"}:
+            agent.status = event.kind
+            agent.current_tool = None
+            agent.detail = event.detail
+        else:
+            agent.status = "running"
+        return True
+
+    def handle_notice(self, message: str) -> bool:
+        """Append a renderer-owned diagnostic without polluting assistant text."""
+
+        if not message:
+            return False
+        self.sections.append(OutputSection(type=OutputType.NOTICE, content=message, complete=True))
+        return True
+
+    def _insert_subagent_group_section(
+        self,
+        section: OutputSection,
+        parent_call_id: Optional[str],
+    ) -> None:
+        """Place progress directly after its parent tool call when possible."""
+
+        if parent_call_id is None:
+            self.sections.append(section)
+            return
+
+        for index in range(len(self.sections) - 1, -1, -1):
+            candidate = self.sections[index]
+            if (
+                candidate.type == OutputType.TOOL_CALL
+                and candidate.tool_tracker is not None
+                and candidate.tool_tracker.call_id == parent_call_id
+            ):
+                insert_at = self._index_after_subagent_groups(index + 1, parent_call_id)
+                self.sections.insert(insert_at, section)
+                return
+        self.sections.append(section)
+
+    def _index_after_subagent_groups(self, index: int, parent_call_id: str) -> int:
+        while index < len(self.sections) and self._is_subagent_group_for(
+            self.sections[index], parent_call_id
+        ):
+            index += 1
+        return index
+
+    @staticmethod
+    def _is_subagent_group_for(section: OutputSection, parent_call_id: str) -> bool:
+        group = section.subagent_group
+        return (
+            section.type == OutputType.SUBAGENT_GROUP
+            and group is not None
+            and group.parent_call_id == parent_call_id
+        )
+
+    def _move_subagent_groups_after_parent(self, parent_call_id: str) -> None:
+        """Repair ordering if child events raced ahead of the parent call event."""
+
+        matching = [
+            section
+            for section in self.sections
+            if self._is_subagent_group_for(section, parent_call_id)
+        ]
+        if not matching:
+            return
+
+        matching_ids = {id(section) for section in matching}
+        self.sections = [section for section in self.sections if id(section) not in matching_ids]
+        for index, section in enumerate(self.sections):
+            if (
+                section.type == OutputType.TOOL_CALL
+                and section.tool_tracker is not None
+                and section.tool_tracker.call_id == parent_call_id
+            ):
+                self.sections[index + 1 : index + 1] = matching
+                return
 
     def _ensure_current_text_section(self):
         """Ensure there's a current text section for streaming."""
@@ -441,6 +591,9 @@ class StreamingDisplayManager:
                 # Get tool name for summary generation
                 tool_name = section.tool_tracker.tool_name if section.tool_tracker else "unknown"
 
+                if self._has_correlated_subagent_group(section.tool_tracker):
+                    continue
+
                 if tool_name in TODO_TOOL_NAMES:
                     todo_renderables = self._format_todo_plan_output(
                         tool_name, section.content, section.tool_tracker
@@ -497,6 +650,16 @@ class StreamingDisplayManager:
                     output_text.append("  ╰─ ", style="dim green")
                     output_text.append("(no output)", style="dim")
                     renderables.append(output_text)
+
+            elif section.type == OutputType.SUBAGENT_GROUP and section.subagent_group:
+                if renderables:
+                    renderables.append(Text())
+                renderables.extend(self._format_subagent_group(section.subagent_group))
+
+            elif section.type == OutputType.NOTICE and section.content:
+                if renderables:
+                    renderables.append(Text())
+                renderables.append(Text(section.content, style="dim red"))
 
         # Return a Group for proper rendering
         if renderables:
@@ -595,6 +758,134 @@ class StreamingDisplayManager:
             i += 1
 
         return renderables
+
+    def _format_subagent_group(self, group: SubagentActivityGroup) -> List[Text]:
+        """Render a bounded Claude/Codex-style summary of child activity."""
+
+        agents = sorted(group.agents.values(), key=self._subagent_sort_key)
+        if not agents:
+            return []
+
+        header = self._format_subagent_header(agents)
+        if self.console.height < MIN_DETAILED_SUBAGENT_HEIGHT:
+            return [header]
+
+        visible = agents[:MAX_VISIBLE_SUBAGENTS]
+        lines = [header]
+        for index, agent in enumerate(visible):
+            lines.append(self._format_subagent_row(agent, index == len(agents) - 1))
+
+        hidden = len(agents) - len(visible)
+        if hidden:
+            hidden_line = Text()
+            hidden_line.append("  ╰─ ", style="dim")
+            hidden_line.append(f"+{self._count_label(hidden, 'more agent')}", style="dim")
+            lines.append(hidden_line)
+        return lines
+
+    def _format_subagent_header(self, agents: List[SubagentActivityTracker]) -> Text:
+        running = sum(agent.status == "running" for agent in agents)
+        completed = sum(agent.status == "completed" for agent in agents)
+        failed = sum(agent.status == "failed" for agent in agents)
+        cancelled = sum(agent.status == "cancelled" for agent in agents)
+        tool_uses = sum(agent.tool_uses for agent in agents)
+        tool_use_label = self._count_label(tool_uses, "tool use")
+
+        header = Text()
+        if running:
+            header.append("◉ ", style="cyan")
+            header.append("Delegated agents", style="bold cyan")
+            parts = [f"{running} running"]
+            if completed:
+                parts.append(f"{completed} done")
+            if failed:
+                parts.append(f"{failed} failed")
+            if cancelled:
+                parts.append(f"{cancelled} cancelled")
+            header.append(f" · {', '.join(parts)} · {tool_use_label}", style="dim")
+        else:
+            terminal_outcomes = sum(bool(count) for count in (completed, failed, cancelled))
+            if terminal_outcomes > 1:
+                result_label = "Mixed results"
+                result_color = "magenta"
+            elif failed:
+                result_label = "Failed"
+                result_color = "red"
+            elif cancelled:
+                result_label = "Cancelled"
+                result_color = "yellow"
+            else:
+                result_label = "Succeeded"
+                result_color = "green"
+
+            header.append("● ", style=result_color)
+            header.append("Delegated agents", style=f"bold {result_color}")
+            agent_label = self._count_label(len(agents), "agent")
+            summary = f"{result_label} ({agent_label}, {tool_use_label})"
+            if terminal_outcomes > 1:
+                outcomes = []
+                if completed:
+                    outcomes.append(f"{completed} succeeded")
+                if failed:
+                    outcomes.append(f"{failed} failed")
+                if cancelled:
+                    outcomes.append(f"{cancelled} cancelled")
+                summary += f" · {', '.join(outcomes)}"
+            header.append(f" · {summary}", style=f"dim {result_color}")
+        return header
+
+    def _format_subagent_row(self, agent: SubagentActivityTracker, is_last: bool) -> Text:
+        line = Text()
+        line.append("  ╰─ " if is_last else "  ├─ ", style="dim")
+        label = " ".join(agent.label.split())[:64] or "subagent"
+        line.append(label, style="cyan")
+        if agent.status == "running":
+            line.append(f" · {agent.current_tool or 'working'}", style="dim cyan")
+        elif agent.status == "completed":
+            suffix = (
+                f"succeeded ({self._count_label(agent.tool_uses, 'tool use')})"
+                if agent.tool_uses
+                else "succeeded"
+            )
+            line.append(f" · {suffix}", style="dim green")
+        elif agent.status == "failed":
+            line.append(" · failed", style="red")
+            if agent.detail:
+                detail = " ".join(agent.detail.split())[:80]
+                if detail:
+                    line.append(f" · {detail}", style="dim red")
+        else:
+            line.append(" · cancelled", style="yellow")
+        return line
+
+    @staticmethod
+    def _subagent_sort_key(agent: SubagentActivityTracker):
+        """Sort declared positions first, then stable identity fields."""
+
+        label = " ".join(agent.label.split()).casefold()
+        if agent.order is None:
+            return (1, 0, label, agent.agent_id)
+        return (0, agent.order, label, agent.agent_id)
+
+    @staticmethod
+    def _count_label(count: int, singular: str) -> str:
+        """Return a count with simple English singular/plural grammar."""
+
+        suffix = singular if count == 1 else f"{singular}s"
+        return f"{count} {suffix}"
+
+    def _has_correlated_subagent_group(self, tracker: Optional[ToolCallTracker]) -> bool:
+        """Return whether a delegate call already has richer child-run output."""
+
+        if (
+            tracker is None
+            or tracker.tool_name not in {"task_delegate", "agent_tool"}
+            or not tracker.call_id
+        ):
+            return False
+        return any(
+            group.parent_call_id == tracker.call_id for group in self.subagent_groups.values()
+        )
 
     def finalize_text_sections(self):
         """Finalize any pending text sections."""
@@ -747,6 +1038,9 @@ class StreamingDisplayManager:
             return ""
 
         clean_output = output.strip()
+
+        if tool_name == "task_delegate":
+            return "Delegation complete"
 
         # Handle read_file tool
         if tool_name == "read_file":

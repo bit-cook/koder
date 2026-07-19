@@ -5,13 +5,14 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from agents.models.chatcmpl_converter import Converter
 
 from koder_agent.config import reset_config_manager
 from koder_agent.core.session import EnhancedSQLiteSession
 from koder_agent.core.usage_tracker import UsageTracker, usage_snapshot_path
-from koder_agent.harness.agents.definitions import AgentDefinition
+from koder_agent.harness.agents.definitions import AgentDefinition, get_agent_definitions
 from koder_agent.harness.agents.service import AgentService
 from koder_agent.harness.commands.interactive import HarnessInteractiveCommandHandler
 from koder_agent.harness.memory.compact import CompactionResult
@@ -388,14 +389,14 @@ def test_live_magic_docs_command_lists_and_refreshes_marker_docs(tmp_path, monke
 
 
 def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatch):
-    original_home = Path.home()
+    monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".zshrc").write_text('export PS1="project:\\W\\$ "\n', encoding="utf-8")
     home_settings = tmp_path / ".koder" / "settings.json"
     home_settings.parent.mkdir(parents=True, exist_ok=True)
     home_settings.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         "koder_agent.harness.commands.security_review.llm_completion",
-        lambda messages, model=None: asyncio.sleep(
+        lambda messages, model=None, **kwargs: asyncio.sleep(
             0, result="# Security Review\n\nNo high-confidence security findings."
         ),
     )
@@ -455,15 +456,7 @@ def test_live_harness_commands_return_runtime_backed_output(tmp_path, monkeypatc
     pr_comments_output = _run("/pr_comments", handler=handler)
     peers_output = _run("/peers", handler=handler)
     feedback_output = _run("/feedback", handler=handler)
-    try:
-        import os
-
-        os.environ["HOME"] = str(tmp_path)
-        statusline_output = _run("/statusline", handler=handler)
-    finally:
-        import os
-
-        os.environ["HOME"] = str(original_home)
+    statusline_output = _run("/statusline", handler=handler)
     color_output = _run("/color", handler=handler)
     ctx_viz_output = _run("/ctx_viz", handler=handler)
     sandbox_output = _run("/sandbox", handler=handler)
@@ -637,6 +630,26 @@ def test_plan_command_toggles_permission_mode_and_blocks_mutations():
     assert "allowed: true" in allowed_output
     assert "read-only tool allowed in plan mode" in allowed_output
     assert "permission_mode: default" in exit_output
+
+
+def test_permissions_check_passes_notebook_path_to_permission_service():
+    permission_service = PermissionService.default()
+    permission_service.evaluate_tool_call_async = AsyncMock(  # type: ignore[method-assign]
+        wraps=permission_service.evaluate_tool_call_async
+    )
+    handler = HarnessInteractiveCommandHandler(permission_service=permission_service)
+    notebook_path = "analysis.ipynb"
+
+    output = _run(f"/permissions check notebook_edit {notebook_path}", handler=handler)
+
+    permission_service.evaluate_tool_call_async.assert_awaited_once_with(
+        "notebook_edit",
+        {"notebook_path": notebook_path},
+    )
+    assert "tool: notebook_edit" in output
+    assert "allowed: false" in output
+    assert "requires_approval: true" in output
+    assert "workspace mutation requires approval" in output
 
 
 def test_help_command_uses_registry_descriptions_without_execute_placeholders():
@@ -1169,7 +1182,7 @@ def test_advisor_command_runs_local_review_with_current_session_and_repo(tmp_pat
     scheduler = SimpleNamespace(session=session)
     captured: dict[str, object] = {}
 
-    async def _fake_completion(messages, model=None):
+    async def _fake_completion(messages, model=None, **kwargs):
         captured["messages"] = messages
         captured["model"] = model
         return "# Advisor Review\n\n## Recommended Next Steps\n- Add a regression test."
@@ -1464,7 +1477,7 @@ def test_btw_command_uses_session_context_without_mutating_history(tmp_path, mon
 
     captured_messages: list[dict] = []
 
-    async def _fake_completion(messages, model=None):
+    async def _fake_completion(messages, model=None, **kwargs):
         captured_messages.extend(messages)
         return "Auth note: OAuth refresh tokens."
 
@@ -1541,11 +1554,8 @@ def test_compact_command_persists_runtime_compaction_summary(monkeypatch):
         async def get_items(self):
             return list(self.items)
 
-        async def clear_session(self):
-            self.items = []
-
-        async def add_items(self, items):
-            self.items.extend(items)
+        async def replace_items(self, items):
+            self.items = list(items)
 
     async def fake_compact(messages):
         return CompactionResult(
@@ -1574,6 +1584,52 @@ def test_compact_command_persists_runtime_compaction_summary(monkeypatch):
     ]
 
 
+def test_compact_command_pins_only_the_current_scheduler_todo(monkeypatch):
+    class _Session:
+        session_id = "compact-todo"
+
+        def __init__(self):
+            self.items = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "latest answer"},
+            ]
+
+        async def get_items(self):
+            return list(self.items)
+
+        async def replace_items(self, items):
+            self.items = list(items)
+
+    async def fake_compact(messages):
+        return CompactionResult(
+            summary="Older messages summarized.",
+            kept_messages=messages[-1:],
+            token_count=12,
+            original_count=len(messages),
+        )
+
+    monkeypatch.setattr(
+        "koder_agent.harness.commands.interactive.llm_compact_messages",
+        fake_compact,
+    )
+
+    session = _Session()
+    scheduler = SimpleNamespace(
+        session=session,
+        _active_todo_preserved_message=lambda: {
+            "role": "user",
+            "content": "Active Plan (pinned across compaction)\n  └ □ current scheduler task",
+        },
+    )
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+
+    output = asyncio.run(handler.handle_slash_input("/compact", scheduler=scheduler))
+
+    assert output.startswith("compacted, context size ")
+    assert "current scheduler task" in session.items[1]["content"]
+    assert session.items[-1]["content"] == "latest answer"
+
+
 def test_compact_command_summarizes_response_items_instead_of_replaying_them(monkeypatch):
     class _Session:
         session_id = "compact-sdk-items"
@@ -1596,11 +1652,8 @@ def test_compact_command_summarizes_response_items_instead_of_replaying_them(mon
         async def get_items(self):
             return list(self.items)
 
-        async def clear_session(self):
-            self.items = []
-
-        async def add_items(self, items):
-            self.items.extend(items)
+        async def replace_items(self, items):
+            self.items = list(items)
 
     async def fake_completion(_messages):
         return "Summary: old messages summarized."
@@ -1653,7 +1706,18 @@ def test_compact_command_rejects_extra_arguments():
     assert output == "Usage: /compact"
 
 
-def test_session_rename_commands_use_scheduler_state():
+def test_session_rename_commands_use_scheduler_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class _UnexpectedGlobalSession:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("scheduler commands must not open global session storage")
+
+    monkeypatch.setattr(
+        "koder_agent.harness.commands.interactive.EnhancedSQLiteSession",
+        _UnexpectedGlobalSession,
+    )
+
     class _Session:
         def __init__(self):
             self.session_id = "runtime-demo"
@@ -1760,11 +1824,14 @@ def test_files_command_lists_files_already_in_session_context(tmp_path):
 
     tracked_one = tmp_path / "src" / "auth.py"
     tracked_two = tmp_path / "docs" / "guide.md"
+    tracked_notebook = tmp_path / "notebooks" / "analysis.ipynb"
     missing_file = tmp_path / "missing.md"
     tracked_one.parent.mkdir(parents=True)
     tracked_two.parent.mkdir(parents=True)
+    tracked_notebook.parent.mkdir(parents=True)
     tracked_one.write_text("print('auth')\n", encoding="utf-8")
     tracked_two.write_text("# guide\n", encoding="utf-8")
+    tracked_notebook.write_text('{"cells": []}\n', encoding="utf-8")
 
     class _Session:
         session_id = "files-context-demo"
@@ -1796,6 +1863,11 @@ def test_files_command_lists_files_already_in_session_context(tmp_path):
                     "name": "edit_file",
                     "arguments": json.dumps({"path": str(missing_file)}),
                 },
+                {
+                    "type": "function_call",
+                    "name": "notebook_edit",
+                    "arguments": json.dumps({"notebook_path": str(tracked_notebook)}),
+                },
             ]
 
     scheduler = SimpleNamespace(session=_Session())
@@ -1805,8 +1877,71 @@ def test_files_command_lists_files_already_in_session_context(tmp_path):
     assert files_output.startswith("Files in context:\n")
     assert "src/auth.py (exists)" in files_output
     assert "docs/guide.md (exists)" in files_output
+    assert "notebooks/analysis.ipynb (exists)" in files_output
     assert "missing.md (missing)" in files_output
     assert files_output.count("src/auth.py") == 1
+
+
+def test_context_consumers_ignore_invalid_persisted_tool_targets(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    decoy = tmp_path / "safe-decoy.ipynb"
+    actual = tmp_path / "outside-target.ipynb"
+    decoy.write_text('{"cells": []}\n', encoding="utf-8")
+    actual.write_text('{"cells": []}\n', encoding="utf-8")
+
+    class _Session:
+        async def get_items(self):
+            return [
+                {
+                    "type": "function_call",
+                    "name": "notebook_edit",
+                    "arguments": json.dumps(
+                        {
+                            "path": str(decoy),
+                            "notebook_path": str(actual),
+                            "operation": "delete",
+                        }
+                    ),
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{malformed",
+                            }
+                        },
+                        {
+                            "name": "write_file",
+                            "arguments": json.dumps([str(actual)]),
+                        },
+                    ]
+                },
+            ]
+
+    usage = SimpleNamespace(
+        current_context_tokens=0,
+        request_count=0,
+        input_tokens=0,
+        output_tokens=0,
+        total_cost=0.0,
+    )
+    scheduler = SimpleNamespace(
+        session=_Session(),
+        usage_tracker=SimpleNamespace(session_usage=usage, model="gpt-4.1"),
+    )
+    handler = HarnessInteractiveCommandHandler(emit_console=False)
+
+    files_output = _run_with_scheduler("/files", handler=handler, scheduler=scheduler)
+    context_output = _run_with_scheduler("/context", handler=handler, scheduler=scheduler)
+    insights_output = _run_with_scheduler("/insights", handler=handler, scheduler=scheduler)
+
+    assert files_output == "No files in context"
+    assert "### Files in context" not in context_output
+    assert "Files in context: 0" in insights_output
+    for output in (files_output, context_output, insights_output):
+        assert decoy.name not in output
+        assert actual.name not in output
 
 
 def test_diff_command_reports_git_and_conversation_edits(tmp_path, monkeypatch):
@@ -2009,7 +2144,7 @@ def test_security_review_command_uses_prompt_backed_markdown_contract(tmp_path, 
 
     captured_messages: list[dict] = []
 
-    async def _fake_completion(messages, model=None):
+    async def _fake_completion(messages, model=None, **kwargs):
         captured_messages.extend(messages)
         return (
             "# Vuln 1: XSS: `src/auth.py:2`\n\n"
@@ -2402,9 +2537,9 @@ def test_permissions_check_reports_sandbox_and_tool_decisions(tmp_path, monkeypa
     assert "sandbox: enabled" in enable_output
     assert "permissions: check" in blocked_output
     assert "tool: run_shell" in blocked_output
-    assert "allowed: true" in blocked_output
-    assert "requires_approval: false" in blocked_output
-    assert "sandboxed shell command auto-allowed" in blocked_output
+    assert "allowed: false" in blocked_output
+    assert "requires_approval: true" in blocked_output
+    assert "sandboxed shell command auto-allowed" not in blocked_output
     assert "sandbox: excluded command added" in exclude_output
     assert "allowed: false" in excluded_output
     assert "requires_approval: true" in excluded_output
@@ -2563,11 +2698,10 @@ def test_fork_command_respects_main_agent_spawn_allowlist(tmp_path):
 
 def test_fork_command_can_resume_background_agent(tmp_path):
     service = AgentService.for_test(tmp_path)
-    definition = AgentDefinition(
-        agent_type="general-purpose",
-        when_to_use="General work",
-        system_prompt="You are a general-purpose agent.",
-        source="built-in",
+    definition = next(
+        agent
+        for agent in get_agent_definitions(cwd=tmp_path).active_agents
+        if agent.agent_type == "general-purpose"
     )
 
     import koder_agent.harness.agents.service as agent_service_module
@@ -2583,6 +2717,7 @@ def test_fork_command_can_resume_background_agent(tmp_path):
                 agent_definition=definition,
                 prompt="first task",
                 description="First task",
+                cwd=tmp_path,
             )
         )
         asyncio.run(service.wait(first.id))
@@ -2604,12 +2739,17 @@ def test_fork_command_can_resume_background_agent(tmp_path):
 
 def test_fork_command_preserves_plan_permission_mode_on_resume(tmp_path):
     service = AgentService.for_test(tmp_path)
-    definition = AgentDefinition(
-        agent_type="planner",
-        when_to_use="Plans work",
-        system_prompt="You are a planner.",
-        source="built-in",
-        permission_mode="plan",
+    project = tmp_path / "project"
+    (project / ".koder" / "agents").mkdir(parents=True)
+    (project / ".koder" / "agents" / "planner.md").write_text(
+        "---\nname: planner\ndescription: Plans work\npermissionMode: plan\n---\n"
+        "You are a planner.\n",
+        encoding="utf-8",
+    )
+    definition = next(
+        agent
+        for agent in get_agent_definitions(cwd=project).active_agents
+        if agent.agent_type == "planner"
     )
 
     import koder_agent.harness.agents.service as agent_service_module
@@ -2627,6 +2767,7 @@ def test_fork_command_preserves_plan_permission_mode_on_resume(tmp_path):
                 prompt="draft plan",
                 description="Draft plan",
                 permission_mode="plan",
+                cwd=project,
             )
         )
         asyncio.run(service.wait(first.id))
@@ -2647,3 +2788,113 @@ def test_fork_command_preserves_plan_permission_mode_on_resume(tmp_path):
     assert (
         Path(first.output_path).read_text(encoding="utf-8") == "mode=plan; prompt=continue planning"
     )
+
+
+def test_fork_resume_uses_origin_project_definition_after_main_cwd_changes(tmp_path, monkeypatch):
+    service = AgentService.for_test(tmp_path)
+    origin = tmp_path / "origin"
+    other = tmp_path / "other"
+    for project, body in ((origin, "Origin worker."), (other, "Other worker.")):
+        (project / ".koder" / "agents").mkdir(parents=True)
+        (project / ".koder" / "agents" / "worker.md").write_text(
+            "---\nname: worker\ndescription: Does work\npermissionMode: plan\n---\n" + body + "\n",
+            encoding="utf-8",
+        )
+    origin_definition = next(
+        agent
+        for agent in get_agent_definitions(cwd=origin).active_agents
+        if agent.agent_type == "worker"
+    )
+    seen: list[tuple[str, str, str]] = []
+
+    import koder_agent.harness.agents.service as agent_service_module
+
+    async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
+        seen.append((agent_definition.system_prompt, prompt, cwd))
+        return f"result for {prompt}"
+
+    original_execute = agent_service_module._execute_agent_run
+    agent_service_module._execute_agent_run = fake_execute
+    try:
+        first = asyncio.run(
+            service.launch_background(
+                agent_definition=origin_definition,
+                prompt="first task",
+                description="Origin task",
+                cwd=origin,
+                permission_mode="plan",
+            )
+        )
+        asyncio.run(service.wait(first.id))
+        monkeypatch.chdir(other)
+        other_definition = next(
+            agent
+            for agent in get_agent_definitions(cwd=other).active_agents
+            if agent.agent_type == "worker"
+        )
+        scheduler = SimpleNamespace(
+            session=SimpleNamespace(get_items=lambda: []),
+            agent_definitions=SimpleNamespace(active_agents=[other_definition]),
+        )
+        handler = HarnessInteractiveCommandHandler(agent_service=service)
+        output = asyncio.run(
+            handler.handle_slash_input(f"/fork --resume {first.id} continue task", scheduler)
+        )
+        asyncio.run(service.wait(first.id))
+    finally:
+        agent_service_module._execute_agent_run = original_execute
+
+    assert "fork: resumed background subagent" in output
+    assert "permission_mode: plan" in output
+    assert seen[-1] == ("Origin worker.", "continue task", str(origin.resolve()))
+
+
+def test_fork_resume_rejects_missing_origin_definition_even_with_same_name_elsewhere(
+    tmp_path, monkeypatch
+):
+    service = AgentService.for_test(tmp_path)
+    origin = tmp_path / "origin"
+    other = tmp_path / "other"
+    for project, body in ((origin, "Origin worker."), (other, "Other worker.")):
+        (project / ".koder" / "agents").mkdir(parents=True)
+        (project / ".koder" / "agents" / "worker.md").write_text(
+            "---\nname: worker\ndescription: Does work\n---\n" + body + "\n",
+            encoding="utf-8",
+        )
+    origin_definition = next(
+        agent
+        for agent in get_agent_definitions(cwd=origin).active_agents
+        if agent.agent_type == "worker"
+    )
+
+    async def fake_execute(**_kwargs):
+        return "done"
+
+    import koder_agent.harness.agents.service as agent_service_module
+
+    original_execute = agent_service_module._execute_agent_run
+    agent_service_module._execute_agent_run = fake_execute
+    try:
+        first = asyncio.run(
+            service.launch_background(
+                agent_definition=origin_definition,
+                prompt="first task",
+                description="Origin task",
+                cwd=origin,
+            )
+        )
+        asyncio.run(service.wait(first.id))
+        (origin / ".koder" / "agents" / "worker.md").unlink()
+        monkeypatch.chdir(other)
+        handler = HarnessInteractiveCommandHandler(agent_service=service)
+        output = asyncio.run(
+            handler.handle_slash_input(
+                f"/fork --resume {first.id} continue task",
+                SimpleNamespace(agent_definitions=get_agent_definitions(cwd=other)),
+            )
+        )
+    finally:
+        agent_service_module._execute_agent_run = original_execute
+
+    assert "original agent definition is missing or changed" in output
+    assert service.get(first.id).state == "completed"

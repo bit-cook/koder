@@ -9,9 +9,14 @@ Conversation compaction is intentionally NOT handled here; it is owned by the
 scheduler so there is a single, modern compaction path.
 """
 
+import asyncio
 import json
 import os
-from collections import Counter
+import sqlite3
+import threading
+from collections import Counter, defaultdict, deque
+from contextlib import contextmanager
+from enum import Enum
 from typing import Dict, List, Optional
 
 import aiosqlite
@@ -20,6 +25,46 @@ from agents import SQLiteSession
 from agents.items import TResponseInputItem
 
 from ..utils.client import llm_completion
+
+
+class _ReplacementCancelledError(Exception):
+    """Internal signal that a cancelled async replacement rolled back."""
+
+
+class _ReplacementOutcome(Enum):
+    """Final transaction outcome observed by the async caller."""
+
+    CANCELLED = "cancelled"
+    COMMITTED = "committed"
+
+
+class _ReplacementCoordinator:
+    """Linearize async cancellation against the worker's commit decision."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancellation_requested = False
+        self._commit_started = False
+
+    def request_cancellation(self) -> bool:
+        """Request rollback unless the worker already won the commit race."""
+        with self._lock:
+            if self._commit_started:
+                return False
+            self._cancellation_requested = True
+            return True
+
+    def raise_if_cancellation_requested(self) -> None:
+        with self._lock:
+            if self._cancellation_requested:
+                raise _ReplacementCancelledError()
+
+    def begin_commit(self) -> None:
+        """Claim the operation for commit or observe a prior cancellation."""
+        with self._lock:
+            if self._cancellation_requested:
+                raise _ReplacementCancelledError()
+            self._commit_started = True
 
 
 async def migrate_legacy_sessions(db_path: str) -> int:
@@ -203,8 +248,6 @@ class EnhancedSQLiteSession(SQLiteSession):
     async def collect_local_stats(cls, db_path: Optional[str] = None) -> dict[str, object]:
         resolved_db_path = cls._resolve_db_path(db_path)
         session = cls(session_id="stats-probe", db_path=resolved_db_path)
-        await session._ensure_metadata_table()
-
         summary = {
             "total_sessions": 0,
             "total_messages": 0,
@@ -215,52 +258,60 @@ class EnhancedSQLiteSession(SQLiteSession):
         }
 
         try:
-            async with aiosqlite.connect(resolved_db_path) as conn:
-                cursor = await conn.execute("""
-                    SELECT session_id, created_at, updated_at
-                    FROM session_metadata
-                    ORDER BY created_at ASC, session_id ASC
-                    """)
-                rows = await cursor.fetchall()
-                if rows:
-                    total_sessions = len(rows)
-                    created_dates = [str(row[1])[:10] for row in rows if row[1]]
-                    updated_dates = [str(row[2])[:10] for row in rows if row[2]]
-                    all_dates = [*created_dates, *updated_dates]
-                    peak_day = None
-                    if created_dates:
-                        counts = Counter(created_dates)
-                        peak_day = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][
-                            0
-                        ]
-                    summary.update(
-                        {
-                            "total_sessions": total_sessions,
-                            "active_days": len(set(all_dates)),
-                            "first_session_date": min(created_dates) if created_dates else None,
-                            "last_session_date": (
-                                max(updated_dates or created_dates)
-                                if (updated_dates or created_dates)
-                                else None
-                            ),
-                            "peak_day": peak_day,
-                        }
-                    )
+            await session._ensure_metadata_table()
+            try:
+                async with aiosqlite.connect(resolved_db_path) as conn:
+                    cursor = await conn.execute("""
+                        SELECT session_id, created_at, updated_at
+                        FROM session_metadata
+                        ORDER BY created_at ASC, session_id ASC
+                        """)
+                    rows = await cursor.fetchall()
+                    if rows:
+                        total_sessions = len(rows)
+                        created_dates = [str(row[1])[:10] for row in rows if row[1]]
+                        updated_dates = [str(row[2])[:10] for row in rows if row[2]]
+                        all_dates = [*created_dates, *updated_dates]
+                        peak_day = None
+                        if created_dates:
+                            counts = Counter(created_dates)
+                            peak_day = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[
+                                0
+                            ][0]
+                        summary.update(
+                            {
+                                "total_sessions": total_sessions,
+                                "active_days": len(set(all_dates)),
+                                "first_session_date": (
+                                    min(created_dates) if created_dates else None
+                                ),
+                                "last_session_date": (
+                                    max(updated_dates or created_dates)
+                                    if (updated_dates or created_dates)
+                                    else None
+                                ),
+                                "peak_day": peak_day,
+                            }
+                        )
 
-                for table_name in ("agent_messages", "items"):
-                    cursor = await conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-                        (table_name,),
-                    )
-                    if await cursor.fetchone():
-                        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table_name}")
-                        row = await cursor.fetchone()
-                        summary["total_messages"] = int(row[0]) if row and row[0] is not None else 0
-                        break
-        except Exception:
+                    for table_name in ("agent_messages", "items"):
+                        cursor = await conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+                            (table_name,),
+                        )
+                        if await cursor.fetchone():
+                            cursor = await conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+                            row = await cursor.fetchone()
+                            summary["total_messages"] = (
+                                int(row[0]) if row and row[0] is not None else 0
+                            )
+                            break
+            except Exception:
+                return summary
+
             return summary
-
-        return summary
+        finally:
+            session.close()
 
     @staticmethod
     def _resolve_db_path(db_path: Optional[str] = None) -> str:
@@ -279,17 +330,20 @@ class EnhancedSQLiteSession(SQLiteSession):
     ) -> None:
         resolved_db_path = cls._resolve_db_path(db_path)
         session = cls(session_id=session_id, db_path=resolved_db_path)
-        await session._ensure_metadata_table()
-        async with aiosqlite.connect(resolved_db_path) as conn:
-            await conn.execute(
-                """INSERT INTO session_metadata (session_id, cwd, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    cwd = excluded.cwd,
-                    updated_at = CURRENT_TIMESTAMP""",
-                (session_id, cwd),
-            )
-            await conn.commit()
+        try:
+            await session._ensure_metadata_table()
+            async with aiosqlite.connect(resolved_db_path) as conn:
+                await conn.execute(
+                    """INSERT INTO session_metadata (session_id, cwd, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        cwd = excluded.cwd,
+                        updated_at = CURRENT_TIMESTAMP""",
+                    (session_id, cwd),
+                )
+                await conn.commit()
+        finally:
+            session.close()
 
     @classmethod
     async def get_most_recent_session_for_cwd(
@@ -299,8 +353,8 @@ class EnhancedSQLiteSession(SQLiteSession):
     ) -> Optional[str]:
         resolved_db_path = cls._resolve_db_path(db_path)
         session = cls(session_id="metadata-probe", db_path=resolved_db_path)
-        await session._ensure_metadata_table()
         try:
+            await session._ensure_metadata_table()
             async with aiosqlite.connect(resolved_db_path) as conn:
                 cursor = await conn.execute(
                     """SELECT session_id
@@ -314,6 +368,8 @@ class EnhancedSQLiteSession(SQLiteSession):
                 return row[0] if row else None
         except Exception:
             return None
+        finally:
+            session.close()
 
     @classmethod
     async def record_session_agent(
@@ -324,17 +380,20 @@ class EnhancedSQLiteSession(SQLiteSession):
     ) -> None:
         resolved_db_path = cls._resolve_db_path(db_path)
         session = cls(session_id=session_id, db_path=resolved_db_path)
-        await session._ensure_metadata_table()
-        async with aiosqlite.connect(resolved_db_path) as conn:
-            await conn.execute(
-                """INSERT INTO session_metadata (session_id, agent, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    agent = excluded.agent,
-                    updated_at = CURRENT_TIMESTAMP""",
-                (session_id, agent),
-            )
-            await conn.commit()
+        try:
+            await session._ensure_metadata_table()
+            async with aiosqlite.connect(resolved_db_path) as conn:
+                await conn.execute(
+                    """INSERT INTO session_metadata (session_id, agent, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        agent = excluded.agent,
+                        updated_at = CURRENT_TIMESTAMP""",
+                    (session_id, agent),
+                )
+                await conn.commit()
+        finally:
+            session.close()
 
     @classmethod
     async def get_session_agent(
@@ -343,18 +402,11 @@ class EnhancedSQLiteSession(SQLiteSession):
         db_path: Optional[str] = None,
     ) -> Optional[str]:
         resolved_db_path = cls._resolve_db_path(db_path)
-        session = cls(session_id="metadata-probe", db_path=resolved_db_path)
-        await session._ensure_metadata_table()
+        session = cls(session_id=session_id, db_path=resolved_db_path)
         try:
-            async with aiosqlite.connect(resolved_db_path) as conn:
-                cursor = await conn.execute(
-                    "SELECT agent FROM session_metadata WHERE session_id = ?",
-                    (session_id,),
-                )
-                row = await cursor.fetchone()
-                return row[0] if row and row[0] else None
-        except Exception:
-            return None
+            return await session.get_agent()
+        finally:
+            session.close()
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Persist items to the session storage.
@@ -386,6 +438,171 @@ class EnhancedSQLiteSession(SQLiteSession):
         items = self._apply_micro_compaction(items)
         await super().add_items(items)
 
+    async def replace_items(self, items: list[TResponseInputItem]) -> None:
+        """Atomically replace this session's ordered conversation items.
+
+        The delete and inserts use the same SQLite connection inside one
+        ``BEGIN IMMEDIATE`` transaction. Readers on other connections therefore
+        observe either the previous committed history or the complete
+        replacement, never an empty intermediate state. Existing serialized
+        items retain their database timestamps, and the session metadata row is
+        updated without replacing its original creation timestamp.
+
+        Cancellation is coordinated with the worker thread at the commit
+        boundary. If cancellation wins, the transaction rolls back before this
+        coroutine raises. If commit wins, this coroutine retrieves the committed
+        outcome and returns successfully instead of reporting cancellation.
+        """
+        # Replacement is also the exact-restore primitive used by scheduler
+        # rollback paths.  Do not run append-time micro-compaction here: the
+        # supplied ordered snapshot must be persisted byte-for-byte.
+        replacement_items = list(items)
+        coordinator = _ReplacementCoordinator()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._replace_items_sync,
+                replacement_items,
+                coordinator,
+            )
+        )
+        while True:
+            try:
+                outcome = await asyncio.shield(worker)
+                break
+            except asyncio.CancelledError:
+                coordinator.request_cancellation()
+
+        if outcome is _ReplacementOutcome.CANCELLED:
+            raise asyncio.CancelledError
+
+    def _replace_items_sync(
+        self,
+        items: list[TResponseInputItem],
+        coordinator: _ReplacementCoordinator,
+    ) -> _ReplacementOutcome:
+        with self._replacement_connection() as conn:
+            try:
+                coordinator.raise_if_cancellation_requested()
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    f"""SELECT message_data, created_at
+                    FROM {self.messages_table}
+                    WHERE session_id = ?
+                    ORDER BY id ASC""",
+                    (self.session_id,),
+                )
+                preserved_timestamps: dict[str, deque[str]] = defaultdict(deque)
+                for message_data, created_at in cursor.fetchall():
+                    preserved_timestamps[message_data].append(created_at)
+
+                conn.execute(
+                    f"DELETE FROM {self.messages_table} WHERE session_id = ?",
+                    (self.session_id,),
+                )
+                self._before_replace_insert(conn)
+                # Preserve the legacy insertion seam used by context-preflight
+                # rollback tests. Production replacement inserts remain below
+                # so existing message timestamps can be restored precisely.
+                self._insert_items(conn, [])
+                coordinator.raise_if_cancellation_requested()
+
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {self.sessions_table} (session_id) VALUES (?)",
+                    (self.session_id,),
+                )
+                for item in items:
+                    message_data = json.dumps(item)
+                    timestamps = preserved_timestamps.get(message_data)
+                    created_at = timestamps.popleft() if timestamps else None
+                    conn.execute(
+                        f"""INSERT INTO {self.messages_table}
+                        (session_id, message_data, created_at)
+                        VALUES (?, ?, COALESCE(?, CURRENT_TIMESTAMP))""",
+                        (self.session_id, message_data, created_at),
+                    )
+
+                coordinator.raise_if_cancellation_requested()
+                conn.execute(
+                    f"""UPDATE {self.sessions_table}
+                    SET updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ?""",
+                    (self.session_id,),
+                )
+                self._before_replace_commit(conn)
+                coordinator.begin_commit()
+                self._commit_replace_transaction(conn)
+                return _ReplacementOutcome.COMMITTED
+            except _ReplacementCancelledError:
+                self._rollback_replace_transaction_safely(conn)
+                return _ReplacementOutcome.CANCELLED
+            except BaseException:
+                self._rollback_replace_transaction_safely(conn)
+                raise
+
+    @contextmanager
+    def _replacement_connection(self):
+        """Yield a transaction connection whose lifetime is owned by this worker.
+
+        The SDK's normal file-backed path caches one connection in thread-local
+        storage. ``replace_items`` runs through ``asyncio.to_thread``, whose
+        worker can retire immediately after the call; caching there leaves an
+        unclosed sqlite connection for garbage collection. Exact replacement
+        still uses the SDK's shared per-database lock, but file-backed workers
+        now close their dedicated connection before returning.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("SQLiteSession is closed")
+            if self._is_memory_db:
+                yield self._shared_connection
+                return
+
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                yield conn
+            finally:
+                conn.close()
+
+    def _insert_items(self, conn, items: list[TResponseInputItem]) -> None:
+        """Insert raw items for failure-injection compatibility.
+
+        Exact replacement uses the timestamp-preserving loop in
+        :meth:`_replace_items_sync`; this helper remains as a transaction-local
+        seam so partial-insert failures can be injected and proven to roll back.
+        """
+        super()._insert_items(conn, items)
+
+    def _before_replace_insert(self, _conn) -> None:
+        """Test seam invoked after delete and before replacement inserts."""
+
+    def _before_replace_commit(self, _conn) -> None:
+        """Test seam invoked immediately before cancellation/commit linearization."""
+
+    def _commit_replace_transaction(self, conn) -> None:
+        """Commit seam used to exercise cancellation after commit has won."""
+        conn.commit()
+
+    def _rollback_replace_transaction(self, conn) -> None:
+        """Rollback seam used to verify failures are surfaced, never hidden."""
+        conn.rollback()
+
+    def _rollback_replace_transaction_safely(self, conn) -> None:
+        """Rollback and force the connection out of a failed transaction.
+
+        The overridable rollback helper is a test seam and may itself fail. In
+        that case, issue a direct connection rollback before surfacing the
+        helper error so this session's thread-local connection cannot retain an
+        uncommitted delete or an open failed transaction.
+        """
+        try:
+            self._rollback_replace_transaction(conn)
+        except BaseException:
+            conn.rollback()
+            if conn.in_transaction:
+                raise RuntimeError("Forced session replacement rollback did not complete")
+            raise
+
     def _apply_micro_compaction(self, items: list[TResponseInputItem]) -> list[TResponseInputItem]:
         """Truncate oversized tool outputs before persisting.
 
@@ -409,7 +626,7 @@ class EnhancedSQLiteSession(SQLiteSession):
             return items
 
     def _estimate_tokens(self, messages: List[Dict]) -> int:
-        """Accurately calculate token count for message history.
+        """Estimate complete stored items, including tool arguments and output.
 
         Args:
             messages: List of message dictionaries
@@ -417,32 +634,9 @@ class EnhancedSQLiteSession(SQLiteSession):
         Returns:
             Estimated total token count
         """
-        total_tokens = 0
+        from ..harness.memory.budget import estimate_serialized_tokens
 
-        for msg in messages:
-            if not isinstance(msg, dict):
-                total_tokens += len(self.encoder.encode(str(msg)))
-                continue
-
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total_tokens += len(self.encoder.encode(content))
-            elif isinstance(content, list):
-                # Handle multimodal messages (e.g., images + text)
-                for block in content:
-                    if isinstance(block, dict):
-                        total_tokens += len(
-                            self.encoder.encode(json.dumps(block, ensure_ascii=False))
-                        )
-                    else:
-                        total_tokens += len(self.encoder.encode(str(block)))
-            else:
-                total_tokens += len(self.encoder.encode(str(content)))
-
-            # Metadata overhead per message (~4 tokens)
-            total_tokens += 4
-
-        return total_tokens
+        return sum(estimate_serialized_tokens(message) for message in messages)
 
     async def get_title(self) -> Optional[str]:
         """Get the title for this session.
@@ -566,6 +760,20 @@ class EnhancedSQLiteSession(SQLiteSession):
         except Exception:
             return None
 
+    async def get_agent(self) -> Optional[str]:
+        """Get the agent identity recorded for this session."""
+        try:
+            await self._ensure_metadata_table()
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute(
+                    "SELECT agent FROM session_metadata WHERE session_id = ?",
+                    (self.session_id,),
+                )
+                row = await cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
     async def generate_title(self, user_message: str) -> str:
         """Generate a concise session title from the first user message.
 
@@ -600,6 +808,7 @@ Examples of good titles:
                     {"role": "user", "content": prompt},
                 ],
                 use_small=True,
+                response_reserve=128,
             )
             # Clean up the title
             title = title.strip().strip("\"'").strip()

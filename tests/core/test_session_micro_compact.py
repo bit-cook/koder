@@ -169,6 +169,43 @@ async def test_original_items_not_mutated(db_path):
     assert original["output"] == big  # caller's dict unchanged
 
 
+@pytest.mark.asyncio
+async def test_replace_items_atomically_replaces_instead_of_appending(db_path):
+    session = EnhancedSQLiteSession("s-replace", db_path=db_path)
+    originals = [
+        {"role": "user", "content": "ORIGINAL_A"},
+        {"role": "assistant", "content": "ORIGINAL_B"},
+    ]
+    replacement = [{"role": "assistant", "content": "COMPACTED"}]
+    await session.add_items(originals)
+
+    await session.replace_items(replacement)
+
+    assert await session.get_items() == replacement
+
+
+@pytest.mark.asyncio
+async def test_replace_items_rolls_back_partial_transaction(db_path, monkeypatch):
+    session = EnhancedSQLiteSession("s-replace-fail", db_path=db_path)
+    originals = [
+        {"role": "user", "content": "ORIGINAL_A"},
+        {"role": "assistant", "content": "ORIGINAL_B"},
+    ]
+    await session.add_items(originals)
+    original_insert = session._insert_items
+
+    def partial_insert_then_fail(conn, _items):
+        original_insert(conn, [{"role": "assistant", "content": "PARTIAL_COMPACTED"}])
+        raise RuntimeError("simulated transaction failure")
+
+    monkeypatch.setattr(session, "_insert_items", partial_insert_then_fail)
+
+    with pytest.raises(RuntimeError, match="simulated transaction failure"):
+        await session.replace_items([{"role": "assistant", "content": "COMPACTED"}])
+
+    assert await session.get_items() == originals
+
+
 def test_env_default_when_unset(monkeypatch):
     """Sanity: with no env override the threshold is the documented default."""
     monkeypatch.delenv("KODER_MICRO_COMPACT_MAX_CHARS", raising=False)

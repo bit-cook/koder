@@ -35,7 +35,7 @@ def _patched_scheduler_env():
         mock_session.session_id = "test"
         mock_session.db_path = ":memory:"
         mock_session.get_items = AsyncMock(return_value=[])
-        mock_session.clear_session = AsyncMock()
+        mock_session.replace_items = AsyncMock()
         mock_session.add_items = AsyncMock()
         mock_session.summarization_threshold = None
         mock_session_cls.return_value = mock_session
@@ -170,6 +170,7 @@ class TestContextOverflowRetry:
 
             with patch("koder_agent.core.scheduler.Runner.run", side_effect=fake_run):
                 response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         assert attempts["n"] == 2  # original + one retry
         scheduler._run_auto_compact.assert_called_once()
@@ -200,6 +201,7 @@ class TestContextOverflowRetry:
 
             with patch("koder_agent.core.scheduler.Runner.run", side_effect=always_overflow):
                 response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         # Exactly one retry: original attempt + one post-compact attempt.
         assert attempts["n"] == 2
@@ -232,6 +234,7 @@ class TestContextOverflowRetry:
 
             with patch("koder_agent.core.scheduler.Runner.run", side_effect=boom):
                 response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         assert attempts["n"] == 1  # no retry
         scheduler._run_auto_compact.assert_not_called()
@@ -268,6 +271,7 @@ class TestContextOverflowRetry:
 
             with patch("koder_agent.core.scheduler.Runner.run", side_effect=always_overflow):
                 response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         assert attempts["n"] == 1  # no retry when circuit broken
         scheduler._run_auto_compact.assert_not_called()
@@ -307,7 +311,7 @@ class TestAutoCompactNoOpBreaker:
             assert scheduler._auto_compact._consecutive_failures == 0
             assert not scheduler._auto_compact.is_circuit_broken()
             # No-op means the session was never rewritten.
-            mock_session.clear_session.assert_not_called()
+            mock_session.replace_items.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_genuine_llm_failure_still_records_failure(self):
@@ -330,8 +334,8 @@ class TestAutoCompactNoOpBreaker:
             assert scheduler._auto_compact._consecutive_failures == 1
 
     @pytest.mark.asyncio
-    async def test_add_items_failure_still_records_failure(self):
-        """Non-regression: an add_items rollback records a genuine failure."""
+    async def test_replace_items_failure_still_records_failure(self):
+        """Non-regression: an atomic replacement failure is recorded."""
         original = [
             {"role": "user", "content": "old"},
             {"role": "assistant", "content": "old answer"},
@@ -343,7 +347,7 @@ class TestAutoCompactNoOpBreaker:
             patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
         ):
             mock_session.get_items = AsyncMock(return_value=list(original))
-            mock_session.add_items = AsyncMock(side_effect=RuntimeError("disk full"))
+            mock_session.replace_items = AsyncMock(side_effect=RuntimeError("disk full"))
             mock_compact.return_value = CompactionResult(
                 summary="summarized old turns",
                 kept_messages=[{"role": "assistant", "content": "new answer"}],
@@ -368,52 +372,45 @@ class TestAutoCompactNoOpBreaker:
 class TestTodoPinnedAcrossCompaction:
     @pytest.mark.asyncio
     async def test_active_todo_pinned_into_compacted_head(self):
-        from koder_agent.tools.todo import TodoStore
-
-        store = TodoStore()
-        saved = list(store.todos)
-        store.todos = [
-            {
-                "content": "wire up the parser",
-                "status": "in_progress",
-                "priority": "high",
-                "id": "1",
-            },
-            {
-                "content": "add regression tests",
-                "status": "pending",
-                "priority": "medium",
-                "id": "2",
-            },
+        original = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new request"},
+            {"role": "assistant", "content": "new answer"},
         ]
-        try:
-            original = [
-                {"role": "user", "content": "old request"},
-                {"role": "assistant", "content": "old answer"},
-                {"role": "user", "content": "new request"},
-                {"role": "assistant", "content": "new answer"},
+        with (
+            _patched_scheduler_env() as mock_session,
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            mock_session.get_items = AsyncMock(return_value=list(original))
+            mock_compact.return_value = CompactionResult(
+                summary="the earlier conversation",
+                kept_messages=[{"role": "assistant", "content": "new answer"}],
+                token_count=50,
+                original_count=4,
+            )
+            scheduler = _make_scheduler()
+            scheduler.todo_store.todos = [
+                {
+                    "content": "wire up the parser",
+                    "status": "in_progress",
+                    "priority": "high",
+                    "id": "1",
+                },
+                {
+                    "content": "add regression tests",
+                    "status": "pending",
+                    "priority": "medium",
+                    "id": "2",
+                },
             ]
-            with (
-                _patched_scheduler_env() as mock_session,
-                patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
-            ):
-                mock_session.get_items = AsyncMock(return_value=list(original))
-                mock_compact.return_value = CompactionResult(
-                    summary="the earlier conversation",
-                    kept_messages=[{"role": "assistant", "content": "new answer"}],
-                    token_count=50,
-                    original_count=4,
-                )
-                scheduler = _make_scheduler()
-                scheduler._auto_compact = AutoCompactManager(
-                    context_window=50_000, max_output_tokens=10_000
-                )
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
 
-                await scheduler._run_auto_compact()
+            await scheduler._run_auto_compact()
 
-                added = mock_session.add_items.call_args[0][0]
-        finally:
-            store.todos = saved
+            added = mock_session.replace_items.call_args[0][0]
 
         # Head: summary first, pinned todo list second.
         assert added[0]["content"].startswith("[Conversation compacted]")
@@ -427,39 +424,32 @@ class TestTodoPinnedAcrossCompaction:
     @pytest.mark.asyncio
     async def test_no_todo_message_when_store_empty(self):
         """Non-regression: an empty todo store adds no pinned message."""
-        from koder_agent.tools.todo import TodoStore
+        original = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new request"},
+            {"role": "assistant", "content": "new answer"},
+        ]
+        with (
+            _patched_scheduler_env() as mock_session,
+            patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
+        ):
+            mock_session.get_items = AsyncMock(return_value=list(original))
+            mock_compact.return_value = CompactionResult(
+                summary="the earlier conversation",
+                kept_messages=[{"role": "assistant", "content": "new answer"}],
+                token_count=50,
+                original_count=4,
+            )
+            scheduler = _make_scheduler()
+            scheduler.todo_store.todos = []
+            scheduler._auto_compact = AutoCompactManager(
+                context_window=50_000, max_output_tokens=10_000
+            )
 
-        store = TodoStore()
-        saved = list(store.todos)
-        store.todos = []
-        try:
-            original = [
-                {"role": "user", "content": "old request"},
-                {"role": "assistant", "content": "old answer"},
-                {"role": "user", "content": "new request"},
-                {"role": "assistant", "content": "new answer"},
-            ]
-            with (
-                _patched_scheduler_env() as mock_session,
-                patch("koder_agent.core.scheduler.llm_compact_messages") as mock_compact,
-            ):
-                mock_session.get_items = AsyncMock(return_value=list(original))
-                mock_compact.return_value = CompactionResult(
-                    summary="the earlier conversation",
-                    kept_messages=[{"role": "assistant", "content": "new answer"}],
-                    token_count=50,
-                    original_count=4,
-                )
-                scheduler = _make_scheduler()
-                scheduler._auto_compact = AutoCompactManager(
-                    context_window=50_000, max_output_tokens=10_000
-                )
+            await scheduler._run_auto_compact()
 
-                await scheduler._run_auto_compact()
-
-                added = mock_session.add_items.call_args[0][0]
-        finally:
-            store.todos = saved
+            added = mock_session.replace_items.call_args[0][0]
 
         # summary + single kept message, no pinned plan injected.
         assert len(added) == 2

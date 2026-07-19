@@ -199,16 +199,14 @@ def test_auto_compact_dispatches_pre_and_post_compact(tmp_path, monkeypatch):
                 {"role": "assistant", "content": "two"},
             ]
 
-        async def clear_session(self):
-            pass
-
-        async def add_items(self, items):
+        async def replace_items(self, items):
             pass
 
         summarization_threshold = 100
 
     scheduler = AgentScheduler.__new__(AgentScheduler)
     scheduler.session = _Session()
+    scheduler.todo_store = SimpleNamespace(todos=[])
     scheduler._auto_compact = SimpleNamespace(
         record_success=lambda: None, record_failure=lambda: None
     )

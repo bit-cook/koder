@@ -11,7 +11,7 @@ import yaml
 from koder_agent.config.manager import _migrate_legacy_voice_fields
 from koder_agent.harness.hooks.runtime import dispatch_command_hooks
 
-from .schema import RuntimeConfig
+from .schema import RuntimeConfig, parse_runtime_config_source
 
 
 class RuntimeConfigService:
@@ -29,7 +29,7 @@ class RuntimeConfigService:
         if self.config_path.exists():
             data = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
             data = _migrate_legacy_voice_fields(data)
-            self._config = RuntimeConfig(**data)
+            self._config = parse_runtime_config_source(data)
         else:
             self._config = RuntimeConfig()
         return self._config

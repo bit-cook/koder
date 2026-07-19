@@ -13,9 +13,12 @@ def test_model_deprecation_called():
 
 
 def test_plugin_name_validation_called():
-    # Check marketplace.py
-    src = _source("koder_agent/harness/plugins/marketplace.py")
-    assert "validate_plugin_name" in src
+    manifest_src = _source("koder_agent/harness/plugins/manifest.py")
+    lifecycle_src = _source("koder_agent/harness/plugins/path_safety.py")
+    marketplace_src = _source("koder_agent/harness/plugins/marketplace.py")
+    assert "validate_plugin_name_format" in manifest_src
+    assert "canonical_plugin_name" in lifecycle_src
+    assert "canonical_marketplace_name" in marketplace_src
 
 
 def test_skill_discovery_called():

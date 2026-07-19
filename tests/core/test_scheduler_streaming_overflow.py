@@ -213,6 +213,7 @@ class TestStreamingOverflowEndToEnd:
 
             scheduler._handle_streaming = fake_handle_streaming
             response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         assert attempts["n"] == 2  # original + one retry
         scheduler._run_auto_compact.assert_called_once()
@@ -232,6 +233,7 @@ class TestStreamingOverflowEndToEnd:
 
             scheduler._handle_streaming = always_overflow
             response = await scheduler.handle("do the thing", render_output=False)
+            await scheduler.cleanup()
 
         assert attempts["n"] == 2  # original + exactly one retry
         scheduler._run_auto_compact.assert_called_once()

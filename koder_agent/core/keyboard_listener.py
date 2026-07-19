@@ -148,39 +148,51 @@ async def iter_with_cancellation(
     try:
         while not token.is_cancelled:
             # Create a task for getting the next item
+            next_task = asyncio.create_task(async_iter.__anext__())
+            cancel_task = asyncio.create_task(token.wait())
             try:
-                # Use anext with a wrapper that checks cancellation
-                next_task = asyncio.create_task(async_iter.__anext__())
-                cancel_task = asyncio.create_task(token.wait())
-
                 # Wait for either next item or cancellation
-                done, pending = await asyncio.wait(
+                done, _pending = await asyncio.wait(
                     [next_task, cancel_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # Cancel pending tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                # Retrieve both child outcomes before choosing precedence. If
+                # cancellation and iterator failure complete together, the
+                # cancellation wins but the iterator exception is still observed.
+                if not next_task.done():
+                    next_task.cancel()
+                if not cancel_task.done():
+                    cancel_task.cancel()
+                next_result, cancel_result = await asyncio.gather(
+                    next_task,
+                    cancel_task,
+                    return_exceptions=True,
+                )
 
                 # Check what completed
-                if cancel_task in done:
+                if cancel_task in done or token.is_cancelled:
                     # Cancellation requested
                     break
 
                 if next_task in done:
-                    try:
-                        item = next_task.result()
-                        yield item
-                    except StopAsyncIteration:
+                    if isinstance(next_result, StopAsyncIteration):
                         break
+                    if isinstance(next_result, BaseException):
+                        raise next_result
+                    yield next_result
+
+                if isinstance(cancel_result, BaseException) and not isinstance(
+                    cancel_result,
+                    asyncio.CancelledError,
+                ):
+                    raise cancel_result
 
             except asyncio.CancelledError:
-                break
+                next_task.cancel()
+                cancel_task.cancel()
+                await asyncio.gather(next_task, cancel_task, return_exceptions=True)
+                raise
     except StopAsyncIteration:
         pass
 

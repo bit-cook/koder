@@ -201,6 +201,52 @@ def get_file_state() -> ReadFileState:
     return _file_state
 
 
+def validate_read_file_for_edit(path: str) -> Optional[str]:
+    """Return an edit guard error unless ``path`` has a fresh, complete read."""
+    p = Path(path).resolve()
+    if not p.exists():
+        return f"File not found: {path}"
+    if not _file_state.has_been_read(str(p)):
+        return "File has not been read yet. Read it first before editing it."
+    if _file_state.is_partial_view(str(p)):
+        return "File was only partially read. Read the full file before editing."
+    if _file_state.is_stale(str(p)):
+        return (
+            "File has been modified since it was last read. "
+            "Read it again before attempting to edit it."
+        )
+    return None
+
+
+def replace_read_file_contents(path: str, content: str) -> Optional[str]:
+    """Atomically replace a fully-read existing file using edit-file invariants.
+
+    Returns ``None`` on success, otherwise the same model-facing error used by
+    normal file edits. Callers retain responsibility for computing ``content``.
+    """
+    validation_error = validate_read_file_for_edit(path)
+    if validation_error is not None:
+        return validation_error
+
+    p = Path(path).resolve()
+    try:
+        _, line_ending = _read_text_preserving_ending(p)
+        record_pre_edit(str(p))
+        validation_error = validate_read_file_for_edit(path)
+        if validation_error is not None:
+            return validation_error
+        _atomic_write_no_follow(path, _apply_line_ending(content, line_ending))
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"{_SYMLINK_WRITE_MSG}: {path}"
+        return str(e)
+    except Exception as e:
+        return f"Error editing file: {str(e)}"
+
+    _file_state.record_read(str(p), content=_normalize_newlines(content))
+    return None
+
+
 class FileWriteModel(BaseModel):
     path: str
     content: str

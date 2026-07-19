@@ -14,7 +14,10 @@ from agents import (
     ToolInputGuardrailData,
 )
 
-from ..tools.skill_context import get_active_restrictions
+from ..tools.skill_context import (
+    get_active_restrictions,
+    get_skill_activation_block_message,
+)
 
 
 def skill_tool_restriction_guardrail(
@@ -38,12 +41,6 @@ def skill_tool_restriction_guardrail(
     Returns:
         ToolGuardrailFunctionOutput indicating whether to allow or reject
     """
-    restrictions = get_active_restrictions()
-
-    # No active restrictions - allow all tools
-    if restrictions is None:
-        return ToolGuardrailFunctionOutput.allow()
-
     # Guard against missing or empty tool_name (defensive coding)
     tool_name = getattr(data.context, "tool_name", "") or ""
     if not tool_name:
@@ -52,6 +49,26 @@ def skill_tool_restriction_guardrail(
             message="Unable to verify tool: tool name is missing or empty",
             output_info={"error": "missing_tool_name"},
         )
+
+    call_id = getattr(data.context, "tool_call_id", None)
+    activation_block = get_skill_activation_block_message(
+        tool_name,
+        call_id,
+    )
+    if activation_block is not None:
+        return ToolGuardrailFunctionOutput.reject_content(
+            message=activation_block,
+            output_info={
+                "blocked_tool": tool_name,
+                "error": "skill_activation_batch_barrier",
+            },
+        )
+
+    restrictions = get_active_restrictions()
+
+    # No active restrictions - allow all tools
+    if restrictions is None:
+        return ToolGuardrailFunctionOutput.allow()
 
     # Get tool arguments for pattern matching (e.g., shell command matching)
     tool_args = getattr(data.context, "tool_arguments", None)

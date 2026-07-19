@@ -21,6 +21,15 @@ from __future__ import annotations
 import sys
 from typing import Any, Callable, Optional
 
+from koder_agent.core.queued_input import ApprovalBroker, ApprovalBrokerUnavailableError
+
+from .tool_arguments import (
+    ToolArgumentError,
+    canonical_target_field,
+    extract_canonical_tool_target,
+    normalize_tool_arguments,
+)
+
 # Verdict strings understood by enforce_tool_permission.
 _ALLOW = "allow"
 _ALWAYS = "always"
@@ -76,20 +85,34 @@ def _summarize_arguments(tool_name: str, arguments: dict) -> str:
     """Render the most decision-relevant argument for the prompt line."""
     if not isinstance(arguments, dict):
         return ""
-    for key in ("command", "file_path", "path", "args", "url", "uri"):
-        value = arguments.get(key)
+    try:
+        normalized = normalize_tool_arguments(tool_name, arguments)
+    except ToolArgumentError as exc:
+        return f"invalid_arguments={_sanitize(str(exc))}"
+    target = extract_canonical_tool_target(tool_name, normalized)
+    target_field = canonical_target_field(tool_name)
+    if target is not None and target_field is not None:
+        shown = target if len(target) <= 200 else target[:197] + "..."
+        return f"{target_field}={_sanitize(shown)}"
+    for key in ("args",):
+        value = normalized.get(key)
         if isinstance(value, str) and value.strip():
             shown = value if len(value) <= 200 else value[:197] + "..."
             return f"{key}={_sanitize(shown)}"
     return ""
 
 
-def build_interactive_approver(reader: Optional[Reader] = None) -> Callable[..., Any]:
+def build_interactive_approver(
+    reader: Optional[Reader] = None,
+    approval_broker: ApprovalBroker | None = None,
+) -> Callable[..., Any]:
     """Build an async approver that prompts the user to allow/always/deny a call.
 
     Args:
         reader: Optional callable ``(prompt) -> answer`` used to obtain the user's
             choice. Injectable for tests; defaults to a fail-closed terminal reader.
+        approval_broker: Optional prompt-toolkit broker. When its queued-input app
+            is active, it owns stdin and supplies the answer instead of ``reader``.
 
     Returns:
         An async callable ``(tool_name, arguments, decision) -> str`` returning
@@ -112,6 +135,14 @@ def build_interactive_approver(reader: Optional[Reader] = None) -> Callable[...,
         prompt = "\n".join(lines)
 
         try:
+            if approval_broker is not None:
+                try:
+                    answer = await approval_broker.request(prompt)
+                except ApprovalBrokerUnavailableError:
+                    pass
+                else:
+                    return _ANSWER_MAP.get(answer.strip().lower(), _DENY)
+
             # The default reader blocks on terminal input; run it off the event
             # loop so a pending prompt cannot freeze streaming, background agents,
             # channel consumers, or the ESC-cancel path (review findings 4/8). A

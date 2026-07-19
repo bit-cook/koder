@@ -61,6 +61,7 @@ async def run_backend_smoke_async(
                     background=False,
                     session_id=None,
                     policy=policy,
+                    degradation_approved=True,
                 )
             )
 
@@ -127,6 +128,7 @@ async def run_backend_smoke_async(
                 background=False,
                 session_id=None,
                 policy=policy,
+                degradation_approved=True,
             )
         )
         if timeout.status != "error":

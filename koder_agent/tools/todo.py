@@ -1,5 +1,10 @@
 """Todo list management tools."""
 
+from __future__ import annotations
+
+import threading
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import List
 
 from pydantic import BaseModel
@@ -22,37 +27,94 @@ class TodoWriteModel(BaseModel):
     todos: List[TodoItem]
 
 
+@dataclass(frozen=True)
+class TodoRuntimeIdentity:
+    """Identity of one in-memory todo owner."""
+
+    session_id: str
+    agent_id: str
+    run_id: str
+
+    @classmethod
+    def direct(cls) -> "TodoRuntimeIdentity":
+        return cls(session_id="__direct__", agent_id="direct", run_id="direct")
+
+
 class TodoStore:
-    """Singleton store for todos to ensure shared state across all agents."""
+    """Thread-safe, in-memory todo state for one explicit runtime identity.
 
-    _instance = None
+    Stores are intentionally not durable. A scheduler keeps its store for its
+    lifetime, and callers may pass that same store to a replacement scheduler
+    during an in-process session switch. A fresh process or unrelated scheduler
+    starts with an empty store.
+    """
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._todos = []  # Initialize on first creation only
-        return cls._instance
+    def __init__(self, identity: TodoRuntimeIdentity):
+        self.identity = identity
+        self._lock = threading.RLock()
+        self._todos: list[dict] = []
 
     @property
     def todos(self) -> List[dict]:
-        return self._todos
+        with self._lock:
+            return [dict(todo) for todo in self._todos]
 
     @todos.setter
     def todos(self, value: List[dict]):
-        self._todos = value
+        with self._lock:
+            self._todos = [dict(todo) for todo in value]
+
+    def clear(self) -> None:
+        self.todos = []
 
 
-# Global singleton instance - created once at module load
-_store = TodoStore()
+_todo_store_var: ContextVar[TodoStore | None] = ContextVar("koder_todo_store", default=None)
+
+
+def set_todo_context(store: TodoStore) -> Token:
+    """Publish one runtime's store to SDK-created tool tasks."""
+    return _todo_store_var.set(store)
+
+
+def reset_todo_context(token: Token) -> None:
+    """Restore the previous todo runtime scope."""
+    try:
+        _todo_store_var.reset(token)
+    except (LookupError, ValueError):
+        _todo_store_var.set(None)
+
+
+def get_todo_store() -> TodoStore:
+    """Return the explicitly scoped store, failing closed when none exists."""
+    store = _todo_store_var.get()
+    if store is None:
+        raise RuntimeError(
+            "todo tools require an explicit runtime identity; this caller has no todo scope"
+        )
+    return store
+
+
+def get_todo_store_or_none() -> TodoStore | None:
+    """Return the current explicitly scoped store without creating fallback state."""
+    return _todo_store_var.get()
+
+
+def reset_todo_state_for_tests() -> None:
+    """Clear the current test scope without creating process-global state."""
+    current = _todo_store_var.get()
+    if current is not None:
+        current.clear()
+    _todo_store_var.set(None)
 
 
 @function_tool
 def todo_read() -> str:
     """Read all todos from the list."""
-    if not _store.todos:
+    todos = get_todo_store().todos
+    if not todos:
         return "No todos found. The list is empty."
 
-    return _format_todo_list(_store.todos)
+    return _format_todo_list(todos)
 
 
 def _format_todo_list(todos: List[dict], *, title: str = "Current Plan") -> str:
@@ -97,9 +159,11 @@ def todo_write(todos: List[TodoItem]) -> str:
             or low), and a stable string id
     """
     # Convert TodoItem objects to dictionaries
-    _store.todos = [todo.model_dump() for todo in todos]
+    store = get_todo_store()
+    store.todos = [todo.model_dump() for todo in todos]
 
-    if not _store.todos:
+    current_todos = store.todos
+    if not current_todos:
         return "Todo list cleared."
 
-    return _format_todo_list(_store.todos, title="Updated Plan")
+    return _format_todo_list(current_todos, title="Updated Plan")

@@ -19,22 +19,35 @@ if str(project_root) not in sys.path:
 def test_agent_tool_sync_spawn_returns_result(monkeypatch):
     """Sync agent_tool call blocks and returns the sub-agent result."""
 
+    display_labels = []
+
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
+        display_labels.append(_kwargs["display_identity"].label)
         return f"result for: {prompt}"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
 
+    from koder_agent.core.display_context import (
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
     from koder_agent.tools.agent import _agent_tool_impl
 
-    result = asyncio.run(
-        _agent_tool_impl(
-            description="Test sync",
-            prompt="Analyze the auth module",
-        )
-    )
+    async def run_case():
+        with (
+            subagent_display_scope(lambda _event: None),
+            tool_display_call_scope("agent_tool", "call-agent-tool"),
+        ):
+            return await _agent_tool_impl(
+                description="Test sync",
+                prompt="Analyze the auth module",
+            )
+
+    result = asyncio.run(run_case())
     parsed = json.loads(result)
     assert parsed["status"] == "completed"
     assert "result for: Analyze the auth module" in parsed["result"]
+    assert display_labels == ["general-purpose · Test sync"]
 
 
 def test_agent_tool_with_subagent_type(monkeypatch):

@@ -1,6 +1,6 @@
 [project]
 name = "koder"
-version = "0.6.2"
+version = "0.6.3"
 description = "An intuitive AI coding assistant and interactive CLI tool that boosts developer productivity with intelligent automation and context-aware support."
 authors = [{ name = "Pengfei Ni" }]
 readme = "README.md"
@@ -34,6 +34,7 @@ dependencies = [
     "orjson>=3.11.9",
     "apscheduler>=3.11.3",
     "fastapi-sso>=0.21.1",
+    "filelock>=3.29.0",
     "pyjwt>=2.13.0",
     "python-multipart>=0.0.32",
     "cryptography>=49.0.0",
@@ -49,6 +50,7 @@ dependencies = [
     "vercel>=0.6.0",
     "e2b>=2.31.0",
     "e2b-code-interpreter>=2.8.1",
+    "filelock>=3.29.0",
 ]
 
 [project.urls]

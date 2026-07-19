@@ -17,7 +17,10 @@ def _auto_approve_project_hooks(request):
 
     Tests in test_project_hook_trust.py manage their own patches.
     """
-    if "test_project_hook_trust" in request.node.nodeid:
+    if (
+        "test_project_hook_trust" in request.node.nodeid
+        or "real_project_hook_trust" in request.fixturenames
+    ):
         yield
         return
     with patch(
@@ -25,3 +28,8 @@ def _auto_approve_project_hooks(request):
         return_value=True,
     ):
         yield
+
+
+@pytest.fixture
+def real_project_hook_trust():
+    """Opt a harness test into the real project-hook approval gate."""

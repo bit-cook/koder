@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-TaskStatus = Literal["pending", "in_progress", "completed"]
+TaskStatus = Literal["pending", "in_progress", "completed", "failed", "cancelled"]
 
 
 def _utc_now_iso() -> str:

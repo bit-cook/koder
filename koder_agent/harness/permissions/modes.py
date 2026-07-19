@@ -35,5 +35,6 @@ FILE_WRITE_TOOLS = frozenset(
         "write_file",
         "edit_file",
         "append_file",
+        "notebook_edit",
     }
 )

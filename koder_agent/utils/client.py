@@ -16,8 +16,37 @@ from agents import (
 from openai import AsyncOpenAI
 
 from ..config import get_config, get_config_manager
+from ..core.turn_cancellation import await_with_turn_cancellation
+from ..harness.memory.budget import (
+    ContextPreflightError,
+    estimate_messages_tokens,
+    estimate_model_request_preflight,
+    truncate_messages_to_token_budget,
+)
 from .model_deprecation import check_model_deprecation
-from .model_info import resolve_model_alias
+from .model_info import get_context_window_size, get_maximum_output_tokens, resolve_model_alias
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CompletionTruncationMetadata:
+    """Truthful description of an explicitly truncated auxiliary request."""
+
+    model: str
+    context_window: int
+    response_reserve: int
+    original_input_tokens: int
+    sent_input_tokens: int
+
+
+@dataclass(frozen=True)
+class LLMCompletionResult:
+    """Auxiliary completion text plus request-integrity metadata."""
+
+    text: str
+    truncation: CompletionTruncationMetadata | None = None
+
 
 # Suppress debug info from litellm
 litellm.suppress_debug_info = True
@@ -634,12 +663,22 @@ def get_model_client_snapshot(model_override: Optional[str] = None) -> dict:
     """Return a stable snapshot of the currently resolved client settings."""
     config = get_config()
     config_manager = get_config_manager()
+    model_name = get_model_name(model_override)
+    context_window = get_configured_context_window(
+        model_name,
+        use_main_override=model_override in (None, "", "inherit"),
+    )
     return {
-        "model_name": get_model_name(model_override),
+        "model_name": model_name,
         "api_key": get_api_key(model_override),
         "base_url": get_base_url(model_override),
         "litellm_kwargs": get_litellm_model_kwargs(model_override),
         "native_openai": is_native_openai_provider(model_override),
+        "context_window": context_window,
+        "max_output_tokens": get_maximum_output_tokens(
+            model_name,
+            max_context_size=context_window,
+        ),
         "reasoning_effort": config_manager.get_effective_value(
             config.model.reasoning_effort,
             "KODER_REASONING_EFFORT",
@@ -677,6 +716,45 @@ def get_small_model_name() -> Optional[str]:
     return None
 
 
+def _positive_int(value: object, *, setting: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{setting} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{setting} must be a positive integer")
+    return parsed
+
+
+def get_configured_context_window(
+    model: str,
+    *,
+    use_small: bool = False,
+    use_main_override: bool = True,
+) -> int:
+    """Resolve an authoritative registry or explicit configured model window."""
+    config = get_config()
+    if use_small:
+        override = os.environ.get("KODER_SMALL_MODEL_CONTEXT_WINDOW")
+        if override is None:
+            override = config.model.small_model_context_window
+        setting = "model.small_model_context_window"
+    elif use_main_override:
+        override = os.environ.get("KODER_CONTEXT_WINDOW")
+        if override is None:
+            override = config.model.context_window
+        setting = "model.context_window"
+    else:
+        override = None
+        setting = "model.context_window"
+    parsed_override = _positive_int(override, setting=setting)
+    if parsed_override is None:
+        return get_context_window_size(model)
+    return get_context_window_size(model, max_context_size=parsed_override)
+
+
 @backoff.on_exception(
     backoff.expo,
     LITELLM_RETRYABLE_ERRORS,
@@ -684,8 +762,14 @@ def get_small_model_name() -> Optional[str]:
     jitter=backoff.full_jitter,
 )
 async def llm_completion(
-    messages: list, model: Optional[str] = None, use_small: bool = False
-) -> str:
+    messages: list,
+    model: Optional[str] = None,
+    use_small: bool = False,
+    *,
+    response_reserve: int | None = None,
+    overflow_policy: Literal["error", "truncate"] = "error",
+    return_metadata: bool = False,
+) -> str | LLMCompletionResult:
     """
     Make an LLM completion call using the configured provider settings.
 
@@ -698,15 +782,30 @@ async def llm_completion(
         use_small: If True and a small model is configured (via KODER_SMALL_MODEL
                    env or config.model.small_model), override the model for this call.
                    When no small model is configured, this flag is ignored.
+        response_reserve: Tokens reserved for the auxiliary response. Defaults
+                          to the model's normal maximum output allowance.
+        overflow_policy: Reject by default. Truncation is an explicit opt-in,
+                         never triggers compaction, and requires metadata.
+        return_metadata: Return :class:`LLMCompletionResult`. Required when
+                         ``overflow_policy="truncate"`` so callers cannot hide
+                         partial-input provenance.
 
     Returns:
         The completion response content as string
     """
     # If use_small requested and no explicit model override, try small model
+    selected_small_model = False
+    explicit_model_override = model is not None
     if use_small and model is None:
         small = get_small_model_name()
         if small:
             model = small
+            selected_small_model = True
+
+    if overflow_policy == "truncate" and not return_metadata:
+        raise ValueError(
+            'overflow_policy="truncate" requires return_metadata=True so truncation is surfaced'
+        )
 
     config, config_manager, provider, raw_model, model_from_env = _resolve_completion_settings(
         model
@@ -732,6 +831,55 @@ async def llm_completion(
     if model.startswith("litellm/"):
         model = model[len("litellm/") :]
 
+    context_window = get_configured_context_window(
+        model,
+        use_small=selected_small_model,
+        use_main_override=not explicit_model_override and not selected_small_model,
+    )
+    reserve = (
+        get_maximum_output_tokens(model, max_context_size=context_window)
+        if response_reserve is None
+        else max(0, response_reserve)
+    )
+    fixed_messages = []
+    dynamic_messages = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in {"system", "developer"}:
+            fixed_messages.append(message)
+        else:
+            dynamic_messages.append(message)
+    estimate = estimate_model_request_preflight(
+        context_window=context_window,
+        response_reserve=reserve,
+        instructions=fixed_messages,
+        input_items=dynamic_messages,
+        model=model,
+    )
+    truncation: CompletionTruncationMetadata | None = None
+    if not estimate.fits:
+        fitted_messages = None
+        if overflow_policy == "truncate":
+            fitted_messages = truncate_messages_to_token_budget(
+                messages,
+                estimate.available_input_tokens,
+            )
+        if fitted_messages is None:
+            raise ContextPreflightError(estimate, subject="Auxiliary request")
+        logger.warning(
+            "Truncated auxiliary LLM input for context preflight: model=%s required=%s window=%s",
+            model,
+            estimate.required_tokens,
+            estimate.context_window,
+        )
+        truncation = CompletionTruncationMetadata(
+            model=model,
+            context_window=context_window,
+            response_reserve=reserve,
+            original_input_tokens=estimate_messages_tokens(messages, model=model),
+            sent_input_tokens=estimate_messages_tokens(fitted_messages, model=model),
+        )
+        messages = fitted_messages
+
     # Use the same base URL priority as the main agent path:
     # KODER_BASE_URL > provider-specific environment > config.
     base_url = _resolve_base_url(config, config_manager, provider)
@@ -741,6 +889,7 @@ async def llm_completion(
         "model": model,
         "messages": messages,
         "metadata": {"source": "koder"},
+        "max_tokens": reserve,
     }
     if api_key:
         kwargs["api_key"] = api_key
@@ -768,6 +917,7 @@ async def llm_completion(
             "input": messages,
             "metadata": {"source": "koder"},
             "stream": False,
+            "max_output_tokens": reserve,
         }
         if api_key:
             responses_kwargs["api_key"] = api_key
@@ -775,13 +925,15 @@ async def llm_completion(
             responses_kwargs["base_url"] = base_url
         if extra_headers:
             responses_kwargs["extra_headers"] = extra_headers
-        response = await litellm.aresponses(**responses_kwargs)
-        return _extract_responses_text(response)
+        response = await await_with_turn_cancellation(litellm.aresponses(**responses_kwargs))
+        text = _extract_responses_text(response)
+        return LLMCompletionResult(text=text, truncation=truncation) if return_metadata else text
 
     if extra_headers:
         kwargs["extra_headers"] = extra_headers
-    response = await litellm.acompletion(**kwargs)
-    return response.choices[0].message.content
+    response = await await_with_turn_cancellation(litellm.acompletion(**kwargs))
+    text = response.choices[0].message.content
+    return LLMCompletionResult(text=text, truncation=truncation) if return_metadata else text
 
 
 def _extract_responses_text(response: object) -> str:

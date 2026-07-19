@@ -56,3 +56,53 @@ def test_nested_json():
     result = invoke_tool(structured_output, {"data": json.dumps(nested)})
     parsed = json.loads(result)
     assert parsed["level1"]["level2"]["level3"][2]["key"] == "deep"
+
+
+def test_oversized_structured_output_fails_explicitly(monkeypatch):
+    """Oversized structured output never masquerades as the requested schema."""
+    monkeypatch.setenv("KODER_MAX_TOOL_OUTPUT_CHARS", "500")
+    data = json.dumps({"answer": 42, "explanation": "x" * 5000})
+
+    result = invoke_tool(structured_output, {"data": data})
+    parsed = json.loads(result)
+
+    assert len(result) <= 500
+    assert parsed["error"] == "tool_output_too_large"
+    assert parsed["original_chars"] == len(data)
+    assert parsed["max_chars"] == 500
+    assert "answer" not in parsed
+
+
+def test_deep_json_returns_too_large_error(monkeypatch):
+    monkeypatch.setenv("KODER_MAX_TOOL_OUTPUT_CHARS", "10000")
+    data = "[" * 100 + "0" + "]" * 100
+
+    result = invoke_tool(structured_output, {"data": data})
+
+    assert json.loads(result)["error"] == "tool_output_too_large"
+
+
+def test_huge_json_integer_within_output_limit_is_preserved(monkeypatch):
+    monkeypatch.setenv("KODER_MAX_TOOL_OUTPUT_CHARS", "10000")
+    data = '{"value":' + "9" * 5000 + "}"
+
+    result = invoke_tool(structured_output, {"data": data})
+
+    assert result == data
+
+
+def test_wide_json_object_returns_too_large_error(monkeypatch):
+    monkeypatch.setenv("KODER_MAX_TOOL_OUTPUT_CHARS", "500000")
+    data = json.dumps({f"key_{index}": index for index in range(10001)})
+
+    result = invoke_tool(structured_output, {"data": data})
+
+    assert json.loads(result)["error"] == "tool_output_too_large"
+
+
+def test_duplicate_object_keys_are_rejected_explicitly():
+    data = '{"role":"user","role":"admin"}'
+
+    result = invoke_tool(structured_output, {"data": data})
+
+    assert json.loads(result) == {"error": "duplicate_json_key", "key": "role"}

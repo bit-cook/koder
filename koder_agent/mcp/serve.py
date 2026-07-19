@@ -21,6 +21,8 @@ _EXCLUDED_TOOLS = frozenset(
         "team_create",
         "team_delete",
         "agent_tool",
+        "todo_read",
+        "todo_write",
     }
 )
 

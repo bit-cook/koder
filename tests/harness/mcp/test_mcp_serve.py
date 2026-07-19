@@ -34,6 +34,8 @@ class TestBuildToolList:
             "team_create",
             "team_delete",
             "agent_tool",
+            "todo_read",
+            "todo_write",
         ):
             assert excluded not in exposed_names
             assert excluded not in tool_map
@@ -165,6 +167,24 @@ class TestToolCallViaServer:
             response = await handler(request)
             result = response.root
             assert result.isError is True
+
+        asyncio.run(_run())
+
+    def test_todo_tools_are_not_callable_without_an_mcp_request_identity(self):
+        async def _run():
+            server = create_mcp_server()
+            from mcp import types
+
+            handler = server.request_handlers[types.CallToolRequest]
+            requests = [
+                types.CallToolRequest(
+                    method="tools/call",
+                    params=types.CallToolRequestParams(name=name, arguments={}),
+                )
+                for name in ("todo_read", "todo_write")
+            ]
+            responses = await asyncio.gather(*(handler(request) for request in requests))
+            assert all(response.root.isError is True for response in responses)
 
         asyncio.run(_run())
 

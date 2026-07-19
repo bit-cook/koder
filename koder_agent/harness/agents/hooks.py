@@ -69,6 +69,7 @@ def _run_command_hooks(rules: list[dict], payload: dict[str, Any], cwd: str | Pa
                     cwd=str(cwd),
                     shell=True,
                     check=False,
+                    capture_output=True,
                     timeout=_bounded_timeout(hook.get("timeout")),
                 )
             except subprocess.TimeoutExpired:

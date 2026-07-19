@@ -3,7 +3,7 @@
 WORKFLOW_STATE_COMMAND_SPECS = {
     "assistant": {"help_text": "Inspect active Koder assistant profiles"},
     "init-verifiers": {"help_text": "Create project verifier skills"},
-    "memory": {"help_text": "Inspect stored runtime memories"},
+    "memory": {"help_text": "Inspect memories and review AutoDream candidates"},
     "thinkback": {"help_text": "Review recent local session context"},
     "thinkback-play": {"help_text": "Replay recent local session turns"},
     "tasks": {"help_text": "Inspect active runtime tasks"},

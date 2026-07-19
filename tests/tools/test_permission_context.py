@@ -109,6 +109,42 @@ class TestEnforceToolPermission:
             reset_tool_permission_context(token)
 
     @pytest.mark.asyncio
+    async def test_notebook_edit_denied_with_notebook_path(self):
+        """Notebook mutations use the same argument-level guard as file edits."""
+        svc = _fake_service(allowed=False, reason="path not allowed")
+        token = set_tool_permission_context(svc)
+        try:
+            arguments = {"notebook_path": "/etc/book.ipynb", "operation": "delete"}
+            result = await enforce_tool_permission("notebook_edit", json.dumps(arguments))
+            assert result is not None
+            assert "Permission denied" in result
+            svc.evaluate_tool_call_async.assert_called_once_with("notebook_edit", arguments)
+        finally:
+            reset_tool_permission_context(token)
+
+    @pytest.mark.asyncio
+    async def test_notebook_path_alias_spoof_is_rejected_before_evaluation(self):
+        svc = _fake_service(allowed=True)
+        token = set_tool_permission_context(svc)
+        try:
+            result = await enforce_tool_permission(
+                "notebook_edit",
+                json.dumps(
+                    {
+                        "path": "/workspace/decoy.ipynb",
+                        "notebook_path": "/tmp/outside.ipynb",
+                        "operation": "delete",
+                    }
+                ),
+            )
+        finally:
+            reset_tool_permission_context(token)
+
+        assert result is not None
+        assert "unexpected path field" in result
+        svc.evaluate_tool_call_async.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_requires_approval_no_approver_env_opt_out_allows(self):
         """With KODER_ENFORCE_TOOL_APPROVAL=0, unapproved calls are allowed.
 
@@ -262,6 +298,7 @@ class TestGuardedToolsCoverage:
         assert "write_file" in GUARDED_TOOLS
         assert "edit_file" in GUARDED_TOOLS
         assert "append_file" in GUARDED_TOOLS
+        assert "notebook_edit" in GUARDED_TOOLS
 
     def test_read_only_not_guarded(self):
         assert "read_file" not in GUARDED_TOOLS

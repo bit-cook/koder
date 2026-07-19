@@ -125,3 +125,22 @@ def get_bundled_skills() -> dict[str, Skill]:
             base_dir=BUNDLED_SKILLS_DIR,
         )
     return bundled
+
+
+def is_trusted_bundled_skill(skill: Skill, name: str) -> bool:
+    """Return whether *skill* is the first-party bundled implementation."""
+    canonical = get_bundled_skills().get(name)
+    if canonical is None:
+        return False
+    return (
+        skill.name == name
+        and skill.source == "bundled"
+        and skill.base_dir is not None
+        and skill.base_dir.resolve() == BUNDLED_SKILLS_DIR.resolve()
+        and skill.description == canonical.description
+        and skill.content == canonical.content
+        and skill.allowed_tools == canonical.allowed_tools
+        and skill.hooks == canonical.hooks
+        and skill.disable_model_invocation == canonical.disable_model_invocation
+        and skill.execution_context == canonical.execution_context
+    )

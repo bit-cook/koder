@@ -132,6 +132,22 @@ def create_mcp_subparsers(subparsers):
         help="Reset approval choices for project-scoped MCP servers",
     )
 
+    approve_parser = mcp_subparsers.add_parser(
+        "approve",
+        help="Review and approve current project-scoped MCP sources",
+    )
+    approve_parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        help="Approve only this project MCP source path (repeatable)",
+    )
+    approve_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Approve the displayed current digests without prompting",
+    )
+
     mcp_subparsers.add_parser("serve", help="Start koder as an MCP server")
 
 
@@ -549,7 +565,7 @@ def _append_subcommand_help(help_text: str) -> str:
         "  auth                Manage OAuth authentication",
         "                      auth <login|list|revoke|status>",
         "  mcp                 Manage MCP servers",
-        "                      mcp <add|add-json|list|get|remove|reset-project-choices|serve>",
+        "                      mcp <add|add-json|list|get|remove|approve|reset-project-choices|serve>",
         "  config              Manage configuration",
         "                      config <show|list|path|edit|init|set|validate|export|import>",
         "  agents              List configured agents",

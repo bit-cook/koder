@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .compat import function_tool
-from .file import get_file_state
+from .file import replace_read_file_contents, validate_read_file_for_edit
 
 
 @function_tool
@@ -33,21 +33,15 @@ def notebook_edit(
         new_source: New cell source (required for replace/insert).
         cell_type: Cell type for insert: 'code' or 'markdown'. Defaults to 'code'.
     """
-    path = Path(notebook_path).resolve()
+    path = Path(notebook_path).expanduser().resolve()
     if not path.exists():
         return f"Error: notebook not found: {notebook_path}"
     if not path.suffix == ".ipynb":
         return f"Error: not a notebook file: {notebook_path}"
 
-    # Security: require that the notebook was read before editing (prevents
-    # blind writes and ensures the agent has seen current content).
-    fs = get_file_state()
-    resolved_str = str(path)
-    if not fs.has_been_read(resolved_str) and not fs.has_been_read(notebook_path):
-        return (
-            "Error: you must read the notebook with read_file before editing it. "
-            "This ensures you have the current content and prevents accidental overwrites."
-        )
+    validation_error = validate_read_file_for_edit(notebook_path)
+    if validation_error is not None:
+        return validation_error
 
     try:
         nb = json.loads(path.read_text(encoding="utf-8"))
@@ -56,14 +50,14 @@ def notebook_edit(
 
     cells = nb.get("cells", [])
 
+    success_message: str
     if operation == "replace":
         if cell_index < 0 or cell_index >= len(cells):
             return f"Error: invalid cell index {cell_index} (notebook has {len(cells)} cells)"
         if new_source is None:
             return "Error: new_source required for replace operation"
         cells[cell_index]["source"] = new_source
-        path.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
-        return f"Cell {cell_index} replaced successfully."
+        success_message = f"Cell {cell_index} replaced successfully."
 
     elif operation == "insert":
         if cell_index < 0 or cell_index > len(cells):
@@ -81,15 +75,22 @@ def notebook_edit(
             new_cell["outputs"] = []
             new_cell["execution_count"] = None
         cells.insert(cell_index, new_cell)
-        path.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
-        return f"Cell inserted at index {cell_index} (type: {ct})."
+        success_message = f"Cell inserted at index {cell_index} (type: {ct})."
 
     elif operation == "delete":
         if cell_index < 0 or cell_index >= len(cells):
             return f"Error: invalid cell index {cell_index} (notebook has {len(cells)} cells)"
         deleted = cells.pop(cell_index)
-        path.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
-        return f"Cell {cell_index} deleted (was {deleted.get('cell_type', 'unknown')} cell)."
+        success_message = (
+            f"Cell {cell_index} deleted (was {deleted.get('cell_type', 'unknown')} cell)."
+        )
 
     else:
         return f"Error: unknown operation '{operation}'. Use 'replace', 'insert', or 'delete'."
+
+    write_error = replace_read_file_contents(
+        notebook_path, json.dumps(nb, indent=1, ensure_ascii=False)
+    )
+    if write_error is not None:
+        return write_error
+    return success_message

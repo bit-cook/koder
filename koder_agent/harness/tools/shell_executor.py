@@ -18,17 +18,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Union
 
-from koder_agent.harness.sandbox.backend import SandboxExecutionContext
+from koder_agent.harness.sandbox.backend import (
+    SandboxExecutionContext,
+    SandboxExecutionRequirement,
+    SandboxFallbackRequirement,
+)
+from koder_agent.harness.sandbox.enforcement import (
+    autoapproval_blockers,
+    backend_capability_digest,
+    canonical_workspace_path,
+    sandbox_degradation_reason,
+    sandbox_fallback_requirement_digest,
+    sandbox_policy_digest,
+    unsandboxed_fallback_losses,
+    unsandboxed_fallback_reason,
+)
 from koder_agent.harness.sandbox.sdk_backend import execute_with_sdk_backend
 from koder_agent.harness.sandbox_settings import is_excluded_command, resolve_sandbox_settings
 from koder_agent.harness.session_env import build_sandbox_env, build_subprocess_env
 
 IS_WINDOWS = platform.system() == "Windows"
 
-# Callback threaded in from the tool/permission layer. It is invoked with a
-# one-line human-readable reason when the sandbox backend reports
-# ``unavailable``/``unsupported``; returning True approves running the command
-# UNSANDBOXED (with a visible warning), returning False keeps the hard error.
+# Callback threaded in from the tool/permission layer. It is invoked with the
+# exact unavailable guarantees before degraded sandbox execution, and again if
+# an unavailable/unsupported backend would require UNSANDBOXED fallback.
 # May be sync or async. When omitted, degradation stays fail-closed (error).
 SandboxUnavailableApproval = Callable[[str], Union[bool, Awaitable[bool]]]
 
@@ -36,7 +49,7 @@ SandboxUnavailableApproval = Callable[[str], Union[bool, Awaitable[bool]]]
 async def _resolve_sandbox_unavailable_approval(
     approval: SandboxUnavailableApproval | None, reason: str
 ) -> bool:
-    """Ask the (optional) approval callback whether to degrade to unsandboxed.
+    """Ask the optional callback whether to accept the named sandbox degradation.
 
     Default is fail-closed: no callback -> not approved. Any error raised by the
     callback is treated as a denial so degradation never happens silently.
@@ -50,6 +63,154 @@ async def _resolve_sandbox_unavailable_approval(
         return bool(result)
     except Exception:
         return False
+
+
+def _selected_backend_status(sandbox_state):
+    return next(
+        (
+            status
+            for status in sandbox_state.backend_statuses
+            if status.backend_id == sandbox_state.backend
+        ),
+        None,
+    )
+
+
+def _sandbox_snapshot(sandbox_state, backend_status) -> SandboxExecutionRequirement:
+    return SandboxExecutionRequirement(
+        backend_id=sandbox_state.backend,
+        canonical_cwd=canonical_workspace_path(Path.cwd()),
+        policy_digest=sandbox_policy_digest(sandbox_state.policy),
+        capability_digest=backend_capability_digest(backend_status.capabilities),
+    )
+
+
+def _sandbox_snapshot_mismatch(
+    required: SandboxExecutionRequirement,
+    sandbox_state,
+    *,
+    use_sandbox: bool,
+    require_complete_capabilities: bool,
+) -> str | None:
+    current_cwd = canonical_workspace_path(Path.cwd())
+    if not sandbox_state.enabled:
+        return "sandbox is no longer enabled"
+    if not use_sandbox:
+        return "command is now excluded from sandbox execution"
+    if current_cwd != required.canonical_cwd:
+        return f"canonical cwd changed from {required.canonical_cwd} to {current_cwd}"
+    if sandbox_state.backend != required.backend_id:
+        return f"selected backend changed to {sandbox_state.backend}"
+    if sandbox_state.policy is None:
+        return "sandbox policy is unavailable"
+
+    backend_status = _selected_backend_status(sandbox_state)
+    if backend_status is None or not backend_status.available:
+        return "sandbox backend is no longer available"
+    if sandbox_policy_digest(sandbox_state.policy) != required.policy_digest:
+        return "sandbox policy changed after permission evaluation"
+    if backend_capability_digest(backend_status.capabilities) != required.capability_digest:
+        return "sandbox backend capabilities changed after permission evaluation"
+    if require_complete_capabilities:
+        blockers = autoapproval_blockers(
+            sandbox_state.policy,
+            backend_status.capabilities,
+        )
+        if blockers:
+            return "sandbox no longer proves all auto-approval protections: " + "; ".join(
+                item.restriction for item in blockers
+            )
+    return None
+
+
+def capture_unsandboxed_fallback_requirement(
+    sandbox_state,
+    *,
+    command: str,
+    trigger: str,
+) -> SandboxFallbackRequirement | None:
+    """Capture the exact state and losses for one host-execution approval."""
+
+    if sandbox_state.policy is None:
+        return None
+    backend_status = _selected_backend_status(sandbox_state)
+    if backend_status is None:
+        return None
+    canonical_cwd = canonical_workspace_path(Path.cwd())
+    losses = unsandboxed_fallback_losses(
+        sandbox_state.policy,
+        backend_status.capabilities,
+        canonical_cwd=canonical_cwd,
+    )
+    reason = unsandboxed_fallback_reason(
+        sandbox_state.backend,
+        trigger=trigger,
+        losses=losses,
+    )
+    return SandboxFallbackRequirement(
+        backend_id=sandbox_state.backend,
+        canonical_cwd=canonical_cwd,
+        policy_digest=sandbox_policy_digest(sandbox_state.policy),
+        capability_digest=backend_capability_digest(backend_status.capabilities),
+        requirement_digest=sandbox_fallback_requirement_digest(
+            command=command,
+            trigger=trigger,
+            losses=losses,
+            sandbox_enabled=sandbox_state.enabled,
+            platform_enabled=sandbox_state.platform_enabled,
+            backend_available=sandbox_state.backend_available,
+            backend_reason=sandbox_state.backend_reason,
+            backend_status_available=backend_status.available,
+            backend_status_reason=backend_status.reason,
+        ),
+        reason=reason,
+    )
+
+
+def unsandboxed_fallback_requirement_mismatch(
+    required: SandboxFallbackRequirement,
+    sandbox_state,
+    *,
+    command: str,
+    trigger: str,
+) -> str | None:
+    """Rebuild and compare every field bound by a fallback approval."""
+
+    if not sandbox_state.enabled:
+        return "sandbox is no longer enabled"
+    if is_excluded_command(command, cwd=Path.cwd()):
+        return "command is now excluded from sandbox execution"
+    current = capture_unsandboxed_fallback_requirement(
+        sandbox_state,
+        command=command,
+        trigger=trigger,
+    )
+    if current is None:
+        return "sandbox fallback state is unavailable"
+    if current.canonical_cwd != required.canonical_cwd:
+        return f"canonical cwd changed from {required.canonical_cwd} to {current.canonical_cwd}"
+    if current.backend_id != required.backend_id:
+        return f"selected backend changed from {required.backend_id} to {current.backend_id}"
+    if current.policy_digest != required.policy_digest:
+        return "sandbox policy digest changed after degradation approval"
+    if current.capability_digest != required.capability_digest:
+        return "sandbox capability digest changed after degradation approval"
+    if current.requirement_digest != required.requirement_digest:
+        return "sandbox fallback requirement digest changed after degradation approval"
+    return None
+
+
+def _blocked_sandbox_result(backend_id: str, reason: str) -> ShellExecutionResult:
+    return ShellExecutionResult(
+        status="error",
+        output=(
+            "sandboxed: false\n"
+            "created: false\n"
+            "executed: false\n"
+            f"backend: {backend_id}\n"
+            f"reason: {reason}"
+        ),
+    )
 
 
 # Cap the per-shell output buffer so a verbose long-running background process
@@ -112,10 +273,18 @@ def _kill_process_group(process: asyncio.subprocess.Process) -> None:
     _signal_process_group(process, signal.SIGKILL)
 
 
-async def _drain_after_kill(process: asyncio.subprocess.Process, timeout: float = 1.0) -> None:
+async def _drain_after_kill(
+    process: asyncio.subprocess.Process, timeout: float = 1.0
+) -> tuple[str, str]:
     """Drain buffered output after a kill without blocking forever."""
-    with contextlib.suppress(asyncio.TimeoutError, Exception):
-        await asyncio.wait_for(process.communicate(), timeout=timeout)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except Exception:
+        return "", ""
+    return (
+        stdout.decode("utf-8", errors="replace").strip() if stdout else "",
+        stderr.decode("utf-8", errors="replace").strip() if stderr else "",
+    )
 
 
 def resolve_powershell_executable() -> str | None:
@@ -273,13 +442,27 @@ class ShellExecutionResult:
     shell_id: str | None = None
 
 
-def _sandbox_output(result) -> str:
-    lines: list[str] = []
-    if result.sandboxed:
-        lines.append("sandboxed: true")
-        if result.backend_id:
-            lines.append(f"backend: {result.backend_id}")
-    body = result.combined_output().strip()
+def _sandbox_output(result, *, output_style: str = "shell") -> str:
+    lines: list[str] = [
+        f"sandboxed: {'true' if result.sandboxed else 'false'}",
+        f"created: {'true' if result.created else 'false'}",
+        f"executed: {'true' if result.executed else 'false'}",
+    ]
+    if result.backend_id:
+        lines.append(f"backend: {result.backend_id}")
+    if output_style == "git":
+        body = result.stdout.strip()
+        stderr = result.stderr.strip()
+        if stderr:
+            body = f"{body}\n{stderr}" if body else stderr
+        if result.exit_code not in (None, 0) and not body:
+            body = f"Git command failed with exit code {result.exit_code}"
+        if result.violation:
+            body = f"sandbox violation: {result.violation}" + (f"\n{body}" if body else "")
+    else:
+        body = result.combined_output().strip()
+    if result.reason and (not body or body == "(no output)"):
+        body = f"sandbox error: {result.reason}"
     if body:
         lines.append(body)
     return "\n".join(lines) if lines else "(no output)"
@@ -291,6 +474,7 @@ async def _run_foreground_unsandboxed(
     timeout: int,
     session_id: str | None,
     warning: str | None = None,
+    output_style: str = "shell",
 ) -> ShellExecutionResult:
     """Run ``command`` in the foreground without a sandbox.
 
@@ -326,8 +510,14 @@ async def _run_foreground_unsandboxed(
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         _kill_process_group(process)
-        await _drain_after_kill(process, timeout=1)
-        timeout_output = f"Command timed out after {timeout} seconds"
+        drained = await _drain_after_kill(process, timeout=1)
+        partial_stdout, partial_stderr = drained or ("", "")
+        label = "Git command" if output_style == "git" else "Command"
+        timeout_output = f"{label} timed out after {timeout} seconds"
+        if output_style != "git" and (partial_stdout or partial_stderr):
+            timeout_output += f". Partial output:\n{partial_stdout}"
+            if partial_stderr:
+                timeout_output += f"\n[stderr]: {partial_stderr}"
         if warning:
             timeout_output = f"{warning}\n{timeout_output}"
         return ShellExecutionResult(status="error", output=timeout_output)
@@ -344,13 +534,18 @@ async def _run_foreground_unsandboxed(
     output = stdout.decode("utf-8", errors="replace").strip()
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if stderr_text:
-        output += f"\n[stderr]: {stderr_text}" if output else f"[stderr]: {stderr_text}"
-    if process.returncode != 0:
+        if output_style == "git":
+            output += f"\n{stderr_text}" if output else stderr_text
+        else:
+            output += f"\n[stderr]: {stderr_text}" if output else f"[stderr]: {stderr_text}"
+    if process.returncode != 0 and output_style != "git":
         output += (
             f"\n[exit code]: {process.returncode}"
             if output
             else f"[exit code]: {process.returncode}"
         )
+    if process.returncode != 0 and not output and output_style == "git":
+        output = f"Git command failed with exit code {process.returncode}"
     output = output or "(no output)"
     if warning:
         output = f"{warning}\n{output}"
@@ -368,15 +563,16 @@ async def execute_shell_command(
     run_in_background: bool = False,
     session_id: str | None = None,
     sandbox_unavailable_approval: SandboxUnavailableApproval | None = None,
+    required_sandbox: SandboxExecutionRequirement | None = None,
+    output_style: str = "shell",
 ) -> ShellExecutionResult:
     """Execute a shell command without performing permission checks.
 
     ``sandbox_unavailable_approval`` lets the caller (which owns the permission
-    context) opt into graceful degradation: when the sandbox backend reports
-    ``unavailable``/``unsupported`` the callback is asked whether to run the
-    command UNSANDBOXED instead. If it approves, the command runs in the
-    foreground with a visible one-line warning; otherwise the fail-closed error
-    is returned (the safe default when no callback is supplied).
+    context) explicitly accept sandbox degradation. It is consulted before a
+    command enters a backend with incomplete configured guarantees and again if
+    an unavailable/unsupported backend would require UNSANDBOXED fallback. The
+    safe default without a callback is fail-closed.
     """
     parts = shlex.split(command)
     if not parts:
@@ -386,6 +582,19 @@ async def execute_shell_command(
 
     sandbox_state = resolve_sandbox_settings(Path.cwd())
     use_sandbox = sandbox_state.enabled and not is_excluded_command(command, cwd=Path.cwd())
+    if required_sandbox is not None:
+        mismatch_reason = _sandbox_snapshot_mismatch(
+            required_sandbox,
+            sandbox_state,
+            use_sandbox=use_sandbox,
+            require_complete_capabilities=True,
+        )
+        if mismatch_reason is not None:
+            return _blocked_sandbox_result(
+                required_sandbox.backend_id,
+                "permission was auto-approved only for sandbox execution, but "
+                f"{mismatch_reason}; host execution was blocked",
+            )
     if use_sandbox:
         if run_in_background:
             return ShellExecutionResult(
@@ -399,6 +608,53 @@ async def execute_shell_command(
                 ),
             )
         elif sandbox_state.policy is not None:
+            degradation_warning = None
+            backend_status = _selected_backend_status(sandbox_state)
+            if backend_status is not None and backend_status.available:
+                blockers = autoapproval_blockers(
+                    sandbox_state.policy,
+                    backend_status.capabilities,
+                )
+                if blockers:
+                    degradation_reason = sandbox_degradation_reason(
+                        sandbox_state.backend,
+                        blockers,
+                    )
+                    degradation_snapshot = _sandbox_snapshot(sandbox_state, backend_status)
+                    approved = await _resolve_sandbox_unavailable_approval(
+                        None if required_sandbox is not None else sandbox_unavailable_approval,
+                        degradation_reason,
+                    )
+                    if not approved:
+                        return _blocked_sandbox_result(
+                            sandbox_state.backend,
+                            "explicit sandbox degradation approval required before execution; "
+                            f"{degradation_reason}",
+                        )
+
+                    refreshed_state = resolve_sandbox_settings(Path.cwd())
+                    refreshed_use_sandbox = refreshed_state.enabled and not is_excluded_command(
+                        command,
+                        cwd=Path.cwd(),
+                    )
+                    mismatch_reason = _sandbox_snapshot_mismatch(
+                        degradation_snapshot,
+                        refreshed_state,
+                        use_sandbox=refreshed_use_sandbox,
+                        require_complete_capabilities=False,
+                    )
+                    if mismatch_reason is not None:
+                        return _blocked_sandbox_result(
+                            degradation_snapshot.backend_id,
+                            "sandbox state changed after degradation approval; "
+                            f"{mismatch_reason}; reapproval is required before execution",
+                        )
+                    sandbox_state = refreshed_state
+                    degradation_warning = (
+                        "warning: sandbox degradation explicitly approved before execution; "
+                        f"{degradation_reason}"
+                    )
+
             # Fail-closed allowlist for the sandboxed path: forward only benign
             # vars + explicit session vars, never the full host env. A
             # pattern-based scrub alone misses oddly-named secrets
@@ -414,36 +670,67 @@ async def execute_shell_command(
                     background=False,
                     session_id=session_id,
                     policy=sandbox_state.policy,
+                    degradation_approved=degradation_warning is not None,
                 )
             )
             if sandbox_result.status not in {"unavailable", "unsupported"}:
+                output = _sandbox_output(sandbox_result, output_style=output_style)
+                if degradation_warning:
+                    output = f"{degradation_warning}\n{output}"
                 return ShellExecutionResult(
                     status="success" if sandbox_result.exit_code == 0 else "error",
-                    output=_sandbox_output(sandbox_result),
+                    output=output,
                     exit_code=sandbox_result.exit_code,
                 )
             # Sandbox backend cannot run this command. Offer graceful
             # degradation to the caller: run UNSANDBOXED only behind an explicit
             # approval, with a visible warning. Absent approval, keep the
             # existing fail-closed error so nothing runs unsandboxed silently.
-            reason = sandbox_result.reason or "sandbox backend unavailable"
+            backend_reason = sandbox_result.reason or "sandbox backend unavailable"
+            fallback_trigger = f"sandbox backend became unavailable ({backend_reason})"
+            fallback_requirement = capture_unsandboxed_fallback_requirement(
+                sandbox_state,
+                command=command,
+                trigger=fallback_trigger,
+            )
+            if fallback_requirement is None:
+                return _blocked_sandbox_result(
+                    sandbox_state.backend,
+                    "unable to capture exact sandbox fallback state; host execution was blocked",
+                )
             approved = await _resolve_sandbox_unavailable_approval(
-                sandbox_unavailable_approval, reason
+                sandbox_unavailable_approval,
+                fallback_requirement.reason,
             )
             if approved:
+                refreshed_state = resolve_sandbox_settings(Path.cwd())
+                mismatch_reason = unsandboxed_fallback_requirement_mismatch(
+                    fallback_requirement,
+                    refreshed_state,
+                    command=command,
+                    trigger=fallback_trigger,
+                )
+                if mismatch_reason is not None:
+                    return _blocked_sandbox_result(
+                        fallback_requirement.backend_id,
+                        "sandbox state changed after exact unsandboxed fallback approval; "
+                        f"{mismatch_reason}; a new exact approval is required before execution",
+                    )
                 warning = (
-                    f"warning: sandbox unavailable ({reason}); "
-                    f"running command UNSANDBOXED with approval"
+                    f"warning: sandbox unavailable ({backend_reason}); "
+                    "running command UNSANDBOXED with exact state-bound approval"
                 )
                 return await _run_foreground_unsandboxed(
                     command,
                     timeout=timeout,
                     session_id=session_id,
                     warning=warning,
+                    output_style=output_style,
                 )
-            return ShellExecutionResult(
-                status="error",
-                output=(f"sandboxed: false\nbackend: {sandbox_state.backend}\nreason: {reason}"),
+            return _blocked_sandbox_result(
+                sandbox_state.backend,
+                "exact unsandboxed fallback approval was not granted; "
+                f"{fallback_requirement.reason}",
             )
 
     if run_in_background:
@@ -488,7 +775,12 @@ async def execute_shell_command(
             shell_id=shell_id,
         )
 
-    return await _run_foreground_unsandboxed(command, timeout=timeout, session_id=session_id)
+    return await _run_foreground_unsandboxed(
+        command,
+        timeout=timeout,
+        session_id=session_id,
+        output_style=output_style,
+    )
 
 
 async def execute_powershell_command(

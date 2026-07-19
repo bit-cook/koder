@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 if "litellm" not in sys.modules:
     litellm_stub = types.ModuleType("litellm")
     litellm_stub.model_cost = {}
@@ -12,6 +14,8 @@ if "litellm" not in sys.modules:
 project_root = Path(__file__).resolve().parents[3]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+from koder_agent.tools.todo import TodoRuntimeIdentity, TodoStore  # noqa: E402
 
 
 def test_send_message_to_agent_by_name(tmp_path):
@@ -410,6 +414,9 @@ def test_execute_agent_run_exposes_team_context_to_send_message(tmp_path, monkey
             seed_items=None,
             cwd=str(tmp_path),
             team_context=context,
+            todo_store=TodoStore(
+                TodoRuntimeIdentity("test-session", "agent-integrator", "test-run")
+            ),
         )
     )
 
@@ -476,11 +483,103 @@ def test_execute_agent_run_cleans_up_agent_mcp_servers(tmp_path, monkeypatch):
             session_id="cleanup-session",
             seed_items=None,
             cwd=str(tmp_path),
+            todo_store=TodoStore(
+                TodoRuntimeIdentity("cleanup-session", "general-purpose", "test-run")
+            ),
         )
     )
 
     assert result == "done"
     assert fake_server.cleaned is True
+
+
+@pytest.mark.parametrize("failure_boundary", ["session", "get_items", "add_items"])
+def test_execute_agent_run_partial_initialization_closes_owner_once(
+    tmp_path, monkeypatch, failure_boundary
+):
+    from koder_agent.harness.agents.definitions import AgentDefinition
+    from koder_agent.harness.agents.service import _execute_agent_run
+    from koder_agent.mcp import MCPServerSet
+
+    class FakeServer:
+        name = "owned"
+
+        def __init__(self):
+            self.cleanup_count = 0
+
+        async def cleanup(self):
+            self.cleanup_count += 1
+
+    server = FakeServer()
+    owner = MCPServerSet([server])
+
+    async def fake_create_dev_agent(*args, **kwargs):
+        return types.SimpleNamespace(mcp_servers=[], _koder_mcp_servers=owner)
+
+    class FakeSession:
+        def __init__(self, session_id):
+            if failure_boundary == "session":
+                raise RuntimeError("session failed")
+
+        async def get_items(self):
+            if failure_boundary == "get_items":
+                raise RuntimeError("get failed")
+            return []
+
+        async def add_items(self, items):
+            if failure_boundary == "add_items":
+                raise RuntimeError("add failed")
+
+    monkeypatch.setattr(
+        "koder_agent.harness.agents.service.create_dev_agent", fake_create_dev_agent
+    )
+    monkeypatch.setattr("koder_agent.harness.agents.service.EnhancedSQLiteSession", FakeSession)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General",
+        system_prompt="Agent.",
+        source="built-in",
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            _execute_agent_run(
+                agent_definition=definition,
+                prompt="run",
+                session_id="partial-session",
+                seed_items=[{"role": "user", "content": "seed"}],
+                cwd=str(tmp_path),
+            )
+        )
+
+    assert server.cleanup_count == 1
+
+
+def test_agent_cleanup_helper_detaches_owner_before_await(monkeypatch):
+    from koder_agent.harness.agents.service import _cleanup_agent_mcp_servers
+    from koder_agent.mcp import MCPServerSet
+
+    class FakeServer:
+        name = "owned"
+
+        def __init__(self):
+            self.cleanup_count = 0
+
+        async def cleanup(self):
+            self.cleanup_count += 1
+
+    server = FakeServer()
+    owner = MCPServerSet([server])
+    agent = types.SimpleNamespace(mcp_servers=[], _koder_mcp_servers=owner)
+
+    async def scenario():
+        await _cleanup_agent_mcp_servers(agent)
+        await _cleanup_agent_mcp_servers(agent)
+
+    asyncio.run(scenario())
+
+    assert agent._koder_mcp_servers is None
+    assert server.cleanup_count == 1
 
 
 def test_send_message_to_stopped_agent_indicates_stopped_state(tmp_path, monkeypatch):

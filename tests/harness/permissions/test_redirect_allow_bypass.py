@@ -92,8 +92,14 @@ class TestSandboxAutoAllowPolicyCheck:
         assert result.requires_approval is True
 
     def test_auto_allow_with_valid_policy_works(self):
-        """When policy exists and backend available, auto_allow fires."""
+        """A backend with all active policy needs enforced can auto-allow."""
         from unittest.mock import MagicMock, patch
+
+        from koder_agent.harness.sandbox.backend import (
+            SandboxBackendCapabilities,
+            SandboxBackendStatus,
+        )
+        from koder_agent.harness.sandbox.policy import SandboxPolicy
 
         service = PermissionService.default()
 
@@ -104,7 +110,28 @@ class TestSandboxAutoAllowPolicyCheck:
         mock_state.backend_reason = ""
         mock_state.platform_enabled = True
         mock_state.auto_allow_bash_if_sandboxed = True
-        mock_state.policy = MagicMock()  # Valid policy object
+        mock_state.policy = SandboxPolicy(
+            mode="workspace-write",
+            backend="unix-local",
+            network_access=True,
+        )
+        mock_state.backend_statuses = (
+            SandboxBackendStatus(
+                backend_id="unix-local",
+                selected=True,
+                available=True,
+                reason="available",
+                capabilities=SandboxBackendCapabilities(
+                    supports_host_process_isolation="enforced",
+                    supports_workspace_isolation="enforced",
+                    supports_repository_sync="enforced",
+                    supports_read_only_filesystem="enforced",
+                    supports_network_policy="unsupported",
+                    supports_domain_policy="unsupported",
+                    supports_protected_paths="enforced",
+                ),
+            ),
+        )
 
         # Mock the policy violation checks to return None (no violation)
         with (

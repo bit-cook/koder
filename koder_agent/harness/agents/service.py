@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
 import uuid
+from collections.abc import Coroutine
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +16,14 @@ from typing import Any, Awaitable, Callable
 
 from agents import RunConfig, Runner
 
-from koder_agent.agentic import create_dev_agent, get_display_hooks
+from koder_agent.agentic import create_dev_agent, get_display_hooks, get_subagent_display_hooks
 from koder_agent.core.constants import get_max_turns
+from koder_agent.core.display_context import (
+    SubagentDisplayIdentity,
+    current_tool_display_call,
+    detached_display_context,
+    has_subagent_display_sink,
+)
 from koder_agent.core.session import EnhancedSQLiteSession
 from koder_agent.harness.agents.hooks import SubagentLifecycleHooks
 from koder_agent.harness.paths import worktrees_dir
@@ -28,6 +36,13 @@ from koder_agent.tools.permission_context import (
     subagent_permission_scope,
 )
 from koder_agent.tools.plan_mode import plan_service_scope
+from koder_agent.tools.skill_context import skill_run_scope
+from koder_agent.tools.todo import (
+    TodoRuntimeIdentity,
+    TodoStore,
+    reset_todo_context,
+    set_todo_context,
+)
 from koder_agent.utils.client import get_model_client_snapshot
 
 from .definitions import (
@@ -56,6 +71,12 @@ async def _deny_approver(tool_name, arguments, decision):
     "deny" is the verdict enforce_tool_permission understands as a block.
     """
     return "deny"
+
+
+def _create_detached_task(coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """Create a background task without retaining parent display routing."""
+
+    return detached_display_context().run(asyncio.create_task, coroutine)
 
 
 def _utc_now_iso() -> str:
@@ -103,25 +124,105 @@ def _redacted_model_config_snapshot(agent_definition: AgentDefinition) -> dict[s
     }
 
 
-async def _cleanup_agent_mcp_servers(agent: Any) -> None:
-    servers = getattr(agent, "mcp_servers", None) or getattr(agent, "_koder_mcp_servers", None)
-    for server in list(servers or []):
-        cleanup = getattr(server, "cleanup", None)
-        if cleanup is None:
-            continue
-        try:
-            await asyncio.wait_for(cleanup(), timeout=3.0)
-        except asyncio.TimeoutError:
-            logger.debug(
-                "Timed out cleaning up subagent MCP server %s", getattr(server, "name", "")
-            )
-        except Exception as exc:
-            logger.debug(
-                "Failed to clean up subagent MCP server %s: %s",
-                getattr(server, "name", ""),
-                exc,
-                exc_info=True,
-            )
+def agent_definition_provenance(agent_definition: AgentDefinition) -> dict[str, Any]:
+    """Return stable, non-secret evidence identifying an agent definition."""
+    serialized = json.dumps(
+        asdict(agent_definition),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return {
+        "source": agent_definition.source,
+        "filename": agent_definition.filename,
+        "base_dir": agent_definition.base_dir,
+        "plugin": agent_definition.plugin,
+        "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    }
+
+
+def agent_definition_matches_record(record: AgentRecord, agent_definition: AgentDefinition) -> bool:
+    """Return whether a definition is exactly the one recorded for a run."""
+    provenance = record.definition_provenance
+    return isinstance(provenance, dict) and provenance == agent_definition_provenance(
+        agent_definition
+    )
+
+
+def resolve_agent_record_origin(record: AgentRecord) -> Path:
+    """Resolve a persisted origin cwd, rejecting missing or unsafe values."""
+    raw = record.origin_cwd
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("background agent record has no originating directory")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("background agent originating directory must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("background agent originating directory is unavailable") from exc
+    if not resolved.is_dir():
+        raise ValueError("background agent originating directory is not a directory")
+    return resolved
+
+
+def resolve_agent_record_execution_cwd(record: AgentRecord) -> Path:
+    """Resolve the persisted worktree or originating cwd used for execution."""
+    origin = resolve_agent_record_origin(record)
+    if not record.worktree_path:
+        return origin
+    worktree = Path(record.worktree_path).expanduser()
+    if not worktree.is_absolute():
+        raise ValueError("background agent worktree directory must be absolute")
+    try:
+        resolved = worktree.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("background agent worktree directory is unavailable") from exc
+    if not resolved.is_dir():
+        raise ValueError("background agent worktree directory is not a directory")
+    return resolved
+
+
+async def _cleanup_agent_mcp_servers(
+    agent: Any,
+    *,
+    propagate_cancellation: bool = True,
+) -> None:
+    from koder_agent.mcp import close_mcp_servers, detach_mcp_server_owner
+
+    owner = detach_mcp_server_owner(agent)
+    await close_mcp_servers(
+        owner,
+        propagate_cancellation=propagate_cancellation,
+    )
+
+
+def _sync_display_identity(
+    agent_definition: AgentDefinition,
+    session_id: str,
+    display_label: str | None,
+) -> SubagentDisplayIdentity | None:
+    """Build parent-managed display identity for a synchronous agent tool run."""
+
+    parent_call = current_tool_display_call()
+    if (
+        not has_subagent_display_sink()
+        or parent_call is None
+        or parent_call.tool_name != "agent_tool"
+    ):
+        return None
+
+    label = agent_definition.agent_type
+    if display_label:
+        label = f"{label} · {display_label}"
+    return SubagentDisplayIdentity(
+        group_id=f"agent-tool-{uuid.uuid4().hex}",
+        agent_id=session_id,
+        label=label,
+        parent_call_id=parent_call.call_id,
+        order=0,
+    )
 
 
 async def _execute_agent_run(
@@ -133,44 +234,111 @@ async def _execute_agent_run(
     cwd: str | None,
     team_context: TeamToolContext | None = None,
     permission_service: Any = None,
+    todo_store: TodoStore | None = None,
+    display_identity: SubagentDisplayIdentity | None = None,
+    direct_display: bool = False,
 ) -> str:
+    if todo_store is None:
+        todo_store = TodoStore(
+            TodoRuntimeIdentity(
+                session_id=session_id,
+                agent_id=agent_definition.agent_type,
+                run_id=session_id,
+            )
+        )
+
     tools = filter_tools_for_agent_definition(agent_definition, get_all_tools())
     # Subagents cannot spawn other subagents
     tools = [tool for tool in tools if tool.name not in {"task_delegate", "agent_tool"}]
-    agent = await create_dev_agent(
-        tools,
-        name=agent_definition.agent_type,
-        instructions_override=build_agent_system_prompt(agent_definition, cwd=cwd or Path.cwd()),
-        model_override=resolve_agent_model(agent_definition),
-        extra_mcp_server_configs=resolve_agent_mcp_server_configs(agent_definition),
-    )
-    session = EnhancedSQLiteSession(session_id=session_id)
-    if seed_items:
-        existing_items = await session.get_items()
-        if not existing_items:
-            await session.add_items(seed_items)
-
-    perm_token = subagent_permission_scope(permission_service, deny_approver=_deny_approver)
-    perm_ctx = get_tool_permission_context()
-    effective_service = perm_ctx.permission_service if perm_ctx else None
+    agent = None
+    perm_token = None
+    todo_token = None
+    if display_identity is not None:
+        display_hooks = get_subagent_display_hooks(
+            group_id=display_identity.group_id,
+            agent_id=display_identity.agent_id,
+            label=display_identity.label,
+            parent_call_id=display_identity.parent_call_id,
+            order=display_identity.order,
+        )
+    else:
+        display_hooks = get_display_hooks()
+        if hasattr(display_hooks, "streaming_mode"):
+            display_hooks.streaming_mode = not direct_display
+    display_status = "failed"
+    display_detail = None
+    primary_error: BaseException | None = None
     try:
+        agent = await create_dev_agent(
+            tools,
+            name=agent_definition.agent_type,
+            instructions_override=build_agent_system_prompt(
+                agent_definition, cwd=cwd or Path.cwd()
+            ),
+            model_override=resolve_agent_model(agent_definition),
+            extra_mcp_server_configs=resolve_agent_mcp_server_configs(agent_definition),
+        )
+        session = EnhancedSQLiteSession(session_id=session_id)
+        if seed_items:
+            existing_items = await session.get_items()
+            if not existing_items:
+                await session.add_items(seed_items)
+
+        if todo_store.identity.session_id != session_id:
+            raise ValueError("todo store session identity does not match subagent session")
+        perm_token = subagent_permission_scope(permission_service, deny_approver=_deny_approver)
+        todo_token = set_todo_context(todo_store)
+        perm_ctx = get_tool_permission_context()
+        effective_service = perm_ctx.permission_service if perm_ctx else None
         with team_tool_context(team_context):
-            result = await Runner.run(
-                agent,
-                prompt,
-                session=session,
-                run_config=RunConfig(),
-                hooks=SubagentLifecycleHooks(
-                    agent_definition=agent_definition,
-                    cwd=cwd or Path.cwd(),
-                    wrapped_hooks=get_display_hooks(),
-                    permission_service=effective_service,
-                ),
-                max_turns=agent_definition.max_turns or get_max_turns(),
+            lifecycle_hooks = SubagentLifecycleHooks(
+                agent_definition=agent_definition,
+                cwd=cwd or Path.cwd(),
+                wrapped_hooks=display_hooks,
+                permission_service=effective_service,
             )
+            with skill_run_scope(lifecycle_hooks) as run_hooks:
+                result = await Runner.run(
+                    agent,
+                    prompt,
+                    session=session,
+                    run_config=RunConfig(),
+                    hooks=run_hooks,
+                    max_turns=agent_definition.max_turns or get_max_turns(),
+                )
+        display_status = "completed"
+    except BaseException as exc:
+        primary_error = exc
+        display_status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+        display_detail = str(exc)
+        raise
     finally:
-        reset_tool_permission_context(perm_token)
-        await _cleanup_agent_mcp_servers(agent)
+        try:
+            if todo_token is not None:
+                reset_todo_context(todo_token)
+            if perm_token is not None:
+                reset_tool_permission_context(perm_token)
+            if agent is not None:
+                await _cleanup_agent_mcp_servers(
+                    agent,
+                    propagate_cancellation=primary_error is None,
+                )
+        except BaseException as exc:
+            if primary_error is None:
+                display_status = (
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                )
+                display_detail = str(exc)
+                raise
+            logger.debug(
+                "Suppressed subagent cleanup failure while preserving %s",
+                type(primary_error).__name__,
+                exc_info=True,
+            )
+        finally:
+            finish_display = getattr(display_hooks, "finish", None)
+            if callable(finish_display):
+                finish_display(display_status, display_detail)
     return str(result.final_output)
 
 
@@ -181,6 +349,8 @@ class AgentService:
         self._agents: dict[str, AgentRecord] = {}
         self._mailboxes: dict[str, list[AgentMessage]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._todo_stores: dict[TodoRuntimeIdentity, TodoStore] = {}
+        self._todo_identities_by_agent: dict[str, TodoRuntimeIdentity] = {}
         self._name_registry: dict[str, str] = {}  # name -> agent_id
         self._owned_temp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._permission_service = permission_service
@@ -198,6 +368,8 @@ class AgentService:
         return service
 
     def close(self) -> None:
+        self._todo_stores.clear()
+        self._todo_identities_by_agent.clear()
         if self._owned_temp_dir is not None:
             self._owned_temp_dir.cleanup()
             self._owned_temp_dir = None
@@ -259,9 +431,13 @@ class AgentService:
         output_path.write_text("", encoding="utf-8")
         worktree_path = None
         worktree_branch = None
-        effective_cwd = str(cwd) if cwd is not None else None
+        origin_cwd = Path(cwd) if cwd is not None else Path.cwd()
+        origin_cwd = origin_cwd.expanduser().resolve(strict=True)
+        if not origin_cwd.is_dir():
+            raise ValueError("background agent cwd must be a directory")
+        effective_cwd = str(origin_cwd)
         if agent_definition.isolation == "worktree" and cwd is not None:
-            cwd_path = Path(cwd).resolve()
+            cwd_path = origin_cwd
             service = WorktreeService(worktrees_dir(cwd_path), repo_root=cwd_path)
             created = service.create(f"agent/{agent_id}")
             worktree_path = str(created.path)
@@ -280,13 +456,15 @@ class AgentService:
             permission_mode=permission_mode or agent_definition.permission_mode,
             state="in_progress",
             model_config=_redacted_model_config_snapshot(agent_definition),
+            origin_cwd=str(origin_cwd),
+            definition_provenance=agent_definition_provenance(agent_definition),
         )
         record = self._with_summary(record)
         self._agents[agent_id] = record
         self._mailboxes[agent_id] = []
         self._save_record(record)
         team_context = team_context_builder(record) if team_context_builder is not None else None
-        self._tasks[agent_id] = asyncio.create_task(
+        self._tasks[agent_id] = _create_detached_task(
             self._run_background(
                 agent_id=agent_id,
                 agent_definition=agent_definition,
@@ -296,6 +474,7 @@ class AgentService:
                 cwd=effective_cwd,
                 team_context=team_context,
                 executor=executor,
+                todo_store=self._get_or_create_todo_store(agent_id, session_id),
             )
         )
         return record
@@ -308,6 +487,7 @@ class AgentService:
         seed_items: list[dict[str, Any]] | None = None,
         cwd: str | Path | None = None,
         permission_mode: str | None = None,
+        display_label: str | None = None,
     ) -> str:
         effective_cwd = str(cwd) if cwd is not None else None
         worktree_service: WorktreeService | None = None
@@ -325,13 +505,28 @@ class AgentService:
             if effective_permission_mode == "plan":
                 scoped_service.enter_plan_mode(permission_mode="plan")
             with plan_service_scope(scoped_service):
+                session_id = f"subagent-sync-{uuid.uuid4().hex[:8]}"
+                display_identity = _sync_display_identity(
+                    agent_definition,
+                    session_id,
+                    display_label,
+                )
                 return await _execute_agent_run(
                     agent_definition=agent_definition,
                     prompt=prompt,
-                    session_id=f"subagent-sync-{uuid.uuid4().hex[:8]}",
+                    session_id=session_id,
                     seed_items=seed_items,
                     cwd=effective_cwd,
                     permission_service=self._permission_service,
+                    display_identity=display_identity,
+                    direct_display=display_identity is None,
+                    todo_store=TodoStore(
+                        TodoRuntimeIdentity(
+                            session_id=session_id,
+                            agent_id=f"sync-{agent_definition.agent_type}",
+                            run_id=session_id,
+                        )
+                    ),
                 )
         finally:
             # Dirty worktrees are kept so the user can inspect or merge them.
@@ -358,6 +553,13 @@ class AgentService:
         record = self.get(agent_id)
         if agent_id in self._tasks and not self._tasks[agent_id].done():
             raise RuntimeError(f"Agent is still running: {agent_id}")
+        if not agent_definition_matches_record(record, agent_definition):
+            raise ValueError("background agent definition provenance does not match")
+        execution_cwd = resolve_agent_record_execution_cwd(record)
+        if cwd is not None:
+            requested_cwd = Path(cwd).expanduser().resolve(strict=True)
+            if requested_cwd != execution_cwd:
+                raise ValueError("background agent resume cwd does not match persisted origin")
         timestamp = _utc_now_iso()
         updated = replace(
             record,
@@ -372,16 +574,17 @@ class AgentService:
             updated, summary_timestamp=timestamp, record_timestamp=timestamp
         )
         self._save_record(self._agents[agent_id])
-        self._tasks[agent_id] = asyncio.create_task(
+        self._tasks[agent_id] = _create_detached_task(
             self._run_background(
                 agent_id=agent_id,
                 agent_definition=agent_definition,
                 prompt=prompt,
                 session_id=record.session_id,
                 seed_items=None,
-                cwd=record.worktree_path or (str(cwd) if cwd is not None else None),
+                cwd=str(execution_cwd),
                 team_context=team_context,
                 executor=executor,
+                todo_store=self._get_or_create_todo_store(agent_id, record.session_id),
             )
         )
         return self._agents[agent_id]
@@ -450,6 +653,7 @@ class AgentService:
         cwd: str | None,
         team_context: TeamToolContext | None = None,
         executor: AgentRunExecutor | None = None,
+        todo_store: TodoStore,
     ) -> None:
         record = self.get(agent_id)
         output_path = Path(record.output_path) if record.output_path else None
@@ -468,13 +672,18 @@ class AgentService:
                     "seed_items": seed_items,
                     "cwd": cwd,
                     "permission_service": self._permission_service,
+                    "todo_store": todo_store,
                 }
                 if team_context is not None:
                     execute_kwargs["team_context"] = team_context
-                if executor is None:
-                    result = await _execute_agent_run(**execute_kwargs)
-                else:
-                    result = await executor(**execute_kwargs)
+                todo_token = set_todo_context(todo_store)
+                try:
+                    if executor is None:
+                        result = await _execute_agent_run(**execute_kwargs)
+                    else:
+                        result = await executor(**execute_kwargs)
+                finally:
+                    reset_todo_context(todo_token)
             if output_path is not None:
                 output_path.write_text(result, encoding="utf-8")
             self._record_team_run_history(
@@ -575,6 +784,31 @@ class AgentService:
         """Register a human-readable name for an agent, making it addressable."""
         self._name_registry[name] = agent_id
 
+    def release_agent(self, agent_id: str) -> None:
+        """Release in-memory state owned by an explicitly cleaned-up agent."""
+        task = self._tasks.get(agent_id)
+        if task is not None and not task.done():
+            raise RuntimeError(f"Agent is still running: {agent_id}")
+        identity = self._todo_identities_by_agent.pop(agent_id, None)
+        if identity is not None:
+            self._todo_stores.pop(identity, None)
+
+    def _get_or_create_todo_store(self, agent_id: str, session_id: str) -> TodoStore:
+        identity = TodoRuntimeIdentity(
+            session_id=session_id,
+            agent_id=agent_id,
+            run_id=f"agent-conversation:{agent_id}",
+        )
+        previous = self._todo_identities_by_agent.get(agent_id)
+        if previous is not None and previous != identity:
+            self._todo_stores.pop(previous, None)
+        self._todo_identities_by_agent[agent_id] = identity
+        store = self._todo_stores.get(identity)
+        if store is None:
+            store = TodoStore(identity)
+            self._todo_stores[identity] = store
+        return store
+
     def update_permission_mode(self, agent_id: str, permission_mode: str) -> AgentRecord:
         """Persist an updated permission mode for an existing agent record."""
 
@@ -645,6 +879,10 @@ class AgentService:
                     data["summary_updated_at"] = None
                 if "model_config" not in data:
                     data["model_config"] = None
+                if "origin_cwd" not in data:
+                    data["origin_cwd"] = None
+                if "definition_provenance" not in data:
+                    data["definition_provenance"] = None
                 record = AgentRecord(**data)
             except Exception:
                 logger.debug("Failed to parse agent record from file", exc_info=True)

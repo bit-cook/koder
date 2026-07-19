@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from koder_agent.harness.agents.definitions import (
     BUILTIN_AGENT_DEFINITIONS,
@@ -13,6 +18,9 @@ from koder_agent.harness.agents.definitions import (
     parse_agent_markdown_file,
     resolve_agent_mcp_server_configs,
 )
+from koder_agent.mcp.project_approvals import reset_project_choices, set_project_approval
+from koder_agent.mcp.server_factory import MCPServerFactory
+from koder_agent.mcp.server_manager import MCPServerManager
 
 
 def _write_agent_file(path: Path, *, name: str, description: str, body: str, **frontmatter) -> None:
@@ -305,6 +313,29 @@ def test_memory_enabled_agent_auto_adds_file_tools():
     assert names >= {"read_file", "write_file", "append_file", "edit_file"}
 
 
+def test_custom_agent_edit_tool_group_includes_notebook_edit():
+    class _Tool:
+        def __init__(self, name: str):
+            self.name = name
+
+    agent = parse_agent_from_json(
+        "editor",
+        {
+            "description": "Edits source and notebooks",
+            "prompt": "You are an editor.",
+            "tools": ["Edit"],
+        },
+    )
+    assert agent is not None
+
+    filtered = filter_tools_for_agent_definition(
+        agent,
+        [_Tool("read_file"), _Tool("edit_file"), _Tool("notebook_edit")],
+    )
+
+    assert {tool.name for tool in filtered} == {"edit_file", "notebook_edit"}
+
+
 def test_plan_mode_agent_filters_write_tools():
     class _Tool:
         def __init__(self, name: str):
@@ -322,7 +353,13 @@ def test_plan_mode_agent_filters_write_tools():
     assert agent is not None
     filtered = filter_tools_for_agent_definition(
         agent,
-        [_Tool("read_file"), _Tool("write_file"), _Tool("append_file"), _Tool("edit_file")],
+        [
+            _Tool("read_file"),
+            _Tool("write_file"),
+            _Tool("append_file"),
+            _Tool("edit_file"),
+            _Tool("notebook_edit"),
+        ],
     )
     names = {tool.name for tool in filtered}
     assert names == {"read_file"}
@@ -370,6 +407,95 @@ def test_resolve_agent_mcp_server_configs_supports_inline_and_named_servers(tmp_
     playwright = next(config for config in configs if config.name == "playwright")
     assert playwright.transport_type.value == "stdio"
     assert playwright.command == "npx"
+
+
+def test_nested_project_agent_uses_non_git_workspace_root_and_session_cwd(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    session_cwd = workspace / "packages" / "app"
+    agent_file = workspace / ".koder" / "agents" / "nested" / "reviewer.md"
+    executable = session_cwd / "bin" / "agent-mcp"
+    home.mkdir()
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text(
+        "---\n"
+        "name: nested-reviewer\n"
+        "description: Reviews nested work\n"
+        "mcpServers:\n"
+        "  - inline:\n"
+        "      type: stdio\n"
+        "      command: ./bin/agent-mcp\n"
+        "---\n"
+        "Review changes.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    definitions = get_agent_definitions(cwd=session_cwd)
+    agent = next(item for item in definitions.all_agents if item.agent_type == "nested-reviewer")
+    configs = resolve_agent_mcp_server_configs(agent)
+
+    assert agent.project_root == str(workspace.resolve())
+    assert agent.execution_cwd == str(session_cwd.resolve())
+    assert len(configs) == 1
+    config = configs[0]
+    assert config.project_root == str(workspace.resolve())
+    assert config.execution_cwd == str(session_cwd.resolve())
+    assert config.command == str(executable.resolve())
+    set_project_approval(
+        project_root=config.project_root,
+        source_path=config.source_path,
+        source_digest=config.source_digest,
+        approved=True,
+    )
+    assert MCPServerManager().revalidate_project_config(config) is True
+
+    assert reset_project_choices(workspace) == 1
+    assert MCPServerManager().revalidate_project_config(config) is False
+
+
+def test_project_agent_inline_runtime_collision_fails_before_transport(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    agent_file = workspace / ".koder" / "agents" / "reviewer.md"
+    executable = workspace / "agent-mcp"
+    home.mkdir()
+    workspace.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text(
+        "---\n"
+        "name: reviewer\n"
+        "description: Reviews changes\n"
+        "mcpServers:\n"
+        "  - global_name:\n"
+        "      type: stdio\n"
+        "      command: ./agent-mcp\n"
+        "---\n"
+        "Review changes.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    definitions = get_agent_definitions(cwd=workspace)
+    agent = next(item for item in definitions.all_agents if item.agent_type == "reviewer")
+    configs = resolve_agent_mcp_server_configs(agent)
+    connect = AsyncMock()
+    monkeypatch.setattr(MCPServerFactory, "create_and_connect_with_retry", connect)
+
+    with pytest.raises(ValueError, match="runtime name 'global_name'"):
+        asyncio.run(
+            MCPServerFactory.create_servers_from_configs(
+                configs,
+                existing_servers=[SimpleNamespace(name="global.name")],
+            )
+        )
+
+    connect.assert_not_awaited()
 
 
 def test_effort_field_parsed_and_preserved(tmp_path):

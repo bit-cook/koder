@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,8 +20,14 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from koder_agent.harness.agents.definitions import AgentDefinition  # noqa: E402
-from koder_agent.harness.agents.service import AgentService  # noqa: E402
+from koder_agent.harness.agents.service import (  # noqa: E402
+    AgentService,
+    _execute_agent_run,
+    agent_definition_matches_record,
+    resolve_agent_record_origin,
+)
 from koder_agent.tools.plan_mode import _get_plan_service, _set_plan_service  # noqa: E402
+from koder_agent.tools.todo import get_todo_store  # noqa: E402
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -54,6 +61,15 @@ def _init_git_repo(repo_root: Path) -> None:
         check=True,
         capture_output=True,
         text=True,
+    )
+
+
+def _general_purpose_definition() -> AgentDefinition:
+    return AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
     )
 
 
@@ -249,9 +265,16 @@ def test_agent_service_records_failure_summary(tmp_path, monkeypatch):
 
 def test_agent_service_can_resume_background_agent_with_same_session(tmp_path, monkeypatch):
     seen_session_ids: list[str] = []
+    seen_stores = []
 
     async def fake_execute(*, agent_definition, prompt, session_id, seed_items, cwd, **_kwargs):
         seen_session_ids.append(session_id)
+        store = get_todo_store()
+        seen_stores.append(store)
+        if prompt == "first task":
+            store.todos = [{"content": "persisted", "status": "pending", "id": "todo-1"}]
+        else:
+            assert store.todos[0]["content"] == "persisted"
         return f"result for {prompt}"
 
     monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
@@ -279,6 +302,81 @@ def test_agent_service_can_resume_background_agent_with_same_session(tmp_path, m
         await service.wait(resumed.id)
         assert len(seen_session_ids) == 2
         assert seen_session_ids[0] == seen_session_ids[1]
+        assert seen_stores[0] is seen_stores[1]
+        assert seen_stores[0].identity.agent_id == record.id
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_isolates_concurrent_agents_with_same_definition(tmp_path, monkeypatch):
+    stores = {}
+
+    async def fake_execute(*, prompt, **_kwargs):
+        store = get_todo_store()
+        store.todos = [{"content": prompt, "status": "pending", "id": prompt}]
+        stores[prompt] = store
+        await asyncio.sleep(0)
+        assert store.todos[0]["content"] == prompt
+        return prompt
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+    )
+
+    async def run_case():
+        first, second = await asyncio.gather(
+            service.launch_background(
+                agent_definition=definition,
+                prompt="first",
+                description="First",
+            ),
+            service.launch_background(
+                agent_definition=definition,
+                prompt="second",
+                description="Second",
+            ),
+        )
+        await asyncio.gather(service.wait(first.id), service.wait(second.id))
+        assert stores["first"] is not stores["second"]
+        assert stores["first"].identity.agent_id == first.id
+        assert stores["second"].identity.agent_id == second.id
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_releases_todo_store_on_explicit_cleanup(tmp_path, monkeypatch):
+    seen_stores = []
+
+    async def fake_execute(**_kwargs):
+        seen_stores.append(get_todo_store())
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="general-purpose",
+        when_to_use="General work",
+        system_prompt="You are a general-purpose agent.",
+        source="built-in",
+    )
+
+    async def run_case():
+        record = await service.launch_background(
+            agent_definition=definition,
+            prompt="first",
+            description="First",
+        )
+        await service.wait(record.id)
+        original = seen_stores[0]
+        service.release_agent(record.id)
+        replacement = service._get_or_create_todo_store(record.id, record.session_id)
+        assert replacement is not original
+        assert replacement.todos == []
 
     asyncio.run(run_case())
 
@@ -511,8 +609,61 @@ def test_agent_service_can_reload_agent_record_from_disk(tmp_path, monkeypatch):
         )
         await service.wait(record.id)
         reloaded = AgentService.for_test(tmp_path)
-        assert reloaded.get(record.id).output_path == record.output_path
+        reloaded_record = reloaded.get(record.id)
+        assert reloaded_record.output_path == record.output_path
+        assert reloaded_record.origin_cwd == str(Path.cwd().resolve())
+        assert agent_definition_matches_record(reloaded_record, definition)
         assert Path(record.output_path).read_text(encoding="utf-8") == "persisted result"
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_rejects_tampered_origin_and_definition_on_resume(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    async def fake_execute(**_kwargs):
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = AgentDefinition(
+        agent_type="worker",
+        when_to_use="Does work",
+        system_prompt="Original worker.",
+        source="projectSettings",
+        filename="worker",
+        base_dir=str(project / ".koder" / "agents"),
+    )
+
+    async def run_case():
+        record = await service.launch_background(
+            agent_definition=definition,
+            prompt="first",
+            description="First",
+            cwd=project,
+        )
+        await service.wait(record.id)
+
+        changed_definition = AgentDefinition(
+            agent_type="worker",
+            when_to_use="Does work",
+            system_prompt="Malicious replacement.",
+            source="projectSettings",
+            filename="worker",
+            base_dir=str(project / ".koder" / "agents"),
+        )
+        with pytest.raises(ValueError, match="definition provenance"):
+            await service.resume_background(
+                agent_id=record.id,
+                agent_definition=changed_definition,
+                prompt="continue",
+                cwd=project,
+            )
+
+        service._agents[record.id] = replace(record, origin_cwd="../../tmp")
+        with pytest.raises(ValueError, match="must be absolute"):
+            resolve_agent_record_origin(service.get(record.id))
 
     asyncio.run(run_case())
 
@@ -547,6 +698,172 @@ def test_agent_service_can_cancel_background_agent(tmp_path, monkeypatch):
         assert Path(cancelled.output_path).read_text(encoding="utf-8") == "Cancelled"
 
     asyncio.run(run_case())
+
+
+def test_agent_service_background_detaches_parent_display_context(tmp_path):
+    from koder_agent.core.display_context import (
+        SubagentDisplayEvent,
+        SubagentDisplayIdentity,
+        current_tool_display_call,
+        emit_subagent_display_event,
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
+
+    observed_calls = []
+    parent_events = []
+
+    async def fake_execute(**_kwargs):
+        observed_calls.append(current_tool_display_call())
+        emit_subagent_display_event(
+            SubagentDisplayEvent(
+                identity=SubagentDisplayIdentity(
+                    group_id="late-group",
+                    agent_id="late-agent",
+                    label="late event",
+                ),
+                kind="started",
+            )
+        )
+        return "done"
+
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    async def run_case():
+        with (
+            subagent_display_scope(parent_events.append),
+            tool_display_call_scope("agent_tool", "parent-call"),
+        ):
+            record = await service.launch_background(
+                agent_definition=definition,
+                prompt="Run later",
+                description="Detached display",
+                executor=fake_execute,
+            )
+        await service.wait(record.id)
+
+    asyncio.run(run_case())
+
+    assert observed_calls == [None]
+    assert parent_events == []
+
+
+def test_execute_agent_run_preserves_cancellation_when_cleanup_fails(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from koder_agent.tools.todo import TodoRuntimeIdentity, TodoStore
+
+    running = asyncio.Event()
+    never = asyncio.Event()
+
+    async def fake_create_dev_agent(*args, **kwargs):
+        return SimpleNamespace(_koder_mcp_servers=[])
+
+    async def fake_run(*args, **kwargs):
+        running.set()
+        await never.wait()
+
+    async def failing_cleanup(*args, **kwargs):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        "koder_agent.harness.agents.service.create_dev_agent", fake_create_dev_agent
+    )
+    monkeypatch.setattr("koder_agent.harness.agents.service.Runner.run", fake_run)
+    monkeypatch.setattr("koder_agent.harness.agents.service.get_all_tools", lambda: [])
+    monkeypatch.setattr(
+        "koder_agent.harness.agents.service._cleanup_agent_mcp_servers", failing_cleanup
+    )
+
+    definition = _general_purpose_definition()
+    session_id = "cleanup-cancellation-test"
+
+    async def run_case():
+        task = asyncio.create_task(
+            _execute_agent_run(
+                agent_definition=definition,
+                prompt="wait",
+                session_id=session_id,
+                seed_items=None,
+                cwd=str(tmp_path),
+                todo_store=TodoStore(
+                    TodoRuntimeIdentity(
+                        session_id=session_id,
+                        agent_id="test-agent",
+                        run_id=session_id,
+                    )
+                ),
+            )
+        )
+        await asyncio.wait_for(running.wait(), timeout=1)
+        task.cancel("stop agent")
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await task
+        assert cancellation.value.args == ("stop agent",)
+
+    asyncio.run(run_case())
+
+
+def test_agent_service_run_sync_uses_direct_display_without_parent_sink(tmp_path, monkeypatch):
+    captured = []
+
+    async def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    result = asyncio.run(
+        service.run_sync(
+            agent_definition=definition,
+            prompt="Inspect directly",
+            display_label="Direct inspection",
+        )
+    )
+
+    assert result == "done"
+    [call] = captured
+    assert call["display_identity"] is None
+    assert call["direct_display"] is True
+
+
+def test_agent_service_run_sync_uses_parent_display_when_attached(tmp_path, monkeypatch):
+    from koder_agent.core.display_context import (
+        subagent_display_scope,
+        tool_display_call_scope,
+    )
+
+    captured = []
+
+    async def fake_execute(**kwargs):
+        captured.append(kwargs)
+        return "done"
+
+    monkeypatch.setattr("koder_agent.harness.agents.service._execute_agent_run", fake_execute)
+    service = AgentService.for_test(tmp_path)
+    definition = _general_purpose_definition()
+
+    async def run_case():
+        with (
+            subagent_display_scope(lambda _event: None),
+            tool_display_call_scope("agent_tool", "call-parent"),
+        ):
+            return await service.run_sync(
+                agent_definition=definition,
+                prompt="Inspect as child",
+                display_label="Child inspection",
+            )
+
+    assert asyncio.run(run_case()) == "done"
+    [call] = captured
+    identity = call["display_identity"]
+    assert identity is not None
+    assert identity.parent_call_id == "call-parent"
+    assert identity.label == "general-purpose · Child inspection"
+    assert call["direct_display"] is False
 
 
 def test_agent_service_applies_plan_mode_per_background_run(tmp_path, monkeypatch):

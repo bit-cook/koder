@@ -107,8 +107,13 @@ BACKEND_SPECS: tuple[BackendSpec, ...] = (
             supports_filesystem=True,
             supports_pty="yes",
             supports_background=False,
+            supports_host_process_isolation="unsupported",
+            supports_workspace_isolation="not-proven",
+            supports_repository_sync="not-applicable-host-workspace",
+            supports_read_only_filesystem="not-proven",
             supports_network_policy="unsupported",
-            supports_protected_paths="preflight-exact",
+            supports_domain_policy="unsupported",
+            supports_protected_paths="unsupported",
         ),
     ),
     BackendSpec(
@@ -124,12 +129,17 @@ BACKEND_SPECS: tuple[BackendSpec, ...] = (
             supports_filesystem=True,
             supports_pty="yes",
             supports_background=False,
+            supports_host_process_isolation="container",
+            supports_workspace_isolation="not-proven",
+            supports_repository_sync="unsupported",
+            supports_read_only_filesystem="not-proven",
             # Network isolation depends on how the Docker container is launched.
             # The SDK docker backend does NOT enforce --network=none by default;
             # containers use Docker's default bridge network unless the caller
             # explicitly configures network mode.  Do not claim enforcement.
             supports_network_policy="not-enforced-by-default",
-            supports_protected_paths="workspace-copy",
+            supports_domain_policy="unsupported",
+            supports_protected_paths="unsupported",
         ),
     ),
     BackendSpec(
@@ -149,6 +159,19 @@ BACKEND_SPECS: tuple[BackendSpec, ...] = (
         credential_groups=(("E2B_API_KEY",),),
         setup_hint="Set E2B_API_KEY and optional KODER_SANDBOX_E2B_TYPE.",
         validation_tier="credential-gated-live-smoke",
+        capabilities=SandboxBackendCapabilities(
+            supports_shell=True,
+            supports_filesystem=True,
+            supports_pty="unknown",
+            supports_background=False,
+            supports_host_process_isolation="remote-sandbox",
+            supports_workspace_isolation="not-proven",
+            supports_repository_sync="unsupported",
+            supports_read_only_filesystem="not-proven",
+            supports_network_policy="enforced",
+            supports_domain_policy="unsupported",
+            supports_protected_paths="unsupported",
+        ),
     ),
     BackendSpec(
         backend_id="modal",
@@ -265,7 +288,7 @@ def get_backend_statuses(requested: str | None = None) -> list[SandboxBackendSta
     ]
 
 
-def create_backend_client_and_options(backend_id: str) -> tuple[Any, Any]:
+def create_backend_client_and_options(backend_id: str, *, policy=None) -> tuple[Any, Any]:
     """Instantiate an SDK sandbox client and options for execution."""
 
     spec = get_backend_spec(backend_id)
@@ -288,7 +311,11 @@ def create_backend_client_and_options(backend_id: str) -> tuple[Any, Any]:
         return client_class(), options_class(worker_url=worker_url, api_key=api_key)
     if backend_id == "e2b":
         sandbox_type = os.environ.get("KODER_SANDBOX_E2B_TYPE", "e2b_code_interpreter")
-        return client_class(), options_class(sandbox_type=sandbox_type)
+        allow_internet_access = True if policy is None else bool(policy.network_access)
+        return client_class(), options_class(
+            sandbox_type=sandbox_type,
+            allow_internet_access=allow_internet_access,
+        )
     if backend_id == "modal":
         app_name = os.environ.get("KODER_SANDBOX_MODAL_APP_NAME", "koder-sandbox")
         return client_class(), options_class(app_name=app_name)

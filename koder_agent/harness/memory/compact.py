@@ -194,6 +194,18 @@ def _summary_message(summary: str) -> dict:
     return {"role": "user", "content": f"{_COMPACTED_PREFIX}\n\n{summary}"}
 
 
+def build_compacted_session_items(result: CompactionResult) -> list[dict]:
+    """Compose persisted history with preserved instructions before the summary."""
+    instructions = [
+        item for item in result.kept_messages if item.get("role") in {"system", "developer"}
+    ]
+    remainder = [
+        item for item in result.kept_messages if item.get("role") not in {"system", "developer"}
+    ]
+    summary_items = [_summary_message(result.summary)] if result.summary else []
+    return [*instructions, *summary_items, *remainder]
+
+
 def _is_replayable_tool_item(item: Any) -> bool:
     """Whether an item is a replayable function_call / function_call_output."""
     if not is_replayable_session_item(item):
@@ -444,9 +456,21 @@ async def llm_compact_messages(
             original_count=original_count,
         )
 
-    kept_pairs = _recent_plain_context_items(messages, keep_recent)
-    to_keep = [message for _, message in kept_pairs]
-    kept_indices = {index for index, _ in kept_pairs}
+    # System/developer items are authoritative instructions and are never
+    # rewritten into prose. ``keep_recent`` applies only to conversational
+    # messages so pinned instructions cannot crowd out the latest user intent.
+    instruction_indices = {
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") in {"system", "developer"}
+    }
+    recent_conversation_pairs = [
+        (index, message)
+        for index, message in _recent_plain_context_items(messages, None)
+        if message.get("role") not in {"system", "developer"}
+    ][-keep_recent:]
+    kept_indices = instruction_indices | {index for index, _message in recent_conversation_pairs}
+    to_keep = [message for index, message in enumerate(messages) if index in kept_indices]
 
     # Preserve the trailing tool_call/result pair verbatim so it stays
     # replayable. These items are appended after the plain-text tail and are
@@ -493,7 +517,11 @@ async def llm_compact_messages(
             }
         ]
 
-        response = await llm_completion(summary_messages, use_small=True)
+        response = await llm_completion(
+            summary_messages,
+            use_small=True,
+            response_reserve=4_096,
+        )
 
         # Extract <summary> section, strip <analysis>
         summary_match = re.search(r"<summary>(.*?)</summary>", response, re.DOTALL | re.IGNORECASE)
@@ -512,15 +540,7 @@ async def llm_compact_messages(
         )
 
     except Exception:
-        # Fall back to deterministic compaction, still preserving the trailing
-        # replayable tool pair verbatim so it is not lost on the fallback path.
-        fallback = compact_messages(messages, max_messages=keep_recent)
-        kept_messages = _keep_tail(fallback.kept_messages)
-        if kept_messages == fallback.kept_messages:
-            return fallback
-        return CompactionResult(
-            summary=fallback.summary,
-            kept_messages=kept_messages,
-            token_count=estimate_messages_tokens(kept_messages),
-            original_count=fallback.original_count,
-        )
+        # Destructive compaction must never claim coverage when the complete
+        # source was not accepted by the summarizer. Propagate the failure so
+        # scheduler/manual callers leave the original session untouched.
+        raise

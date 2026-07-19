@@ -65,7 +65,12 @@ from .skill_context import (
 )
 from .sleep import sleep_tool
 from .structured_output import structured_output
-from .task import TaskDelegateModel, TaskModel, task_delegate
+from .task import (
+    TaskDelegateModel,
+    TaskModel,
+    refresh_task_delegate_schema_limit,
+    task_delegate,
+)
 from .task_lifecycle import (
     TaskCreateModel,
     TaskGetModel,
@@ -100,6 +105,8 @@ def get_all_tools() -> List[Tool]:
     Each FunctionTool is configured with the skill_restriction_guardrail
     to enforce skill-based tool restrictions when skills are active.
     """
+    refresh_task_delegate_schema_limit(strict=False)
+
     # Collect all @function_tool decorated functions directly
     tools = [
         read_file,

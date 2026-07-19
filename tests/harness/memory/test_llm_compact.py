@@ -4,8 +4,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from koder_agent.harness.memory.budget import (
+    ContextPreflightError,
+    estimate_context_preflight,
+)
 from koder_agent.harness.memory.compact import (
     COMPACTION_SUMMARY_PROMPT,
+    build_compacted_session_items,
     compact_messages,
     compactable_session_items,
     llm_compact_messages,
@@ -227,7 +232,7 @@ async def test_llm_compact_does_not_grow_already_compacted_context():
 
 
 @pytest.mark.asyncio
-async def test_llm_compact_fallback_on_error():
+async def test_llm_compact_fails_without_rewriting_on_error():
     messages = [{"role": "user", "content": f"msg {i}"} for i in range(10)]
 
     with patch(
@@ -235,7 +240,90 @@ async def test_llm_compact_fallback_on_error():
         new_callable=AsyncMock,
         side_effect=Exception("API error"),
     ):
-        result = await llm_compact_messages(messages)
-        # Should fall back to deterministic compaction
-        assert result is not None
-        assert result.kept_messages is not None
+        with pytest.raises(Exception, match="API error"):
+            await llm_compact_messages(messages)
+
+
+@pytest.mark.asyncio
+async def test_compaction_never_rewrites_history_from_truncated_source():
+    messages = [{"role": "user", "content": f"sentinel-{index}" * 100} for index in range(8)]
+    original = [dict(message) for message in messages]
+
+    async def reject_complete_source(_messages, **kwargs):
+        assert kwargs.get("overflow_policy", "error") == "error"
+        raise ContextPreflightError(
+            estimate_context_preflight(
+                context_window=64,
+                response_reserve=32,
+                input_tokens=1_000,
+            ),
+            subject="Auxiliary request",
+        )
+
+    with patch(
+        "koder_agent.harness.memory.compact.llm_completion",
+        side_effect=reject_complete_source,
+    ):
+        with pytest.raises(ContextPreflightError):
+            await llm_compact_messages(messages, keep_recent=2)
+
+    assert messages == original
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_system_and_developer_items():
+    messages = [
+        {"role": "system", "content": "system invariant"},
+        {"role": "developer", "content": "developer invariant"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "latest request"},
+    ]
+
+    with patch(
+        "koder_agent.harness.memory.compact.llm_completion",
+        new_callable=AsyncMock,
+        return_value="<summary>older conversation</summary>",
+    ):
+        result = await llm_compact_messages(messages, keep_recent=1)
+
+    assert messages[0] in result.kept_messages
+    assert messages[1] in result.kept_messages
+    assert messages[-1] in result.kept_messages
+    persisted = build_compacted_session_items(result)
+    assert persisted[:2] == messages[:2]
+    assert persisted[2]["content"].startswith("[Conversation compacted]")
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_recent_user_intent_and_tool_pairs_under_tiny_window():
+    messages = [
+        {"role": "system", "content": "do not lose me"},
+        {"role": "user", "content": "old request " * 100},
+        {"role": "user", "content": "latest exact intent"},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": '{"path":"important.py"}',
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": "evidence"},
+    ]
+    original = [dict(message) for message in messages]
+
+    with patch(
+        "koder_agent.harness.memory.compact.llm_completion",
+        new_callable=AsyncMock,
+        side_effect=ContextPreflightError(
+            estimate_context_preflight(
+                context_window=32,
+                response_reserve=16,
+                input_tokens=500,
+            )
+        ),
+    ):
+        with pytest.raises(ContextPreflightError):
+            await llm_compact_messages(messages, keep_recent=1)
+
+    assert messages == original
+    assert messages[-2]["call_id"] == messages[-1]["call_id"]

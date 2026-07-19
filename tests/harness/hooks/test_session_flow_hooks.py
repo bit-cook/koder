@@ -31,10 +31,12 @@ class _FakeScheduler:
         instructions_append=None,
         permission_service=None,
         approver=None,
+        todo_store=None,
     ):
         self.session = _FakeSchedulerSession(session_id)
         self.streaming = streaming
         self.agent_definition = agent_definition
+        self.todo_store = todo_store or SimpleNamespace(session_id=session_id)
         self.usage_tracker = SimpleNamespace(
             model="gpt-5.4",
             session_usage=SimpleNamespace(
@@ -73,6 +75,12 @@ def _patch_runtime(monkeypatch):
     monkeypatch.setattr("koder_agent.harness.session_flow._read_piped_stdin", lambda: None)
 
     class _FakeEnhancedSQLiteSession:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+
+        async def get_cwd(self):
+            return None
+
         @staticmethod
         async def record_session_cwd(_session_id: str, _cwd: str) -> None:
             return None

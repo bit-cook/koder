@@ -25,9 +25,10 @@ def test_powershell_denied_under_sandbox_with_actionable_message(tmp_path, monke
     decision = service.evaluate_tool_call("run_powershell", {"command": "Get-ChildItem"})
 
     assert not decision.allowed
-    assert "PowerShell sandbox execution is not implemented" in decision.reason
-    assert "/sandbox exclude" in decision.reason
-    assert "/sandbox disable" in decision.reason
+    assert decision.requires_approval
+    assert "sandbox protection is unavailable for PowerShell" in decision.reason
+    assert "loses host-process" in decision.reason
+    assert "requires explicit approval" in decision.reason
 
 
 def test_background_shell_denied_under_sandbox_with_actionable_message(tmp_path, monkeypatch):

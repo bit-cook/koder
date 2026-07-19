@@ -8,7 +8,37 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from koder_agent.core.keyboard_listener import KeyboardListener
+from koder_agent.core.keyboard_listener import KeyboardListener, iter_with_cancellation
+
+
+@pytest.mark.asyncio
+async def test_iter_with_cancellation_retrieves_simultaneous_iterator_failure():
+    class RacingToken:
+        is_cancelled = False
+
+        async def wait(self):
+            return None
+
+    class FailingIterator:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("iterator failed during cancellation")
+
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        wrapped = iter_with_cancellation(FailingIterator(), RacingToken())
+        with pytest.raises(StopAsyncIteration):
+            await anext(wrapped)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert unhandled == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix-only TTY tests")

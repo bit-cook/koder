@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
 from pathlib import Path
 
@@ -821,6 +822,20 @@ def test_memory_scenario_is_acceptance_backed_by_project_user_and_remember_files
     assert final_listing["send"] == "/memory"
     assert "Found 3 memory files" in final_listing["expect_all"]
     assert "remembered memory marker" in final_listing["expect_all"]
+    candidate_listing = scenario["turns"][6]
+    assert candidate_listing["send"] == "/memory candidates"
+    assert "memory candidates: 2 pending" in candidate_listing["expect_all"]
+    assert "scope=user" in candidate_listing["expect_all"]
+    assert (
+        "origin_project=/private/tmp/koder-memory-scenario-origin"
+        in candidate_listing["expect_all"]
+    )
+    assert "origin_session=memory-scenario-session" in candidate_listing["expect_all"]
+    assert scenario["turns"][7]["send"].startswith("/memory show ")
+    assert scenario["turns"][8]["send"].startswith("/memory approve ")
+    assert "memory candidate approved" in scenario["turns"][8]["expect_all"]
+    assert scenario["turns"][9]["send"].startswith("/memory reject ")
+    assert "candidate rejected" in scenario["turns"][9]["expect_all"]
     assert scenario["post_assertions"] == [
         {
             "file_contains": [
@@ -844,6 +859,30 @@ def test_memory_scenario_is_acceptance_backed_by_project_user_and_remember_files
                     "remembered memory marker",
                 ],
             ]
+        },
+        {
+            "file_contains": [
+                (
+                    "$HOME/.koder/memory/auto-dream-"
+                    "b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6.md"
+                ),
+                [
+                    "type: user",
+                    "storage_scope: user",
+                    (
+                        "source_candidate: "
+                        "b5bfd0b63ffd1730fa6cc9074193e4388034798bde59f9fd740673df4602f6a6"
+                    ),
+                    "description: candidate memory marker",
+                    "approved candidate marker",
+                ],
+            ]
+        },
+        {
+            "path_not_exists": (
+                "$HOME/.koder/skill-candidates/pending/"
+                "0499eb0d392f78a6997245ef10ed24d94af350edd039d7f0b0a1e50e46de58b6.json"
+            )
         },
     ]
 
@@ -2752,7 +2791,8 @@ def test_permissions_and_sandbox_scenario_is_acceptance_backed_by_decisions():
     assert scenario["acceptance_artifacts"]
     assert any(
         turn.get("send") == "/permissions check run_shell touch blocked.txt"
-        and "sandboxed shell command auto-allowed" in turn.get("expect_all", [])
+        and "requires_approval: true" in turn.get("expect_all", [])
+        and "sandboxed shell command auto-allowed" in turn.get("expect_not", [])
         for turn in scenario["turns"]
     )
     assert any(
@@ -2819,7 +2859,8 @@ def test_permission_slash_commands_are_acceptance_backed_by_runtime_state():
     )
     assert any(
         turn.get("send") == "/permissions check run_shell touch blocked.txt"
-        and "sandboxed shell command auto-allowed" in turn.get("expect_all", [])
+        and "requires_approval: true" in turn.get("expect_all", [])
+        and "sandboxed shell command auto-allowed" in turn.get("expect_not", [])
         for turn in permissions["turns"]
     )
     assert any(
@@ -3189,23 +3230,44 @@ def test_auto_dream_task_scenario_is_acceptance_backed_by_runtime_state():
     assert scenario["acceptance_criteria"]
     assert scenario["acceptance_artifacts"]
     assert "run_auto_dream_from_messages" in scenario["turns"][0]["send"]
-    assert {"auto-dream-runtime-ok", "task_id=1", "memories=1", "saved="} <= set(
-        scenario["turns"][0]["expect_all"]
-    )
+    assert '"type":"project"' in scenario["turns"][0]["send"]
+    assert '"type":"user"' in scenario["turns"][0]["send"]
+    assert {
+        "auto-dream-runtime-ok",
+        "task_id=1",
+        "memories=2",
+        "saved=",
+        "project_scope_ok=True",
+        "user_scope_ok=True",
+        "cross_project_retrieved=False",
+        "user_cross_project_retrieved=True",
+    } <= set(scenario["turns"][0]["expect_all"])
     assert scenario["turns"][1]["send"] == "/tasks"
-    assert {"auto-dream/1", "status=completed", "memories=1", "saved="} <= set(
+    assert {"auto-dream/1", "status=completed", "memories=2", "saved="} <= set(
         scenario["turns"][1]["expect_all"]
     )
     assert "broken.json" in scenario["turns"][2]["send"]
-    assert {"auto-dream/malformed: broken.json", "memories=2", "errors=1"} <= set(
+    assert {"auto-dream/malformed: broken.json", "memories=3", "errors=1"} <= set(
         scenario["turns"][-1]["expect_all"]
     )
     assert {
         "file_glob_contains": [
-            "$HOME/.koder/memory/auto-dream-*.md",
-            "Prefer scenario-backed tmux validation",
+            "$HOME/auto-dream-project-a/.koder/memory/auto-dream-project-*.md",
+            ["type: project", "storage_scope: project", "projectonlyzxq"],
         ]
     } in scenario["post_assertions"]
+    assert {
+        "file_glob_contains": [
+            "$HOME/.koder/memory/auto-dream-user-*.md",
+            ["type: user", "storage_scope: user", "userglobalqvx"],
+        ]
+    } in scenario["post_assertions"]
+    assert {"file_glob_not_contains": ["$HOME/.koder/memory/*.md", "projectonlyzxq"]} in scenario[
+        "post_assertions"
+    ]
+    assert {"path_not_exists": "$HOME/auto-dream-project-b/.koder/memory"} in scenario[
+        "post_assertions"
+    ]
     assert {
         "file_contains": [
             "$HOME/.koder/tasks/auto-dream/broken.json",
@@ -4137,6 +4199,21 @@ def test_fake_openai_fixture_is_checked():
     assert "slash_commands/btw: fake_openai.stream_lines must be a positive integer" in errors
 
 
+def test_fake_openai_fixture_accepts_dynamic_port_and_rejects_invalid_range():
+    manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
+    fixture = manifest["features"]["fixed-bottom-subagent-progress"]["fake_openai"]
+    assert fixture["port"] == 0
+    assert validate_manifest(manifest) == []
+
+    fixture["port"] = 65536
+    errors = validate_manifest(manifest)
+
+    assert (
+        "features/fixed-bottom-subagent-progress: fake_openai.port must be from 0 through 65535"
+        in errors
+    )
+
+
 def test_streaming_tool_queue_fixture_continuation_uses_latest_user_turn():
     completed_previous_tool_turn = {
         "messages": [
@@ -4157,6 +4234,33 @@ def test_streaming_tool_queue_fixture_continuation_uses_latest_user_turn():
 
     assert not FakeOpenAIHandler._request_has_tool_output(None, completed_previous_tool_turn)
     assert FakeOpenAIHandler._request_has_tool_output(None, active_tool_continuation)
+
+
+def test_sandbox_function_tool_scenario_reaches_model_function_tool_path():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["sandbox-function-tool-approval"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["fake_openai"]["scenario"] == "sandbox_shell_tool"
+    assert scenario["turns"][0]["expect_all"] == [
+        "Permission required: run_shell",
+        "touch model-tool-created.txt",
+        "[y]allow once  [a]always allow  [n]deny",
+    ]
+    assert scenario["turns"][1]["send"] == "n"
+    assert scenario["post_assertions"][0] == {"path_not_exists": "$REPO/model-tool-created.txt"}
+
+
+def test_fake_openai_sandbox_scenario_emits_run_shell_call():
+    handler = object.__new__(FakeOpenAIHandler)
+    handler.scenario = "sandbox_shell_tool"
+
+    payload = handler._tool_call_payload()
+
+    assert payload["function"]["name"] == "run_shell"
+    assert json.loads(payload["function"]["arguments"]) == {
+        "command": "touch model-tool-created.txt"
+    }
 
 
 def test_fixed_bottom_queued_input_scenario_uses_streaming_tool_fixture():
@@ -4218,6 +4322,54 @@ def test_fixed_bottom_queued_input_scenario_uses_streaming_tool_fixture():
             ]
         }
     ]
+
+
+def test_fixed_bottom_subagent_progress_uses_compact_dynamic_fixture():
+    manifest = _load_manifest(DEFAULT_MANIFEST)
+    scenario = manifest["features"]["fixed-bottom-subagent-progress"]
+
+    assert scenario["validation_level"] == "acceptance"
+    assert scenario["env"]["KODER_BASE_URL"] == "$FAKE_OPENAI_URL"
+    assert scenario["fake_openai"]["port"] == 0
+    assert scenario["fake_openai"]["scenario"] == "streaming_subagent_tool"
+    assert scenario["turns"][0]["resize"] == {"width": 60, "height": 12}
+    assert "2 running" in scenario["turns"][1]["expect_all"]
+    assert "Succeeded (2 agents, 2 tool uses)" in scenario["turns"][2]["expect_all"]
+    assert scenario["post_assertions"] == [
+        {
+            "file_occurrences": [
+                "$HOME/fake-openai-subagent-display.log",
+                {
+                    "subagent-alpha-read_file-request": 1,
+                    "subagent-alpha-read_file-result": 1,
+                    "subagent-beta-read_file-request": 1,
+                    "subagent-beta-read_file-result": 1,
+                    "call_koder_subagent_alpha_read_file": 2,
+                    "call_koder_subagent_beta_read_file": 2,
+                },
+            ]
+        }
+    ]
+
+
+def test_fake_openai_subagent_scenario_emits_child_specific_read_calls():
+    handler = object.__new__(FakeOpenAIHandler)
+    handler.scenario = "streaming_subagent_tool"
+
+    alpha_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Read sample.txt. Marker: KODER_SUBAGENT_ALPHA.",
+            }
+        ],
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+    }
+    payload = handler._tool_call_payload(alpha_body)
+
+    assert payload["id"] == "call_koder_subagent_alpha_read_file"
+    assert payload["function"]["name"] == "read_file"
+    assert json.loads(payload["function"]["arguments"]) == {"path": "sample.txt"}
 
 
 def test_fixed_bottom_error_history_scenario_uses_failing_stream_fixture():
@@ -4312,6 +4464,20 @@ def test_post_assertions_are_validated():
     assert any("file_contains needs [path, text-or-text-list]" in error for error in errors)
 
 
+def test_file_occurrence_post_assertions_are_validated():
+    manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
+    manifest["teams"]["tmux-pane"]["post_assertions"] = [
+        {"file_occurrences": ["$HOME/x.txt", {"marker": -1}]}
+    ]
+
+    errors = validate_manifest(manifest)
+
+    assert any(
+        "file_occurrences needs [path, {text: exact-nonnegative-count}]" in error
+        for error in errors
+    )
+
+
 def test_sqlite_post_assertions_are_validated():
     manifest = copy.deepcopy(_load_manifest(DEFAULT_MANIFEST))
     manifest["features"]["memory-and-session"]["post_assertions"] = [
@@ -4351,6 +4517,28 @@ def test_post_assertions_check_filesystem_state(tmp_path):
     failures = scenarios._run_post_assertions(scenario, home=home, repo=repo)
 
     assert failures == []
+
+
+def test_post_assertions_check_exact_file_occurrences(tmp_path):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    log_file = home / "provider.log"
+    log_file.write_text("alpha\nbeta\nalpha\n", encoding="utf-8")
+    counts = {"alpha": 2, "beta": 1}
+    scenario = scenarios.ScenarioRef(
+        suite="features",
+        name="subagents",
+        payload={"post_assertions": [{"file_occurrences": ["$HOME/provider.log", counts]}]},
+    )
+
+    assert scenarios._run_post_assertions(scenario, home=home, repo=repo) == []
+
+    counts["alpha"] = 1
+    [failure] = scenarios._run_post_assertions(scenario, home=home, repo=repo)
+
+    assert "'alpha': expected 1, found 2" in failure
 
 
 def test_post_assertions_check_globbed_filesystem_state(tmp_path):
@@ -4431,6 +4619,20 @@ def test_scenario_env_expansion_replaces_repo_home_and_path(monkeypatch, tmp_pat
     )
 
     assert value == f"{repo}/bin:{home}/tools:/usr/bin:/bin"
+
+
+def test_scenario_env_expansion_replaces_dynamic_fake_openai_url(tmp_path):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+
+    value = scenarios._expand_scenario_env_value(
+        "$FAKE_OPENAI_URL/chat",
+        home=home,
+        repo=repo,
+        fake_openai_url="http://127.0.0.1:43210/v1",
+    )
+
+    assert value == "http://127.0.0.1:43210/v1/chat"
 
 
 def test_tmux_pane_assertion_helper_matches_any_worker_pane(monkeypatch):

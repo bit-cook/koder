@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -10,12 +11,105 @@ QUEUE_VISIBLE_PREFIX = "queued: "
 QUEUED_TOOL_OUTPUT_HEADER = "Queued user input"
 
 
+class ApprovalBrokerUnavailableError(RuntimeError):
+    """Raised when no prompt-toolkit input application can own an approval."""
+
+
+class ApprovalBroker:
+    """Route serialized permission answers through the active queued-input app."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._activation_generation = 0
+        self._lock = asyncio.Lock()
+        self._prompt: str | None = None
+        self._answer_future: asyncio.Future[str] | None = None
+        self._callbacks: list[Callable[[], None]] = []
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    @property
+    def prompt(self) -> str | None:
+        return self._prompt
+
+    @property
+    def has_pending_request(self) -> bool:
+        future = self._answer_future
+        return self._prompt is not None and future is not None and not future.done()
+
+    def activate(self) -> None:
+        """Mark prompt-toolkit as the current stdin owner."""
+        self._activation_generation += 1
+        self._active = True
+        self._notify_changed()
+
+    def deactivate(self) -> None:
+        """Release stdin ownership and fail any displayed request closed."""
+        self._active = False
+        future = self._answer_future
+        if future is not None and not future.done():
+            future.set_result("")
+        self._prompt = None
+        self._answer_future = None
+        self._notify_changed()
+
+    async def request(self, prompt: str) -> str:
+        """Display one modal approval prompt and await its submitted answer."""
+        if not self._active:
+            raise ApprovalBrokerUnavailableError
+        generation = self._activation_generation
+        async with self._lock:
+            if not self._active or generation != self._activation_generation:
+                return ""
+
+            future = asyncio.get_running_loop().create_future()
+            self._prompt = prompt
+            self._answer_future = future
+            self._notify_changed()
+            try:
+                return await future
+            finally:
+                if self._answer_future is future:
+                    self._prompt = None
+                    self._answer_future = None
+                    self._notify_changed()
+
+    def submit(self, answer: str) -> bool:
+        """Resolve the visible request, returning whether input was consumed."""
+        future = self._answer_future
+        if not self._active or future is None or future.done():
+            return False
+        future.set_result(answer)
+        return True
+
+    def on_change(self, callback: Callable[[], None]) -> Callable[[], None]:
+        self._callbacks.append(callback)
+
+        def remove() -> None:
+            try:
+                self._callbacks.remove(callback)
+            except ValueError:
+                pass
+
+        return remove
+
+    def _notify_changed(self) -> None:
+        for callback in list(self._callbacks):
+            try:
+                callback()
+            except Exception:
+                continue
+
+
 class QueuedInputManager:
     """Store prompts submitted while a model response is still in flight."""
 
     def __init__(self) -> None:
         self._items: list[str] = []
         self._callbacks: list[Callable[[], None]] = []
+        self.approval_broker = ApprovalBroker()
 
     def enqueue(self, text: str) -> None:
         clean = text.strip()

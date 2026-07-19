@@ -106,3 +106,40 @@ def test_union_across_two_skills_in_separate_tasks():
         add_skill_restrictions(_skill(name, allowed))
 
     asyncio.run(scenario())
+
+
+def test_nested_scheduler_scope_inherits_manual_policy_without_leaking_additions():
+    """A scheduler scope inherits a slash skill and restores its parent snapshot."""
+
+    async def scenario():
+        manual_token = begin_skill_restriction_scope(_skill("manual", ["read_file"]))
+        try:
+            scheduler_token = begin_skill_restriction_scope()
+            try:
+                inherited = get_active_restrictions()
+                assert inherited is not None
+                assert inherited.loaded_skills == ["manual"]
+                assert inherited.is_tool_allowed("read_file")
+                assert not inherited.is_tool_allowed("write_file")
+
+                await asyncio.create_task(_add("nested", ["glob_search"]))
+                nested = get_active_restrictions()
+                assert nested is not None
+                assert nested.loaded_skills == ["manual", "nested"]
+                assert nested.is_tool_allowed("glob_search")
+            finally:
+                reset_skill_restriction_scope(scheduler_token)
+
+            restored = get_active_restrictions()
+            assert restored is not None
+            assert restored.loaded_skills == ["manual"]
+            assert restored.allowed_tools == {"read_file"}
+        finally:
+            reset_skill_restriction_scope(manual_token)
+
+        assert get_active_restrictions() is None
+
+    async def _add(name, allowed):
+        add_skill_restrictions(_skill(name, allowed))
+
+    asyncio.run(scenario())

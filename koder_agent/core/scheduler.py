@@ -1,9 +1,13 @@
 """Agent scheduler for managing agent execution."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import threading
+import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,14 +30,22 @@ from rich.text import Text
 from ..agentic import ApprovalHooks, create_dev_agent, get_display_hooks
 from ..agentic.api_errors import ApiErrorCategory, classify_api_error
 from ..core.constants import get_max_turns, get_turn_timeout
+from ..core.display_context import SubagentDisplayEvent, subagent_display_scope
 from ..core.goal_prompts import GOAL_CONTEXT_MARKER
 from ..core.goal_runtime import GoalRuntime
 from ..core.goals import GoalStore
-from ..core.keyboard_listener import CancellationToken, escape_listener, iter_with_cancellation
+from ..core.keyboard_listener import escape_listener, iter_with_cancellation
 from ..core.queued_input import QueuedInputManager, wrap_function_tool_for_queued_input
 from ..core.session import EnhancedSQLiteSession, migrate_legacy_sessions
 from ..core.streaming_display import StreamingDisplayManager
 from ..core.terminal_reflow import print_reflowable
+from ..core.turn_cancellation import (
+    TurnCancellationScope,
+    await_with_turn_cancellation,
+    current_turn_cancellation_scope,
+    reset_turn_cancellation_scope,
+    set_turn_cancellation_scope,
+)
 from ..core.usage_tracker import UsageTracker, usage_snapshot_path
 from ..core.working_indicator import working_indicator
 from ..harness.agents.definitions import (
@@ -53,8 +65,15 @@ from ..harness.buddy import (
 )
 from ..harness.config.service import RuntimeConfigService
 from ..harness.memory.auto_compact import AutoCompactManager
-from ..harness.memory.budget import estimate_messages_tokens
+from ..harness.memory.budget import (
+    ContextPreflightError,
+    ContextPreflightEstimate,
+    estimate_context_preflight,
+    estimate_message_tokens,
+    estimate_messages_tokens,
+)
 from ..harness.memory.compact import (
+    build_compacted_session_items,
     compactable_session_items,
     llm_compact_messages,
     replayable_session_items,
@@ -69,12 +88,15 @@ from ..tools.permission_context import (
     reset_tool_permission_context,
     set_tool_permission_context,
 )
-from ..tools.skill_context import (
-    begin_skill_restriction_scope,
-    reset_skill_restriction_scope,
+from ..tools.skill_context import skill_invocation_scope, skill_run_scope
+from ..tools.todo import (
+    TodoRuntimeIdentity,
+    TodoStore,
+    reset_todo_context,
+    set_todo_context,
 )
-from ..utils.client import get_model_name
-from ..utils.model_info import get_context_window_size, get_maximum_output_tokens
+from ..utils.client import get_configured_context_window, get_model_name
+from ..utils.model_info import get_maximum_output_tokens
 from ..utils.terminal_theme import get_adaptive_console
 
 logger = logging.getLogger(__name__)
@@ -107,6 +129,11 @@ DEFAULT_GOAL_MAX_CONTINUATIONS = 25
 # the loop). The count cap remains as a secondary backstop.
 DEFAULT_GOAL_MAX_CONTINUATION_TOKENS = 400_000
 
+SYNTHETIC_INTERRUPTION_MARKER = (
+    "[Synthetic interruption marker] The previous assistant turn was interrupted after "
+    "the completed tool call(s) above. No final assistant conclusion was produced."
+)
+
 
 def _goal_max_continuations() -> int:
     raw = os.environ.get("KODER_GOAL_MAX_CONTINUATIONS")
@@ -130,6 +157,123 @@ def _goal_max_continuation_tokens() -> int:
         except ValueError:
             pass
     return DEFAULT_GOAL_MAX_CONTINUATION_TOKENS
+
+
+class _GoalTurnLifecycle:
+    """Finalize one scheduler turn exactly once and reset its execution contexts."""
+
+    def __init__(self, scheduler: "AgentScheduler"):
+        self.scheduler = scheduler
+        self.error = False
+        self.cancelled = False
+        self._finish_task: asyncio.Task[None] | None = None
+        self._perm_token = None
+        self._goal_token = None
+        self._todo_token = None
+
+    async def __aenter__(self) -> "_GoalTurnLifecycle":
+        self.scheduler._last_turn_cancelled = False
+        self.scheduler._last_turn_errored = False
+        self._perm_token = set_tool_permission_context(
+            self.scheduler.permission_service,
+            approver=self.scheduler.approver,
+        )
+        self._goal_token = set_goal_context(self.scheduler.goal_runtime)
+        self._todo_token = set_todo_context(self.scheduler.todo_store)
+        try:
+            await self.scheduler.goal_runtime.on_turn_start(
+                self.scheduler._goal_cumulative_tokens()
+            )
+        except BaseException:
+            self._reset_contexts()
+            raise
+        return self
+
+    def mark_error(self) -> None:
+        self.error = True
+        self.scheduler._last_turn_errored = True
+
+    def mark_cancelled(self) -> None:
+        self.cancelled = True
+        self.scheduler._last_turn_cancelled = True
+
+    async def __aexit__(self, exc_type, _exc, _traceback) -> bool:
+        if exc_type is not None:
+            if issubclass(exc_type, asyncio.CancelledError):
+                self.mark_cancelled()
+            else:
+                self.mark_error()
+        try:
+            await self.finish()
+        finally:
+            self._reset_contexts()
+        return False
+
+    async def finish(self) -> None:
+        if self._finish_task is None:
+            self._finish_task = asyncio.create_task(
+                self.scheduler._finish_goal_turn(
+                    error=self.error,
+                    cancelled=self.cancelled,
+                )
+            )
+        await _await_owned_task(self._finish_task)
+
+    def _reset_contexts(self) -> None:
+        if self._todo_token is not None:
+            reset_todo_context(self._todo_token)
+            self._todo_token = None
+        if self._goal_token is not None:
+            reset_goal_context(self._goal_token)
+            self._goal_token = None
+        if self._perm_token is not None:
+            reset_tool_permission_context(self._perm_token)
+            self._perm_token = None
+
+
+async def _await_owned_task(task: asyncio.Task[Any]) -> Any:
+    """Wait for owned work through repeated cancellation, then re-raise it."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+
+    try:
+        result = task.result()
+    except BaseException:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _run_sync_and_join(function) -> Any:
+    """Run blocking resource closure off-loop and join its one-shot owner thread."""
+    result: list[Any] = []
+    error: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            result.append(function())
+        except BaseException as exc:
+            error.append(exc)
+
+    thread = threading.Thread(
+        target=worker,
+        name="koder-resource-close",
+        daemon=False,
+    )
+    thread.start()
+    while thread.is_alive():
+        await asyncio.sleep(0.01)
+    thread.join()
+    if error:
+        raise error[0]
+    return result[0] if result else None
 
 
 @dataclass
@@ -265,8 +409,12 @@ class AgentScheduler:
         instructions_append: str | None = None,
         permission_service=None,
         approver=None,
+        todo_store: TodoStore | None = None,
+        project_root: str | Path | None = None,
     ):
+        runtime_cwd = Path(project_root or os.getcwd()).expanduser().resolve()
         self.session = EnhancedSQLiteSession(session_id=session_id)
+        self.project_root = runtime_cwd
         self.agent_definition = agent_definition
         self.instructions_override = instructions_override
         self.instructions_append = instructions_append
@@ -293,7 +441,7 @@ class AgentScheduler:
         if agent_definition is not None:
             self.hooks = SubagentLifecycleHooks(
                 agent_definition=agent_definition,
-                cwd=os.getcwd(),
+                cwd=runtime_cwd,
                 wrapped_hooks=display_hooks,
                 permission_service=permission_service,
             )
@@ -313,10 +461,27 @@ class AgentScheduler:
         self._migration_done = False  # Track if migration has been performed
         # Memory management - will be initialized after agent is created
         self._auto_compact: AutoCompactManager | None = None
-        self._session_memory = SessionMemoryManager(project_dir=os.getcwd())
+        self._session_memory = SessionMemoryManager(project_dir=runtime_cwd)
         self._tool_call_count = 0  # Track tool calls for session memory extraction
         self._static_context_tokens_cache: int | None = None
+        self._instruction_context_tokens_cache: int | None = None
+        self._tool_schema_tokens_cache: int | None = None
+        self._context_model_name: str | None = None
         self._turn_lock = asyncio.Lock()
+        agent_id = agent_definition.agent_type if agent_definition is not None else "main"
+        if todo_store is not None and (
+            todo_store.identity.session_id != session_id or todo_store.identity.agent_id != agent_id
+        ):
+            raise ValueError(
+                "todo store runtime identity does not match scheduler session and agent"
+            )
+        self.todo_store = todo_store or TodoStore(
+            TodoRuntimeIdentity(
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=f"scheduler-{uuid.uuid4().hex}",
+            )
+        )
         # Goal runtime: long-running objectives with token budgets and hidden
         # continuation turns. Uses an in-memory store when the session does.
         goal_db_path = getattr(self.session, "db_path", None)
@@ -324,6 +489,9 @@ class AgentScheduler:
         self.goal_runtime = GoalRuntime(session_id=session_id, store=self.goal_store)
         self._last_turn_cancelled = False
         self._last_turn_errored = False
+        self._cancelled_stream_settlement: asyncio.Future[Any] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._background_shell_cleanup_ids: frozenset[str] | None = None
         # NOTE: micro_compact_messages is NOT wired here because the openai-agents
         # SDK's Runner manages tool results internally.  Individual tool outputs are
         # fed back into the conversation by the SDK before session.add_items is
@@ -406,7 +574,7 @@ class AgentScheduler:
                 instructions_override = self.instructions_override
             append_segments = [segment for segment in [self.instructions_append] if segment]
             append_segments.append(COMPANION_ASSISTANT_GUIDANCE)
-            self.dev_agent = await create_dev_agent(
+            dev_agent = await create_dev_agent(
                 self.tools,
                 name=name,
                 instructions_override=instructions_override,
@@ -418,21 +586,32 @@ class AgentScheduler:
                     else None
                 ),
             )
-            tracked_servers = getattr(self.dev_agent, "mcp_servers", None) or getattr(
-                self.dev_agent, "_koder_mcp_servers", None
-            )
-            if tracked_servers:
-                self._mcp_servers = list(tracked_servers)  # Create a copy
+            try:
+                tracked_servers = getattr(dev_agent, "_koder_mcp_servers", None)
+                # Initialize AutoCompactManager with model's context window
+                model_name = model_override or get_model_name()
+                self._context_model_name = model_name
+                context_window = getattr(dev_agent.model, "context_window", None)
+                if not isinstance(context_window, int) or context_window <= 0:
+                    context_window = get_configured_context_window(model_name)
+                max_output_tokens = getattr(dev_agent.model_settings, "max_tokens", None)
+                if not isinstance(max_output_tokens, int) or max_output_tokens < 0:
+                    max_output_tokens = get_maximum_output_tokens(
+                        model_name,
+                        max_context_size=context_window,
+                    )
+                self._auto_compact = AutoCompactManager(
+                    context_window=context_window,
+                    max_output_tokens=max_output_tokens,
+                )
+            except BaseException:
+                from koder_agent.harness.agents.service import _cleanup_agent_mcp_servers
 
-            # Initialize AutoCompactManager with model's context window
-            model_name = get_model_name()
-            context_window = get_context_window_size(model_name)
-            max_output_tokens = get_maximum_output_tokens(model_name)
-            self._auto_compact = AutoCompactManager(
-                context_window=context_window,
-                max_output_tokens=max_output_tokens,
-            )
+                await _cleanup_agent_mcp_servers(dev_agent)
+                raise
 
+            self.dev_agent = dev_agent
+            self._mcp_servers = tracked_servers if tracked_servers is not None else []
             self._agent_initialized = True
 
     async def _reconnect_unhealthy_mcp_servers(self) -> None:
@@ -448,11 +627,18 @@ class AgentScheduler:
         the session.
         """
         try:
+            from ..mcp.runtime_authorization import validate_project_server_authorizations
+
+            await validate_project_server_authorizations(self._mcp_servers)
+        except Exception:
+            logger.debug("Project MCP turn-boundary validation failed", exc_info=True)
+
+        try:
             from ..mcp import get_reconnection_managers
         except Exception:
             return
         try:
-            managers = get_reconnection_managers()
+            managers = get_reconnection_managers(self._mcp_servers)
         except Exception:
             return
         if not managers:
@@ -464,6 +650,52 @@ class AgentScheduler:
                     logger.warning("MCP server %s is unhealthy and could not reconnect", name)
             except Exception:
                 logger.debug("MCP reconnect probe failed for %s", name, exc_info=True)
+
+    def _retain_cancelled_stream_settlement(self, result: Any) -> None:
+        """Retain the SDK task that owns late session persistence after cancellation."""
+        settlement = getattr(result, "run_loop_task", None)
+        if settlement is None:
+            # Test doubles and compatibility shims may expose the same ownership
+            # handle under a descriptive name instead of the SDK field.
+            settlement = getattr(result, "late_task", None)
+        if settlement is None:
+            return
+        if not asyncio.isfuture(settlement):
+            settlement = asyncio.create_task(settlement)
+        self._cancelled_stream_settlement = settlement
+
+    async def _await_cancelled_stream_settlement(self) -> None:
+        """Wait for late SDK persistence, preserving repeated caller cancellation."""
+        settlement = self._cancelled_stream_settlement
+        if settlement is None:
+            return
+
+        caller_cancelled = False
+        while not settlement.done():
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    caller_cancelled = True
+            except BaseException:
+                # The task owns persistence settlement, not turn success. Its
+                # terminal exception is observed and logged below after the
+                # session writes it owns have stopped racing transcript repair.
+                if settlement.done():
+                    break
+
+        if self._cancelled_stream_settlement is settlement:
+            self._cancelled_stream_settlement = None
+
+        if not settlement.cancelled():
+            try:
+                settlement.result()
+            except BaseException:
+                logger.debug("Cancelled stream settlement failed", exc_info=True)
+
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     async def _generate_title_background(self, user_input: str) -> None:
         """Background task to generate and save session title."""
@@ -497,33 +729,34 @@ class AgentScheduler:
         continuations never carry images.
         """
         async with self._turn_lock:
-            # Bind file checkpointing to this session and open a new checkpoint
-            # for this user turn, so file tools snapshot pre-edit content that
-            # /rewind (code mode) can restore. Hidden goal continuations below
-            # stay within this same checkpoint (they are one logical turn).
-            try:
-                from ..harness import checkpoint as _checkpoint
+            with skill_invocation_scope():
+                # Bind file checkpointing to this session and open a new checkpoint
+                # for this user turn, so file tools snapshot pre-edit content that
+                # /rewind (code mode) can restore. Hidden goal continuations below
+                # stay within this same checkpoint (they are one logical turn).
+                try:
+                    from ..harness import checkpoint as _checkpoint
 
-                _checkpoint.set_active_session(self.session.session_id)
-                _checkpoint.begin_turn()
-            except Exception:
-                logger.debug("Failed to begin file checkpoint turn", exc_info=True)
+                    _checkpoint.set_active_session(self.session.session_id)
+                    _checkpoint.begin_turn()
+                except Exception:
+                    logger.debug("Failed to begin file checkpoint turn", exc_info=True)
 
-            response = await self._handle_unlocked(
-                user_input,
-                render_output=render_output,
-                streaming_ui=streaming_ui,
-                multimodal_input=multimodal_input,
-            )
-
-            async def run_continuation(prompt: str) -> str:
-                return await self._handle_unlocked(
-                    prompt,
+                response = await self._handle_unlocked(
+                    user_input,
                     render_output=render_output,
                     streaming_ui=streaming_ui,
+                    multimodal_input=multimodal_input,
                 )
 
-            return await self._run_goal_continuations(response, run_continuation)
+                async def run_continuation(prompt: str) -> str:
+                    return await self._handle_unlocked(
+                        prompt,
+                        render_output=render_output,
+                        streaming_ui=streaming_ui,
+                    )
+
+                return await self._run_goal_continuations(response, run_continuation)
 
     async def _run_goal_continuations(self, response: str, run_turn) -> str:
         """Run hidden continuation turns while the active goal asks for them.
@@ -568,17 +801,46 @@ class AgentScheduler:
         multimodal_input: list | None = None,
     ) -> str:
         """Handle a single turn after the turn lock has been acquired."""
+        import sys
+
         # Start before agent init/memory retrieval so the indicator covers the
         # whole pre-stream setup gap, not just the model call.
         working_indicator.begin()
+        cancellation_scope = TurnCancellationScope()
+        cancellation_context = set_turn_cancellation_scope(cancellation_scope)
+        ui_set_cancel = (
+            getattr(streaming_ui, "set_cancel_callback", None) if streaming_ui is not None else None
+        )
+        if callable(ui_set_cancel):
+            ui_set_cancel(cancellation_scope.cancel)
+
+        async def handle_escape() -> None:
+            cancellation_scope.cancel()
+
+        esc_enabled = streaming_ui is None and sys.platform != "win32" and sys.stdin.isatty()
         try:
-            return await self._run_turn_unlocked(
-                user_input,
-                render_output=render_output,
-                streaming_ui=streaming_ui,
-                multimodal_input=multimodal_input,
-            )
+            async with escape_listener(on_escape=handle_escape, enabled=esc_enabled):
+                async with _GoalTurnLifecycle(self) as goal_turn:
+                    buddy_runtime.mark_task_start()
+                    try:
+                        return await self._run_turn_unlocked(
+                            user_input,
+                            render_output=render_output,
+                            streaming_ui=streaming_ui,
+                            multimodal_input=multimodal_input,
+                            goal_turn=goal_turn,
+                        )
+                    finally:
+                        buddy_runtime.mark_task_complete()
+        except asyncio.CancelledError:
+            if cancellation_scope.is_cancelled:
+                self._last_turn_cancelled = True
+                return "Operation cancelled. You can provide additional instructions."
+            raise
         finally:
+            if callable(ui_set_cancel):
+                ui_set_cancel(None)
+            reset_turn_cancellation_scope(cancellation_context)
             working_indicator.finish()
 
     async def _run_turn_unlocked(
@@ -588,6 +850,7 @@ class AgentScheduler:
         render_output: bool = True,
         streaming_ui: StreamingOutputUI | None = None,
         multimodal_input: list | None = None,
+        goal_turn: _GoalTurnLifecycle | None = None,
     ) -> str:
         """Execute one turn; the caller owns the working-indicator lifecycle.
 
@@ -597,9 +860,24 @@ class AgentScheduler:
         memory, goal accounting, magic docs, companion). Only the first turn
         carries images; goal continuations always pass ``None``.
         """
+        if goal_turn is None:
+            async with _GoalTurnLifecycle(self) as owned_goal_turn:
+                return await self._run_turn_unlocked(
+                    user_input,
+                    render_output=render_output,
+                    streaming_ui=streaming_ui,
+                    multimodal_input=multimodal_input,
+                    goal_turn=owned_goal_turn,
+                )
+
         turn_user_input = user_input
 
+        await self._await_cancelled_stream_settlement()
+
         # Ensure agent is initialized with MCP servers and migration complete
+        cancellation_scope = current_turn_cancellation_scope()
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
         await self._ensure_agent_initialized()
         # Best-effort: reconnect any MCP server that dropped since the last turn.
         await self._reconnect_unhealthy_mcp_servers()
@@ -609,26 +887,43 @@ class AgentScheduler:
             return "Agent not initialized"
 
         await self._repair_unreplayable_session_items()
+        if cancellation_scope is not None:
+            cancellation_scope.raise_if_cancelled()
 
         # Note: Input panel is now displayed in InteractivePrompt, so we skip showing it here
 
-        # Check if this is the first message for title generation and memory injection
+        # Check if this is the first message for title generation and memory injection.
+        # Reject an intrinsically impossible input before either auxiliary call
+        # can reach a provider.
         history = await self.session.get_items()
-        if not history and self._title_generation_task is None:
+        first_turn = not history and self._title_generation_task is None
+        actual_request = user_input
+        if first_turn:
             # Extract actual user request (strip context prefix if present)
-            actual_request = user_input
             if "User request:" in user_input:
                 actual_request = user_input.split("User request:")[-1].strip()
-            self._title_generation_task = asyncio.create_task(
-                self._generate_title_background(actual_request)
-            )
 
+        initial_run_input = multimodal_input if multimodal_input is not None else user_input
+        initial_estimate = await self._estimate_main_call_preflight(
+            initial_run_input,
+            history_tokens=0,
+        )
+        if not initial_estimate.fits:
+            error = ContextPreflightError(initial_estimate, subject="Current input")
+            response = str(error)
+            if render_output:
+                print_reflowable(console, f"[red]{response}[/red]")
+            return response
+
+        if first_turn:
             # Inject relevant memories on first turn. The block is tagged with
             # MEMORY_CONTEXT_MARKER so display (_get_display_input) and memory
             # extraction can recognize and exclude it. Title generation is
             # unaffected because it uses the clean `actual_request` captured
             # above, before this injection.
             memory_context = await self._load_memory_context(actual_request)
+            if cancellation_scope is not None:
+                cancellation_scope.raise_if_cancelled()
             if memory_context:
                 # Prepend memory context to user input. Recalled memories may
                 # originate from untrusted tool output or repositories, so wrap
@@ -648,27 +943,31 @@ class AgentScheduler:
                     f"\n\n---\n\n{user_input}"
                 )
 
-        if render_output and streaming_ui is None:
-            console.print()
-            console.print("[dim]thinking...[/dim]")
-
-        # Run the agent with session - history is managed automatically
-        companion_config = self._runtime_config_service.load()
-        companion = get_companion(companion_config)
-
-        # Publish the permission service into the tool layer so the function_tool
-        # wrapper can enforce argument-level deny/approval on shell & file tools.
-        # Set before Runner.run so the run-loop task copies a context that has it.
-        perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
-        goal_token = set_goal_context(self.goal_runtime)
-        skill_token = begin_skill_restriction_scope()
-        await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
-        self._last_turn_cancelled = False
-        self._last_turn_errored = False
         # The actual model input: multimodal (image blocks + text) when images
         # were attached for this turn, otherwise the plain text string. All
         # bookkeeping below still uses the `user_input` string.
         run_input = multimodal_input if multimodal_input is not None else user_input
+
+        try:
+            await self._preflight_main_model_call(run_input)
+        except ContextPreflightError as error:
+            response = str(error)
+            if render_output:
+                print_reflowable(console, f"[red]{response}[/red]")
+            return response
+
+        if first_turn:
+            self._title_generation_task = asyncio.create_task(
+                self._generate_title_background(actual_request)
+            )
+
+        if render_output and streaming_ui is None:
+            console.print()
+            console.print("[dim]thinking...[/dim]")
+
+        # Run the agent with session - history is managed automatically.
+        companion_config = self._runtime_config_service.load()
+        companion = get_companion(companion_config)
 
         async def _run_once() -> str:
             # Re-runs on a context-overflow retry use the SAME run_input so the
@@ -681,18 +980,22 @@ class AgentScheduler:
                     run_input=run_input,
                 )
             turn_timeout = get_turn_timeout()
-            coro = Runner.run(
-                self.dev_agent,
-                run_input,  # Just current input - session handles history
-                session=self.session,  # Automatic history management
-                run_config=RunConfig(),
-                hooks=self.hooks,
-                max_turns=get_max_turns(),
-            )
-            if turn_timeout > 0:
-                result = await asyncio.wait_for(coro, timeout=turn_timeout)
-            else:
-                result = await coro
+            with skill_run_scope(self.hooks) as run_hooks:
+                coro = Runner.run(
+                    self.dev_agent,
+                    run_input,  # Just current input - session handles history
+                    session=self.session,  # Automatic history management
+                    run_config=RunConfig(),
+                    hooks=run_hooks,
+                    max_turns=get_max_turns(),
+                )
+                if turn_timeout > 0:
+                    result = await asyncio.wait_for(
+                        await_with_turn_cancellation(coro),
+                        timeout=turn_timeout,
+                    )
+                else:
+                    result = await await_with_turn_cancellation(coro)
             # Capture token usage from result
             await self._capture_usage(result)
 
@@ -711,7 +1014,6 @@ class AgentScheduler:
         # through to the normal error handling instead of looping.
         context_overflow_retried = False
         try:
-            buddy_runtime.mark_task_start()
             try:
                 response = await _run_once()
             except Exception as e:
@@ -732,7 +1034,7 @@ class AgentScheduler:
                     except Exception as retry_error:
                         # Still failing (or overflowing again): fall through to
                         # the normal terminal-error handling below.
-                        await self._finish_goal_turn(error=True)
+                        goal_turn.mark_error()
                         error_text = f"Execution error: {_format_execution_error(retry_error)}"
                         response = f"{error_text}\n\nPlease provide new instructions."
                         if render_output:
@@ -743,7 +1045,7 @@ class AgentScheduler:
                         return response
                 else:
                     # Handle execution errors gracefully
-                    await self._finish_goal_turn(error=True)
+                    goal_turn.mark_error()
                     error_text = f"Execution error: {_format_execution_error(e)}"
                     response = f"{error_text}\n\nPlease provide new instructions."
                     if render_output:
@@ -752,16 +1054,11 @@ class AgentScheduler:
                             f"[red]{error_text}[/red]\n\nPlease provide new instructions.",
                         )
                     return response
-            finally:
-                buddy_runtime.mark_task_complete()
-            await self._finish_goal_turn(
-                error=self._last_turn_errored,
-                cancelled=self._last_turn_cancelled,
-            )
         finally:
-            reset_goal_context(goal_token)
-            reset_tool_permission_context(perm_token)
-            reset_skill_restriction_scope(skill_token)
+            if self._last_turn_errored:
+                goal_turn.mark_error()
+            if self._last_turn_cancelled:
+                goal_turn.mark_cancelled()
 
         # Check session cost ceiling after each turn
         cost_error = self._check_session_cost_limit()
@@ -796,19 +1093,30 @@ class AgentScheduler:
         """Handle headless stream-json execution and emit NDJSON-friendly events."""
         turn_timeout = get_turn_timeout()
         async with self._turn_lock:
-            async with asyncio.timeout(turn_timeout if turn_timeout > 0 else None):
-                response = await self._handle_stream_json_unlocked(
-                    user_input,
-                    on_event=on_event,
-                    include_partial_messages=include_partial_messages,
+            with skill_invocation_scope():
+                deadline = (
+                    asyncio.get_running_loop().time() + turn_timeout if turn_timeout > 0 else None
                 )
 
+                async def run_turn(prompt: str) -> str:
+                    async with _GoalTurnLifecycle(self):
+                        turn_coro = self._handle_stream_json_unlocked(
+                            prompt,
+                            on_event=on_event,
+                            include_partial_messages=include_partial_messages,
+                        )
+                        if deadline is None:
+                            return await turn_coro
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            turn_coro.close()
+                            raise TimeoutError
+                        return await asyncio.wait_for(turn_coro, timeout=remaining)
+
+                response = await run_turn(user_input)
+
                 async def run_continuation(prompt: str) -> str:
-                    return await self._handle_stream_json_unlocked(
-                        prompt,
-                        on_event=on_event,
-                        include_partial_messages=include_partial_messages,
-                    )
+                    return await run_turn(prompt)
 
                 return await self._run_goal_continuations(response, run_continuation)
 
@@ -820,6 +1128,7 @@ class AgentScheduler:
         include_partial_messages: bool = False,
     ) -> str:
         """Handle a single headless stream-json turn after the turn lock is held."""
+        await self._await_cancelled_stream_settlement()
         await self._ensure_agent_initialized()
         # Best-effort: reconnect any MCP server that dropped since the last turn.
         await self._reconnect_unhealthy_mcp_servers()
@@ -830,32 +1139,47 @@ class AgentScheduler:
         await self._repair_unreplayable_session_items()
 
         history = await self.session.get_items()
-        if not history and self._title_generation_task is None:
+        first_turn = not history and self._title_generation_task is None
+        actual_request = user_input
+        if first_turn:
             actual_request = user_input
             if "User request:" in user_input:
                 actual_request = user_input.split("User request:")[-1].strip()
+
+        initial_estimate = await self._estimate_main_call_preflight(user_input, history_tokens=0)
+        if not initial_estimate.fits:
+            response = str(ContextPreflightError(initial_estimate, subject="Current input"))
+            on_event({"type": "error", "error": response})
+            return response
+
+        try:
+            await self._preflight_main_model_call(user_input)
+        except ContextPreflightError as error:
+            response = str(error)
+            on_event({"type": "error", "error": response})
+            return response
+
+        if first_turn:
             self._title_generation_task = asyncio.create_task(
                 self._generate_title_background(actual_request)
             )
 
-        perm_token = set_tool_permission_context(self.permission_service, approver=self.approver)
-        goal_token = set_goal_context(self.goal_runtime)
-        skill_token = begin_skill_restriction_scope()
-        await self.goal_runtime.on_turn_start(self._goal_cumulative_tokens())
+        skill_scope = ExitStack()
+        result = None
         try:
+            run_hooks = skill_scope.enter_context(skill_run_scope(self.hooks))
             result = Runner.run_streamed(
                 self.dev_agent,
                 user_input,
                 session=self.session,
                 run_config=RunConfig(),
-                hooks=self.hooks,
+                hooks=run_hooks,
                 max_turns=get_max_turns(),
             )
 
             partial_text_chunks: list[str] = []
             tool_names: dict[str, str] = {}
             reasoning_display_mode = self._reasoning_display_mode()
-
             async for event in result.stream_events():
                 if isinstance(event, RawResponsesStreamEvent):
                     reasoning_payload = _reasoning_stream_payload(
@@ -948,28 +1272,29 @@ class AgentScheduler:
                         },
                     }
                     on_event(payload)
-
-            await self._capture_usage(result)
-            await self._finish_goal_turn()
-
-            # Check session cost ceiling after each headless turn
-            cost_error = self._check_session_cost_limit()
-            if cost_error:
-                on_event({"type": "error", "error": cost_error})
-                return cost_error
-
-            final_response = result.final_output
-            if final_response is None:
-                final_response = "".join(partial_text_chunks)
-            else:
-                final_response = str(final_response)
-            filtered_response = self._filter_output(final_response)
-            await self._refresh_magic_docs_after_turn(user_input, filtered_response)
-            return filtered_response
+        except asyncio.CancelledError:
+            if result is not None:
+                self._retain_cancelled_stream_settlement(result)
+            raise
         finally:
-            reset_goal_context(goal_token)
-            reset_tool_permission_context(perm_token)
-            reset_skill_restriction_scope(skill_token)
+            skill_scope.close()
+            if result is not None:
+                await self._capture_available_usage(result)
+
+        # Check session cost ceiling after each headless turn
+        cost_error = self._check_session_cost_limit()
+        if cost_error:
+            on_event({"type": "error", "error": cost_error})
+            return cost_error
+
+        final_response = result.final_output
+        if final_response is None:
+            final_response = "".join(partial_text_chunks)
+        else:
+            final_response = str(final_response)
+        filtered_response = self._filter_output(final_response)
+        await self._refresh_magic_docs_after_turn(user_input, filtered_response)
+        return filtered_response
 
     def _goal_cumulative_tokens(self) -> int:
         """Cumulative billable tokens used as the goal accounting baseline."""
@@ -1067,6 +1392,15 @@ class AgentScheduler:
             ),
             config_getter=self._runtime_config_service.load,
         )
+        refresh_subagent_display = (
+            (lambda: streaming_ui.update_output(live_renderable))
+            if streaming_ui is not None
+            else (lambda: None)
+        )
+
+        def handle_subagent_display_event(event: SubagentDisplayEvent) -> None:
+            if display_manager.handle_subagent_event(event):
+                refresh_subagent_display()
 
         # Add space before streaming starts
         if streaming_ui is None:
@@ -1079,49 +1413,68 @@ class AgentScheduler:
             console.print("[dim red]Agent not initialized[/dim red]")
             return "Agent not initialized"
 
-        result = Runner.run_streamed(
-            self.dev_agent,
-            run_input,  # Just current input - session handles history
-            session=self.session,  # Automatic history management
-            run_config=RunConfig(),
-            hooks=self.hooks,
-            max_turns=get_max_turns(),
-        )
-        reasoning_display_mode = self._reasoning_display_mode()
+        skill_scope = ExitStack()
+        run_hooks = skill_scope.enter_context(skill_run_scope(self.hooks))
+        skill_scope.enter_context(subagent_display_scope(handle_subagent_display_event))
+        try:
+            result = Runner.run_streamed(
+                self.dev_agent,
+                run_input,  # Just current input - session handles history
+                session=self.session,  # Automatic history management
+                run_config=RunConfig(),
+                hooks=run_hooks,
+                max_turns=get_max_turns(),
+            )
+            reasoning_display_mode = self._reasoning_display_mode()
+        except BaseException:
+            skill_scope.close()
+            raise
 
-        # Track cancellation state with token for immediate response
-        cancel_token = CancellationToken()
-        cancelled = False
+        # Reuse the turn-wide cancellation scope established before retrieval
+        # and preflight. Direct unit callers get a local scope as a fallback.
+        cancellation_scope = current_turn_cancellation_scope()
+        local_cancellation_scope = cancellation_scope is None
+        if cancellation_scope is None:
+            cancellation_scope = TurnCancellationScope()
+        cancel_token = cancellation_scope.token
         execution_error = None  # Track errors for handling after Live context exits
 
         async def handle_escape():
             """Callback when ESC key is pressed."""
-            nonlocal cancelled
-            cancelled = True
-            cancel_token.cancel()  # Signal to break out of iterator immediately
-            result.cancel(mode="immediate")  # Also cancel the underlying stream
+            cancellation_scope.cancel()
 
         def handle_escape_sync():
             """Synchronous ESC hook for the prompt_toolkit streaming UI."""
-            nonlocal cancelled
-            cancelled = True
-            cancel_token.cancel()
-            result.cancel(mode="immediate")
+            cancellation_scope.cancel()
+
+        remove_result_cancel = cancellation_scope.add_callback(
+            lambda: result.cancel(mode="immediate")
+        )
 
         # In fixed-bottom mode, register cancellation with the TUI's ESC binding.
         ui_set_cancel = (
             getattr(streaming_ui, "set_cancel_callback", None) if streaming_ui is not None else None
         )
-        if callable(ui_set_cancel):
-            ui_set_cancel(handle_escape_sync)
+        if callable(ui_set_cancel) and local_cancellation_scope:
+            try:
+                ui_set_cancel(handle_escape_sync)
+            except BaseException:
+                try:
+                    remove_result_cancel()
+                finally:
+                    skill_scope.close()
+                raise
 
         async def consume_stream_events(on_update) -> None:
             nonlocal execution_error
             try:
-                async with escape_listener(on_escape=handle_escape, enabled=esc_enabled):
+                async with escape_listener(
+                    on_escape=handle_escape,
+                    enabled=esc_enabled and local_cancellation_scope,
+                ):
                     stream_iter = result.stream_events()
                     async for event in iter_with_cancellation(stream_iter, cancel_token):
-                        if cancelled:
+                        if cancellation_scope.is_cancelled:
                             break
 
                         try:
@@ -1211,28 +1564,46 @@ class AgentScheduler:
                                 on_update()
 
                         except Exception as e:
-                            console.print(f"[dim red]Event processing error: {e}[/dim red]")
+                            logger.debug("Event processing error", exc_info=True)
+                            if streaming_ui is None:
+                                console.print(f"[dim red]Event processing error: {e}[/dim red]")
+                            elif display_manager.handle_notice(f"Event processing error: {e}"):
+                                on_update()
 
             except Exception as e:
                 execution_error = e
 
         try:
-            if streaming_ui is None:
-                # Use Rich Live for proper formatting during streaming.
-                with Live(
-                    live_renderable,
-                    console=console,
-                    refresh_per_second=8,
-                    transient=True,
-                    vertical_overflow="crop",
-                ) as live:
-                    await consume_stream_events(live.refresh)
-            else:
-                await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))
+            try:
+                if streaming_ui is None:
+                    # Use Rich Live for proper formatting during streaming.
+                    with Live(
+                        live_renderable,
+                        console=console,
+                        refresh_per_second=8,
+                        transient=True,
+                        vertical_overflow="crop",
+                    ) as live:
+                        refresh_subagent_display = live.refresh
+                        await consume_stream_events(live.refresh)
+                else:
+                    await consume_stream_events(lambda: streaming_ui.update_output(live_renderable))
+            except asyncio.CancelledError:
+                self._retain_cancelled_stream_settlement(result)
+                await self._capture_available_usage(result)
+                raise
         finally:
-            # Detach the ESC hook so a stale callback can't cancel a later turn.
-            if callable(ui_set_cancel):
-                ui_set_cancel(None)
+            try:
+                # Detach the ESC hook so a stale callback can't cancel a later turn.
+                if callable(ui_set_cancel) and local_cancellation_scope:
+                    ui_set_cancel(None)
+            finally:
+                try:
+                    remove_result_cancel()
+                finally:
+                    skill_scope.close()
+
+        await self._capture_available_usage(result)
 
         # After Rich Live context ends, perform intelligent cleanup
         working_indicator.set_activity(None)
@@ -1276,7 +1647,8 @@ class AgentScheduler:
             return f"{error_msg}\n\nPlease provide new instructions."
 
         # Handle cancellation case
-        if cancelled:
+        if cancellation_scope.is_cancelled:
+            self._retain_cancelled_stream_settlement(result)
             # Record for goal accounting: a user interrupt pauses the active goal.
             self._last_turn_cancelled = True
             # Rich Live with transient=True clears content on exit, so we need to re-print
@@ -1304,9 +1676,6 @@ class AgentScheduler:
                 else:
                     streaming_ui.set_final_text("[yellow]Operation cancelled by user[/yellow]")
 
-            # Capture any usage data we can
-            await self._capture_usage(result)
-
             # Return partial text for session history
             return partial_text or "Operation cancelled. You can provide additional instructions."
 
@@ -1324,9 +1693,6 @@ class AgentScheduler:
                 print()  # Add spacing after
             else:
                 streaming_ui.set_final_content(final_content)
-
-        # Capture token usage from streaming result
-        await self._capture_usage(result)
 
         # Get final text response for context saving
         final_response = display_manager.get_final_text()
@@ -1402,15 +1768,21 @@ class AgentScheduler:
             pass
         return max(1, len(text) // 4)
 
-    def _estimate_static_context_tokens(self) -> int:
-        """Estimate system prompt and tool schema tokens sent with each request."""
-        if self._static_context_tokens_cache is not None:
-            return self._static_context_tokens_cache
-
-        total = 0
+    def _estimate_instruction_context_tokens(self) -> int:
+        """Estimate the agent's fixed system/developer instructions."""
+        if self._instruction_context_tokens_cache is not None:
+            return self._instruction_context_tokens_cache
         instructions = getattr(self.dev_agent, "instructions", None)
+        total = 0
         if isinstance(instructions, str):
-            total += self._encode_token_count(instructions)
+            total = self._encode_token_count(instructions)
+        self._instruction_context_tokens_cache = total
+        return total
+
+    def _estimate_tool_schema_tokens(self) -> int:
+        """Estimate serialized tool definitions sent with each request."""
+        if self._tool_schema_tokens_cache is not None:
+            return self._tool_schema_tokens_cache
 
         tool_payload = []
         tools = getattr(self.dev_agent, "tools", None) or self.tools
@@ -1423,26 +1795,102 @@ class AgentScheduler:
                 }
             )
 
+        total = 0
         if tool_payload:
             try:
-                total += self._encode_token_count(
+                total = self._encode_token_count(
                     json.dumps(tool_payload, ensure_ascii=False, default=str)
                 )
             except Exception:
-                total += self._encode_token_count(str(tool_payload))
+                total = self._encode_token_count(str(tool_payload))
 
+        self._tool_schema_tokens_cache = total
+        return total
+
+    def _estimate_static_context_tokens(self) -> int:
+        """Estimate system prompt and tool schema tokens sent with each request."""
+        if self._static_context_tokens_cache is not None:
+            return self._static_context_tokens_cache
+
+        total = self._estimate_instruction_context_tokens() + self._estimate_tool_schema_tokens()
         self._static_context_tokens_cache = total
         return total
 
+    def _estimate_run_input_tokens(self, run_input: Any) -> int:
+        """Estimate only the current turn input, excluding persisted history."""
+        try:
+            return estimate_message_tokens(
+                {"role": "user", "content": run_input},
+                model=self._context_model_name,
+            )
+        except Exception:
+            return self._encode_token_count(str(run_input))
+
     async def _estimate_session_tokens(self) -> int:
         """Estimate tokens persisted in the conversation session."""
+        session_items = await self.session.get_items()
+        if not session_items:
+            return 0
+        complete_item_estimate = estimate_messages_tokens(
+            [item for item in session_items if isinstance(item, dict)],
+            model=self._context_model_name,
+        )
         try:
-            session_items = await self.session.get_items()
-            if session_items:
-                return int(self.session._estimate_tokens(session_items))
+            session_estimate = self.session._estimate_tokens(session_items)
+            if inspect.isawaitable(session_estimate):
+                session_estimate = await session_estimate
+            return max(
+                complete_item_estimate,
+                int(session_estimate),
+            )
         except Exception:
-            pass
-        return 0
+            return complete_item_estimate
+
+    async def _estimate_main_call_preflight(
+        self,
+        run_input: Any,
+        *,
+        history_tokens: int | None = None,
+    ) -> ContextPreflightEstimate:
+        """Estimate all context components for a main scheduler model call."""
+        if self._auto_compact is not None:
+            context_window = self._auto_compact.context_window
+            response_reserve = self._auto_compact.max_output_tokens
+        else:
+            model_name = self._context_model_name or get_model_name()
+            context_window = get_configured_context_window(model_name)
+            response_reserve = get_maximum_output_tokens(
+                model_name,
+                max_context_size=context_window,
+            )
+
+        if history_tokens is None:
+            history_tokens = await self._estimate_session_tokens()
+
+        return estimate_context_preflight(
+            context_window=context_window,
+            response_reserve=response_reserve,
+            static_tokens=self._estimate_instruction_context_tokens(),
+            tool_tokens=self._estimate_tool_schema_tokens(),
+            history_tokens=history_tokens,
+            input_tokens=self._estimate_run_input_tokens(run_input),
+        )
+
+    async def _preflight_main_model_call(self, run_input: Any) -> ContextPreflightEstimate:
+        """Compact recoverable history pressure once or reject before provider I/O."""
+        estimate = await self._estimate_main_call_preflight(run_input)
+        if estimate.fits:
+            return estimate
+        if not estimate.history_recoverable:
+            raise ContextPreflightError(estimate, subject="Current input")
+        if self._auto_compact is None or self._auto_compact.is_circuit_broken():
+            raise ContextPreflightError(estimate, subject="Request history")
+
+        await self._run_auto_compact()
+        compacted_estimate = await self._estimate_main_call_preflight(run_input)
+        if not compacted_estimate.fits:
+            raise ContextPreflightError(compacted_estimate, subject="Request after compaction")
+        return compacted_estimate
 
     async def refresh_context_usage_from_session(
         self,
@@ -1465,9 +1913,11 @@ class AgentScheduler:
 
     async def _repair_unreplayable_session_items(self) -> None:
         """Drop invalid persisted items that would make the SDK reject the next run."""
-        if not hasattr(self.session, "get_items") or not hasattr(self.session, "clear_session"):
+        if not hasattr(self.session, "get_items"):
             return
-        if not hasattr(self.session, "add_items"):
+        if self._session_replace_items() is None and (
+            not hasattr(self.session, "clear_session") or not hasattr(self.session, "add_items")
+        ):
             return
         try:
             items = await self.session.get_items()
@@ -1476,53 +1926,122 @@ class AgentScheduler:
 
         replayable_items = replayable_session_items(items)
         if len(replayable_items) == len(items):
+            await self._append_interruption_marker_if_needed(replayable_items)
             return
 
-        # Snapshot the original items so we can restore them if the re-add fails:
-        # clear_session() + add_items() are two separate transactions with no
-        # rollback, so a failure between them would otherwise leave history empty.
+        # Snapshot the original items so any failed rewrite can restore exactly
+        # the pre-operation history.
         original_snapshot = list(items)
+        uses_atomic_replace = self._session_replace_items() is not None
         try:
-            await self.session.clear_session()
-            saved_threshold = getattr(self.session, "summarization_threshold", None)
-            if hasattr(self.session, "summarization_threshold"):
-                self.session.summarization_threshold = 2**31
-            try:
-                await self.session.add_items(replayable_items)
-            finally:
-                if hasattr(self.session, "summarization_threshold"):
-                    self.session.summarization_threshold = saved_threshold
+            await self._replace_session_items(replayable_items)
             await self.refresh_context_usage_from_session(replayable_items)
+            await self._append_interruption_marker_if_needed(replayable_items)
         except Exception:
             logger.debug("Failed to repair unreplayable session items", exc_info=True)
-            await self._restore_session_items(original_snapshot)
+            if not uses_atomic_replace:
+                await self._restore_session_items(original_snapshot)
 
-    async def _restore_session_items(self, snapshot: list) -> None:
-        """Best-effort re-add the pre-clear item snapshot after a failed rewrite.
+    def _session_replace_items(self):
+        """Return a real replace capability without inventing one on mocks."""
+        if inspect.getattr_static(self.session, "replace_items", None) is None:
+            return None
+        replace_items = getattr(self.session, "replace_items", None)
+        return replace_items if callable(replace_items) else None
 
-        ``clear_session`` + ``add_items`` are not a single transaction; if the
-        second half fails the conversation would be left empty. This puts the
-        original items back so history is never silently lost.
-        """
-        if not snapshot:
+    @staticmethod
+    def _ends_with_complete_tool_pair(items: list[dict]) -> bool:
+        """Return whether history ends in a complete Responses tool-call/result run."""
+        if not items or items[-1].get("type") != "function_call_output":
+            return False
+
+        start = len(items)
+        for index in range(len(items) - 1, -1, -1):
+            if items[index].get("type") in {"function_call", "function_call_output"}:
+                start = index
+                continue
+            break
+
+        tail = items[start:]
+        calls: set[str] = set()
+        outputs: set[str] = set()
+        for item in tail:
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                return False
+            if item.get("type") == "function_call":
+                if call_id in calls:
+                    return False
+                calls.add(call_id)
+            else:
+                if call_id not in calls or call_id in outputs:
+                    return False
+                outputs.add(call_id)
+        return bool(calls) and calls == outputs
+
+    async def _append_interruption_marker_if_needed(
+        self,
+        items: list[dict] | None = None,
+    ) -> bool:
+        """Close an interrupted tool tail with one synthetic assistant message."""
+        if not hasattr(self.session, "get_items") or not hasattr(self.session, "add_items"):
+            return False
+        if items is None:
+            try:
+                items = [item for item in await self.session.get_items() if isinstance(item, dict)]
+            except Exception:
+                return False
+        if not self._ends_with_complete_tool_pair(items):
+            return False
+
+        marker = {"role": "assistant", "content": SYNTHETIC_INTERRUPTION_MARKER}
+        try:
+            await self.session.add_items([marker])
+            await self.refresh_context_usage_from_session([*items, marker])
+        except Exception:
+            logger.debug("Failed to append synthetic interruption marker", exc_info=True)
+            return False
+        return True
+
+    async def _replace_session_items(self, items: list) -> None:
+        """Replace history, preferring the atomic exact session capability."""
+        replace_items = self._session_replace_items()
+        if replace_items is not None:
+            await replace_items(items)
             return
-        if not hasattr(self.session, "add_items"):
-            return
+
+        if not hasattr(self.session, "clear_session") or not hasattr(self.session, "add_items"):
+            raise RuntimeError("Session does not support exact history replacement")
+
+        await self.session.clear_session()
         saved_threshold = getattr(self.session, "summarization_threshold", None)
         try:
             if hasattr(self.session, "summarization_threshold"):
                 self.session.summarization_threshold = 2**31
-            try:
-                await self.session.add_items(snapshot)
-            finally:
-                if hasattr(self.session, "summarization_threshold"):
-                    self.session.summarization_threshold = saved_threshold
-        except Exception:
-            logger.error(
-                "Failed to restore session items after a failed rewrite; "
-                "conversation history may be incomplete",
+            await self.session.add_items(items)
+        finally:
+            if hasattr(self.session, "summarization_threshold"):
+                self.session.summarization_threshold = saved_threshold
+
+    async def _restore_session_items(self, snapshot: list) -> None:
+        """Restore exactly the pre-rewrite snapshot or raise loudly."""
+        try:
+            # The fallback replacement clears any partially-written compacted
+            # items before restoring, preventing append-style duplication.
+            await self._replace_session_items(snapshot)
+            if not hasattr(self.session, "get_items"):
+                raise RuntimeError("Session cannot verify restored history")
+            restored = await self.session.get_items()
+            if restored != snapshot:
+                raise RuntimeError(
+                    "Session history restoration verification failed: restored items differ"
+                )
+        except Exception as exc:
+            logger.critical(
+                "Failed to restore session items exactly after a failed rewrite",
                 exc_info=True,
             )
+            raise RuntimeError("Failed to restore session history exactly") from exc
 
     @staticmethod
     def _usage_int(obj, *names: str) -> int:
@@ -1550,6 +2069,11 @@ class AgentScheduler:
             self.usage_tracker.save(self.usage_path)
         except Exception:
             logger.debug("Failed to save usage snapshot to %s", self.usage_path, exc_info=True)
+
+    async def _capture_available_usage(self, result: Any) -> None:
+        """Capture partial provider usage without letting caller cancellation skip it."""
+        task = asyncio.create_task(self._capture_usage(result))
+        await _await_owned_task(task)
 
     async def _capture_usage(self, result) -> None:
         """Capture token usage from a Runner result.
@@ -1600,7 +2124,15 @@ class AgentScheduler:
                     output_text = str(final_output)
                     output_tokens = self._encode_token_count(output_text)
 
-            session_tokens = await self._estimate_session_tokens()
+            try:
+                session_tokens = await self._estimate_session_tokens()
+            except Exception:
+                # Usage capture is observational and must not discard otherwise
+                # usable API/output accounting when session storage is
+                # temporarily unavailable. Main-call preflight remains fail
+                # closed and does not use this fallback.
+                logger.debug("Failed to estimate session tokens for usage capture", exc_info=True)
+                session_tokens = 0
             static_tokens = self._estimate_static_context_tokens()
             estimated_context_tokens = static_tokens + session_tokens
 
@@ -1663,20 +2195,19 @@ class AgentScheduler:
                 pass
         return default
 
-    @staticmethod
-    def _active_todo_preserved_message() -> dict | None:
+    def _active_todo_preserved_message(self) -> dict | None:
         """Formatted active todo list as a replayable message, or None.
 
-        The plan lives in the process-global ``TodoStore`` singleton (not in
+        The plan lives in this scheduler's in-memory runtime store (not in
         session history), so a compaction that rewrites the transcript would
         otherwise leave the model without its plan. Pinning the formatted list
         as a plain ``{"role", "content"}`` message keeps it replayable and
         visible after compaction. Best effort: any failure yields None.
         """
         try:
-            from ..tools.todo import TodoStore, _format_todo_list
+            from ..tools.todo import _format_todo_list
 
-            todos = list(TodoStore().todos or [])
+            todos = self.todo_store.todos
             if not todos:
                 return None
             formatted = _format_todo_list(todos, title="Active Plan (pinned across compaction)")
@@ -1720,17 +2251,7 @@ class AgentScheduler:
             result = await llm_compact_messages(messages, keep_recent=keep_recent)
 
             original_dict_items = [item for item in items if isinstance(item, dict)]
-            compacted_items = (
-                [
-                    {
-                        "role": "user",
-                        "content": f"[Conversation compacted]\n\n{result.summary}",
-                    },
-                    *result.kept_messages,
-                ]
-                if result.summary
-                else result.kept_messages
-            )
+            compacted_items = build_compacted_session_items(result)
             # No-op detection MUST run against the pre-todo compacted items so
             # pinning the todo list never turns a legitimate no-op into a false
             # "did something" path (which would wrongly trip the circuit breaker
@@ -1744,39 +2265,30 @@ class AgentScheduler:
                 # so it reads as part of the preserved context, not the tail.
                 todo_message = self._active_todo_preserved_message()
                 if todo_message is not None:
-                    insert_at = 1 if result.summary else 0
+                    instruction_count = sum(
+                        item.get("role") in {"system", "developer"} for item in result.kept_messages
+                    )
+                    insert_at = instruction_count + (1 if result.summary else 0)
                     compacted_items = (
                         compacted_items[:insert_at] + [todo_message] + compacted_items[insert_at:]
                     )
 
-                # Replace session contents with compacted version.
-                # NOTE: the session no longer performs any summarization in
-                # add_items (the scheduler owns compaction now), so toggling
-                # summarization_threshold is a harmless no-op. It is retained
-                # only for backwards compatibility with any callers/tests that
-                # still reference the attribute.
-                #
-                # Snapshot the original items first: clear_session() + add_items()
-                # are two separate transactions with no rollback, so if the re-add
-                # fails we must put the original conversation back rather than
-                # leave history empty.
+                # Keep the original snapshot for post-compact file restoration;
+                # the history rewrite itself is one transaction in the session
+                # layer and rolls back on failure or cancellation.
                 original_snapshot = list(items)
-                await self.session.clear_session()
-                saved_threshold = self.session.summarization_threshold
-                self.session.summarization_threshold = 2**31
+                uses_atomic_replace = self._session_replace_items() is not None
                 try:
-                    await self.session.add_items(compacted_items)
+                    await self._replace_session_items(compacted_items)
                 except Exception:
                     logger.warning(
-                        "Auto-compact add_items failed; restoring original session items",
+                        "Auto-compact session replacement failed",
                         exc_info=True,
                     )
-                    self.session.summarization_threshold = saved_threshold
-                    await self._restore_session_items(original_snapshot)
+                    if not uses_atomic_replace:
+                        await self._restore_session_items(original_snapshot)
                     self._auto_compact.record_failure()
                     return
-                finally:
-                    self.session.summarization_threshold = saved_threshold
 
                 # Restore recently-accessed files so edits/reads survive the
                 # compaction. Files are collected from the ORIGINAL items (which
@@ -1919,55 +2431,101 @@ class AgentScheduler:
             logger.warning("Session memory extraction failed: %s", e)
 
     async def cleanup(self):
-        """Clean up resources, including MCP servers."""
+        """Clean every scheduler-owned resource exactly once despite cancellation."""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_resources())
+        await _await_owned_task(self._cleanup_task)
+
+    def prepare_uncommitted_cleanup(self) -> None:
+        """Mark an aborted replacement as owning no pre-existing shells."""
+        if self._background_shell_cleanup_ids is None:
+            self._background_shell_cleanup_ids = frozenset()
+
+    def prepare_retirement(self) -> None:
+        """Freeze shell ownership before a replacement scheduler admits work.
+
+        The manager is process-global for lookup, but each model-launched shell
+        carries the Todo runtime identity inherited by SDK child tasks. Snapshot
+        only this scheduler's IDs so concurrent in-process agents keep ownership
+        of their own processes.
+        """
+        if self._background_shell_cleanup_ids is None:
+            try:
+                shell_ids = BackgroundShellManager.get_owned_ids(self.todo_store.identity)
+            except BaseException:
+                # Failing closed can leak an old shell, but cannot select a
+                # foreign agent or future session shell for termination.
+                logger.warning("Failed to snapshot scheduler background shells", exc_info=True)
+                shell_ids = []
+            self._background_shell_cleanup_ids = frozenset(shell_ids)
+
+    async def _cleanup_resources(self) -> None:
         try:
             self._save_usage_snapshot()
+        except BaseException:
+            logger.debug("Usage snapshot cleanup failed", exc_info=True)
 
+        await self._cleanup_guard(
+            "cancelled stream settlement",
+            self._await_cancelled_stream_settlement,
+        )
+        await self._cleanup_guard("title generation task", self._stop_title_generation)
+        await self._cleanup_guard("MCP agent reset", self.reset_agent)
+        await self._cleanup_guard("background shells", self._stop_background_shells)
+        await self._cleanup_guard("goal store", self.goal_store.close)
+        await self._cleanup_guard("session", self._close_session)
+
+    async def _cleanup_guard(self, label: str, action) -> None:
+        try:
+            result = action()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            logger.debug("Scheduler %s cleanup failed", label, exc_info=True)
+
+    async def _stop_title_generation(self) -> None:
+        task = self._title_generation_task
+        self._title_generation_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _stop_background_shells(self) -> None:
+        if self._background_shell_cleanup_ids is None:
+            self.prepare_retirement()
+        for shell_id in self._background_shell_cleanup_ids:
             try:
-                await self.goal_store.close()
-            except Exception:
-                logger.debug("Goal store cleanup failed", exc_info=True)
+                await BackgroundShellManager.terminate(shell_id)
+            except ValueError:
+                # Another owner/user may already have explicitly terminated it.
+                continue
+            except BaseException:
+                logger.debug("Background shell cleanup failed: %s", shell_id, exc_info=True)
 
-            # Cancel pending title generation task
-            if self._title_generation_task and not self._title_generation_task.done():
-                self._title_generation_task.cancel()
-                self._title_generation_task = None
-
-            await self.reset_agent()
-
-            # Clean up background shells
-            for shell_id in list(BackgroundShellManager.get_available_ids()):
-                try:
-                    await BackgroundShellManager.terminate(shell_id)
-                except Exception:
-                    pass  # Best effort cleanup
-
-        except Exception as e:
-            console.print(f"[dim red]Unexpected error during scheduler cleanup: {e}[/dim red]")
+    async def _close_session(self) -> None:
+        close = getattr(self.session, "close", None)
+        if not callable(close):
+            return
+        if inspect.iscoroutinefunction(close):
+            await close()
+        else:
+            await _run_sync_and_join(close)
 
     async def reset_agent(self):
         """Dispose the current agent so config changes apply on the next prompt."""
+        owned_servers = self._mcp_servers
+        dev_agent = self.dev_agent
+        self._mcp_servers = []
+        self.dev_agent = None
+        self._agent_initialized = False
         try:
-            if self._mcp_servers:
-                for server in self._mcp_servers:
-                    try:
-                        if hasattr(server, "cleanup"):
-                            try:
-                                await asyncio.wait_for(server.cleanup(), timeout=3.0)
-                            except asyncio.TimeoutError:
-                                console.print(
-                                    f"[dim red]MCP server {getattr(server, 'name', 'unknown')} cleanup timed out[/dim red]"
-                                )
-                            except Exception as cleanup_error:
-                                console.print(
-                                    f"[dim red]Error cleaning up MCP server {getattr(server, 'name', 'unknown')}: {cleanup_error}[/dim red]"
-                                )
-                    except Exception as exc:
-                        console.print(
-                            f"[dim red]Error accessing MCP server for cleanup: {exc}[/dim red]"
-                        )
-                self._mcp_servers.clear()
-            self.dev_agent = None
-            self._agent_initialized = False
+            from koder_agent.mcp import close_mcp_servers, detach_mcp_server_owner
+
+            agent_owner = detach_mcp_server_owner(dev_agent)
+            await close_mcp_servers(owned_servers)
+            if agent_owner is not owned_servers:
+                await close_mcp_servers(agent_owner)
         except Exception as exc:
             console.print(f"[dim red]Unexpected error while resetting agent: {exc}[/dim red]")

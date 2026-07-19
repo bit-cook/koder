@@ -1,10 +1,14 @@
 """Agent definitions and hooks for Koder."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import uuid
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +17,18 @@ import litellm
 from agents import Agent, ModelSettings
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.items import ItemHelpers, ModelResponse, TResponseStreamEvent
-from agents.models.openai_responses import Converter as ResponsesConverter
+from agents.models._openai_shared import get_default_openai_client
+from agents.models.openai_chatcompletions import Converter as ChatCompletionsConverter
+from agents.models.openai_responses import (
+    Converter as ResponsesConverter,
+)
+from agents.models.openai_responses import (
+    OpenAIResponsesModel,
+)
 from agents.tracing import generation_span
 from agents.usage import Usage
 from agents.util._json import _to_dump_compatible
-from openai import omit
+from openai import AsyncOpenAI, omit
 from openai._models import construct_type
 from openai.types.shared import Reasoning
 from rich.console import Console
@@ -25,13 +36,15 @@ from rich.console import Console
 from ..auth.tool_utils import clean_json_schema
 from ..config import get_config
 from ..harness.agents.definitions import get_agent_definitions
+from ..harness.memory.budget import ContextPreflightError, estimate_model_request_preflight
 from ..harness.output_styles import load_active_output_style_body
 from ..harness.reasoning_display import normalize_reasoning_display_mode
-from ..mcp import MCPServerFactory, load_mcp_servers
+from ..mcp import MCPServerSet, close_mcp_servers, load_mcp_servers
 from ..tools.skill import build_skills_metadata_prompt, discover_merged_skills
 from ..utils.client import (
     GITHUB_COPILOT_HEADERS,
     LITELLM_RETRYABLE_ERRORS,
+    get_configured_context_window,
     get_model_client_snapshot,
 )
 from ..utils.model_info import get_maximum_output_tokens, should_use_reasoning_param
@@ -39,6 +52,67 @@ from ..utils.prompts import KODER_SYSTEM_PROMPT
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+_MCP_PUBLIC_TOOL_NAME_MAX_LENGTH = 64
+_MCP_PUBLIC_TOOL_HASH_LENGTH = 8
+_MCP_PUBLIC_TOOL_DISAMBIGUATION_HASH_LENGTH = 40
+
+
+@dataclass(frozen=True)
+class _MCPToolNameRecord:
+    key: tuple[int, int]
+    identity: tuple[str, str, str]
+    base_name: str
+    seed: str
+    initial_name: str
+
+
+def _present_request_value(value: Any) -> Any:
+    """Normalize SDK omission sentinels before request-budget estimation."""
+    return None if value is omit else value
+
+
+class PreflightOpenAIResponsesModel(OpenAIResponsesModel):
+    """Native Responses model with an exact, per-provider-call budget gate.
+
+    Hooking the SDK request builder keeps native auth, tracing, streaming,
+    request IDs, and response parsing intact. The returned kwargs are the same
+    object the SDK passes to ``client.responses.create`` immediately afterward.
+    """
+
+    def __init__(self, *args, context_window: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.context_window = max(1, int(context_window))
+
+    def _build_response_create_kwargs(self, *args, **kwargs) -> dict[str, Any]:
+        create_kwargs = super()._build_response_create_kwargs(*args, **kwargs)
+        reserve = _present_request_value(create_kwargs.get("max_output_tokens"))
+        if reserve is None:
+            reserve = get_maximum_output_tokens(
+                str(self.model),
+                max_context_size=self.context_window,
+            )
+
+        # Prompt references and provider extension bodies can contribute
+        # request-side context beyond the four primary Responses fields.
+        extra_payload = {
+            key: _present_request_value(create_kwargs.get(key))
+            for key in ("prompt", "extra_body", "context_management")
+            if _present_request_value(create_kwargs.get(key)) is not None
+        }
+        estimate = estimate_model_request_preflight(
+            context_window=self.context_window,
+            response_reserve=int(reserve),
+            instructions=_present_request_value(create_kwargs.get("instructions")),
+            input_items=_present_request_value(create_kwargs.get("input")),
+            tools=_present_request_value(create_kwargs.get("tools")),
+            response_format=_present_request_value(create_kwargs.get("text")),
+            extra_payload=extra_payload,
+            model=str(self.model),
+        )
+        if not estimate.fits:
+            raise ContextPreflightError(estimate, subject="Provider request")
+        return create_kwargs
 
 
 def _safe_mcp_name_part(value: str) -> str:
@@ -49,10 +123,186 @@ def _safe_mcp_name_part(value: str) -> str:
 
 def prefixed_mcp_tool_name(server_name: str, tool_name: str) -> str:
     """Return the ``mcp__<server>__<tool>`` public name for an MCP tool."""
-    return f"mcp__{_safe_mcp_name_part(server_name)}__{_safe_mcp_name_part(tool_name)}"
+    base_name = f"mcp__{_safe_mcp_name_part(server_name)}__{_safe_mcp_name_part(tool_name)}"
+    return _shorten_mcp_tool_name(base_name, f"{server_name}\0{tool_name}")
 
 
-async def _build_prefixed_mcp_tools(mcp_servers, guardrails):
+def _shorten_mcp_tool_name(
+    base_name: str,
+    seed: str,
+    *,
+    force_hash: bool = False,
+    hash_length: int = _MCP_PUBLIC_TOOL_HASH_LENGTH,
+) -> str:
+    if not force_hash and len(base_name) <= _MCP_PUBLIC_TOOL_NAME_MAX_LENGTH:
+        return base_name
+
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:hash_length]
+    return _mcp_tool_name_with_suffix(base_name, digest)
+
+
+def _mcp_tool_name_with_suffix(base_name: str, suffix_value: str) -> str:
+    suffix = f"_{suffix_value}"
+    stem_length = _MCP_PUBLIC_TOOL_NAME_MAX_LENGTH - len(suffix)
+    if stem_length < 1:
+        raise RuntimeError("MCP tool-name limit cannot represent a unique hashed name")
+    stem = base_name[:stem_length].rstrip("_") or "mcp"
+    return f"{stem}{suffix}"
+
+
+def _canonical_mcp_tool_metadata(tool: Any) -> str:
+    """Serialize stable MCP metadata/schema used to distinguish duplicate names."""
+    model_dump = getattr(tool, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="json", by_alias=True, exclude_none=False)
+        except TypeError:
+            payload = model_dump(by_alias=True, exclude_none=False)
+    else:
+        fields = (
+            "title",
+            "description",
+            "inputSchema",
+            "outputSchema",
+            "icons",
+            "annotations",
+            "meta",
+            "execution",
+        )
+        payload = {field: getattr(tool, field) for field in fields if hasattr(tool, field)}
+
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.pop("name", None)
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _mcp_tool_identity(server_name: str, tool: Any) -> tuple[str, str, str]:
+    return (server_name, tool.name, _canonical_mcp_tool_metadata(tool))
+
+
+def _deduplicate_mcp_tool_entries(entries):
+    """Deterministically keep one copy of truly identical public tool identities."""
+    unique_entries = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        identity = _mcp_tool_identity(entry[2], entry[3])
+        if identity in seen:
+            logger.warning(
+                "Duplicate identical MCP tool skipped: server=%s tool=%s",
+                entry[2],
+                entry[3].name,
+            )
+            continue
+        seen.add(identity)
+        unique_entries.append(entry)
+    return unique_entries
+
+
+def _allocate_mcp_tool_names(entries, reserved_names: set[str]) -> dict[tuple[int, int], str]:
+    """Allocate deterministic, provider-safe names for a complete MCP tool batch.
+
+    Allocation is intentionally set-based: every identity is known before any
+    public name is claimed. If multiple identities have the same preferred name
+    (including a collision in the short truncation hash), every member receives
+    a full identity digest. No encounter-order winner keeps the preferred name.
+    """
+    name_counts = Counter((server_name, tool.name) for _, _, server_name, tool in entries)
+    records: list[_MCPToolNameRecord] = []
+    seen_identities: set[tuple[str, str, str]] = set()
+
+    for server_index, tool_index, server_name, tool in sorted(
+        entries,
+        key=lambda entry: (_mcp_tool_identity(entry[2], entry[3]), entry[0], entry[1]),
+    ):
+        identity = _mcp_tool_identity(server_name, tool)
+        if identity in seen_identities:
+            raise ValueError(
+                f"Duplicate identical MCP tool identity: server={server_name} tool={tool.name}"
+            )
+        seen_identities.add(identity)
+        identity_seed = f"{server_name}\0{tool.name}"
+        seed = identity_seed
+        if name_counts[(server_name, tool.name)] > 1:
+            seed = f"{seed}\0metadata:{identity[2]}"
+        base_name = f"mcp__{_safe_mcp_name_part(server_name)}__{_safe_mcp_name_part(tool.name)}"
+        records.append(
+            _MCPToolNameRecord(
+                key=(server_index, tool_index),
+                identity=identity,
+                base_name=base_name,
+                seed=seed,
+                initial_name=_shorten_mcp_tool_name(base_name, identity_seed),
+            )
+        )
+
+    allocated: dict[tuple[int, int], str] = {}
+    used = set(reserved_names)
+    initial_groups: dict[str, list[_MCPToolNameRecord]] = defaultdict(list)
+    for record in records:
+        initial_groups[record.initial_name].append(record)
+
+    pending: list[_MCPToolNameRecord] = []
+    for initial_name in sorted(initial_groups):
+        group = initial_groups[initial_name]
+        if len(group) == 1 and initial_name not in reserved_names:
+            allocated[group[0].key] = initial_name
+            used.add(initial_name)
+        else:
+            # Promote the whole collision group. Choosing one preferred-name
+            # winner here would make allocation depend on list-tools order.
+            pending.extend(group)
+
+    primary_groups: dict[str, list[_MCPToolNameRecord]] = defaultdict(list)
+    for record in pending:
+        candidate = _shorten_mcp_tool_name(
+            record.base_name,
+            record.seed,
+            force_hash=True,
+            hash_length=_MCP_PUBLIC_TOOL_DISAMBIGUATION_HASH_LENGTH,
+        )
+        primary_groups[candidate].append(record)
+
+    unresolved: list[_MCPToolNameRecord] = []
+    for candidate in sorted(primary_groups):
+        group = primary_groups[candidate]
+        if len(group) == 1 and candidate not in used:
+            allocated[group[0].key] = candidate
+            used.add(candidate)
+        else:
+            unresolved.extend(group)
+
+    # A monkeypatched/broken SHA-1 implementation can make even full digests
+    # identical. Resolve that finite set with independent SHA-256 material plus
+    # a stable identity rank. The bounded probe only skips pre-reserved names;
+    # it cannot become an unbounded salted retry loop.
+    unresolved.sort(key=lambda record: record.identity)
+    population = max(1, len(unresolved))
+    for rank, record in enumerate(unresolved):
+        secondary = hashlib.sha256(record.seed.encode("utf-8")).hexdigest()[:12]
+        for probe in range(len(used) + 1):
+            discriminator = rank + (probe * population)
+            candidate = _mcp_tool_name_with_suffix(
+                record.base_name,
+                f"{secondary}_{discriminator:08x}",
+            )
+            if candidate not in used:
+                allocated[record.key] = candidate
+                used.add(candidate)
+                break
+        else:  # pragma: no cover - pigeonhole bound makes this unreachable
+            raise RuntimeError("Unable to allocate a unique MCP tool name")
+
+    return allocated
+
+
+async def _build_prefixed_mcp_tools(mcp_servers, guardrails, reserved_names=None):
     """Wrap MCP tools as Koder-named FunctionTools with guardrails applied."""
     from agents import FunctionTool
     from agents.mcp.util import MCPUtil
@@ -63,39 +313,39 @@ async def _build_prefixed_mcp_tools(mcp_servers, guardrails):
     results = await asyncio.gather(
         *[server.list_tools() for server in mcp_servers], return_exceptions=True
     )
-    built: list[Any] = []
-    seen: set[str] = set()
-    for server, result in zip(mcp_servers, results):
+    entries = []
+    for server_index, (server, result) in enumerate(zip(mcp_servers, results)):
         server_name = getattr(server, "name", "unknown")
         if isinstance(result, BaseException):
             logger.warning("MCP server '%s' failed to list tools: %s", server_name, result)
             continue
-        for mcp_tool in result:
-            public_name = prefixed_mcp_tool_name(server_name, mcp_tool.name)
-            # De-dupe identical public names within one build (defensive; the
-            # server+tool namespacing already makes cross-server collisions rare).
-            if public_name in seen:
-                logger.warning("Duplicate MCP tool name skipped: %s", public_name)
-                continue
-            seen.add(public_name)
-            try:
-                fn_tool = MCPUtil.to_function_tool(
-                    mcp_tool,
-                    server,
-                    convert_schemas_to_strict=False,
-                    tool_name_override=public_name,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to build MCP tool %s from server %s: %s",
-                    mcp_tool.name,
-                    server_name,
-                    exc,
-                )
-                continue
-            if isinstance(fn_tool, FunctionTool):
-                fn_tool.tool_input_guardrails = list(guardrails)
-            built.append(fn_tool)
+        for tool_index, mcp_tool in enumerate(result):
+            entries.append((server_index, tool_index, server_name, mcp_tool))
+
+    entries = _deduplicate_mcp_tool_entries(entries)
+    public_names = _allocate_mcp_tool_names(entries, set(reserved_names or set()))
+    built: list[Any] = []
+    for server_index, tool_index, server_name, mcp_tool in entries:
+        server = mcp_servers[server_index]
+        public_name = public_names[(server_index, tool_index)]
+        try:
+            fn_tool = MCPUtil.to_function_tool(
+                mcp_tool,
+                server,
+                convert_schemas_to_strict=False,
+                tool_name_override=public_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to build MCP tool %s from server %s: %s",
+                mcp_tool.name,
+                server_name,
+                exc,
+            )
+            continue
+        if isinstance(fn_tool, FunctionTool):
+            fn_tool.tool_input_guardrails = list(guardrails)
+        built.append(fn_tool)
     return built
 
 
@@ -148,6 +398,114 @@ def _log_api_error_on_retry(details):
 
 class RetryingLitellmModel(LitellmModel):
     """LitellmModel with backoff retry logic."""
+
+    def __init__(self, *args, context_window: int | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.context_window = (
+            get_configured_context_window(str(self.model), use_main_override=False)
+            if context_window is None
+            else context_window
+        )
+
+    def _effective_context_window(self) -> int:
+        configured = getattr(self, "context_window", None)
+        if configured is not None:
+            return int(configured)
+        return get_configured_context_window(str(self.model), use_main_override=False)
+
+    def _effective_output_cap(self, model_settings: ModelSettings) -> int:
+        context_window = self._effective_context_window()
+        configured = getattr(model_settings, "max_tokens", None)
+        if configured is not None:
+            return max(0, int(configured))
+        return get_maximum_output_tokens(
+            str(self.model),
+            max_context_size=context_window,
+        )
+
+    def _converted_chat_request(
+        self,
+        system_instructions: str | None,
+        input: str | list,
+        model_settings: ModelSettings,
+        tools: list,
+        handoffs: list,
+    ) -> tuple[list, list]:
+        preserve_thinking_blocks = bool(
+            getattr(model_settings, "reasoning", None) is not None
+            and getattr(getattr(model_settings, "reasoning", None), "effort", None) is not None
+        )
+        converted_messages = ChatCompletionsConverter.items_to_messages(
+            input,
+            base_url=getattr(self, "base_url", None),
+            preserve_thinking_blocks=preserve_thinking_blocks,
+            preserve_tool_output_all_content=True,
+            model=self.model,
+            should_replay_reasoning_content=getattr(
+                self,
+                "should_replay_reasoning_content",
+                None,
+            ),
+        )
+        if any(name in str(self.model).lower() for name in ["anthropic", "claude", "gemini"]):
+            converted_messages = self._fix_tool_message_ordering(converted_messages)
+        if "gemini" in str(self.model).lower():
+            converted_messages = self._convert_gemini_extra_content_to_provider_specific_fields(
+                converted_messages
+            )
+        if system_instructions:
+            converted_messages.insert(0, {"content": system_instructions, "role": "system"})
+        converted_tools = (
+            [ChatCompletionsConverter.tool_to_openai(tool) for tool in tools] if tools else []
+        )
+        converted_tools.extend(
+            ChatCompletionsConverter.convert_handoff_tool(handoff) for handoff in handoffs
+        )
+        return _to_dump_compatible(converted_messages), _to_dump_compatible(converted_tools)
+
+    @staticmethod
+    def _converted_responses_request(
+        input: str | list, tools: list, handoffs: list
+    ) -> tuple[list, list]:
+        list_input = _to_dump_compatible(ItemHelpers.input_to_new_input_list(input))
+        converted_tools = ResponsesConverter.convert_tools(tools, handoffs)
+        return list_input, _to_dump_compatible(converted_tools.tools)
+
+    def _preflight_request(
+        self,
+        system_instructions: str | None,
+        input: str | list,
+        model_settings: ModelSettings,
+        tools: list,
+        output_schema,
+        handoffs: list,
+    ) -> None:
+        """Reject each actual provider request before any provider I/O."""
+        if self._should_use_responses_api():
+            input_items, converted_tools = self._converted_responses_request(input, tools, handoffs)
+            instructions = system_instructions
+            response_format = ResponsesConverter.get_response_format(output_schema)
+        else:
+            input_items, converted_tools = self._converted_chat_request(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                handoffs,
+            )
+            instructions = None  # Included in converted chat messages above.
+            response_format = ChatCompletionsConverter.convert_response_format(output_schema)
+        estimate = estimate_model_request_preflight(
+            context_window=self._effective_context_window(),
+            response_reserve=self._effective_output_cap(model_settings),
+            instructions=instructions,
+            input_items=input_items,
+            tools=converted_tools,
+            response_format=_present_request_value(response_format),
+            model=str(self.model),
+        )
+        if not estimate.fits:
+            raise ContextPreflightError(estimate, subject="Provider request")
 
     def _is_github_copilot(self) -> bool:
         """Check if the current model is using GitHub Copilot."""
@@ -205,8 +563,11 @@ class RetryingLitellmModel(LitellmModel):
                 "GitHub Copilot Codex models require LiteLLM Responses API support. "
                 "Please upgrade litellm to a version that provides `aresponses`."
             )
-        list_input = ItemHelpers.input_to_new_input_list(input)
-        list_input = _to_dump_compatible(list_input)
+        list_input, converted_tools_payload = self._converted_responses_request(
+            input,
+            tools,
+            handoffs,
+        )
 
         if model_settings.parallel_tool_calls and tools:
             parallel_tool_calls: bool | None = True
@@ -220,7 +581,7 @@ class RetryingLitellmModel(LitellmModel):
             tool_choice = None
 
         converted_tools = ResponsesConverter.convert_tools(tools, handoffs)
-        tools_payload = _to_dump_compatible(converted_tools.tools)
+        tools_payload = converted_tools_payload
         if not tools_payload:
             tools_payload = None
 
@@ -263,6 +624,7 @@ class RetryingLitellmModel(LitellmModel):
             "metadata": model_settings.metadata,
             "previous_response_id": previous_response_id,
             "prompt": prompt,
+            "text": text_param,
             "stream": stream,
             "extra_headers": self._merge_headers(model_settings),
             "extra_query": model_settings.extra_query,
@@ -298,6 +660,14 @@ class RetryingLitellmModel(LitellmModel):
     ) -> ModelResponse:
         # Clean tools for GitHub Copilot compatibility
         cleaned_tools = self._clean_tools_for_github_copilot(tools)
+        self._preflight_request(
+            system_instructions,
+            input,
+            model_settings,
+            cleaned_tools,
+            output_schema,
+            handoffs,
+        )
 
         if not self._should_use_responses_api():
             return await super().get_response(
@@ -465,6 +835,14 @@ class RetryingLitellmModel(LitellmModel):
         """
         # Clean tools for GitHub Copilot compatibility
         cleaned_tools = self._clean_tools_for_github_copilot(tools)
+        self._preflight_request(
+            system_instructions,
+            input,
+            model_settings,
+            cleaned_tools,
+            output_schema,
+            handoffs,
+        )
 
         max_tries = 5
         attempt = 0
@@ -590,20 +968,38 @@ async def create_dev_agent(
     instructions_append: str | None = None,
     model_override: str | None = None,
     extra_mcp_server_configs=None,
+    _mcp_servers: MCPServerSet | None = None,
 ) -> Agent:
     """Create the main development agent or an overridden subagent with MCP servers."""
+    if _mcp_servers is None:
+        if os.environ.get("KODER_SIMPLE") == "1":
+            owner = MCPServerSet()
+        else:
+            owner = (
+                await load_mcp_servers(extra_configs=extra_mcp_server_configs)
+                if extra_mcp_server_configs
+                else await load_mcp_servers()
+            )
+        try:
+            return await create_dev_agent(
+                tools,
+                name=name,
+                instructions_override=instructions_override,
+                instructions_append=instructions_append,
+                model_override=model_override,
+                _mcp_servers=owner,
+            )
+        except BaseException:
+            try:
+                await close_mcp_servers(owner, propagate_cancellation=False)
+            except BaseException:
+                logger.debug(
+                    "Failed to close MCP owner after agent construction failed", exc_info=True
+                )
+            raise
+
     config = get_config()
-    if os.environ.get("KODER_SIMPLE") == "1":
-        mcp_servers = []
-    else:
-        mcp_servers = await load_mcp_servers()
-    if extra_mcp_server_configs:
-        if MCPServerFactory is None:
-            raise RuntimeError("MCP transport dependencies are unavailable")
-        mcp_servers = [
-            *mcp_servers,
-            *await MCPServerFactory.create_servers_from_configs(extra_mcp_server_configs),
-        ]
+    mcp_servers = _mcp_servers
 
     # Populate ToolSearch deferred tools registry with all available tools.
     # KODER_ENABLE_TOOL_SEARCH controls deferred loading behaviour:
@@ -632,7 +1028,11 @@ async def create_dev_agent(
         skill_restriction_guardrail,
         hook_pretool_input_guardrail,
     ]
-    mcp_tools = await _build_prefixed_mcp_tools(mcp_servers, mcp_guardrails)
+    mcp_tools = await _build_prefixed_mcp_tools(
+        mcp_servers,
+        mcp_guardrails,
+        reserved_names={getattr(tool, "name", "") for tool in tools},
+    )
 
     tools = [*tools, *mcp_tools]
 
@@ -642,12 +1042,34 @@ async def create_dev_agent(
     model_override_value = None if model_override in (None, "", "inherit") else str(model_override)
     model_client = get_model_client_snapshot(model_override_value)
     effective_model_name = model_client["model_name"]
+    context_window = model_client.get("context_window") or get_configured_context_window(
+        effective_model_name
+    )
+    max_output_tokens = model_client.get("max_output_tokens") or get_maximum_output_tokens(
+        effective_model_name,
+        max_context_size=context_window,
+    )
 
-    # Determine the model to use: native OpenAI string or LitellmModel instance.
+    # Every tool-capable path receives an explicit model object so no Runner
+    # request can bypass the per-provider-call preflight boundary.
     resolved_extra_headers = None
     if model_client["native_openai"]:
-        # Use string model name for native OpenAI providers (handled by default client)
-        model = effective_model_name
+        # Normal harness startup configures this shared client, preserving the
+        # exact native auth/base URL/transport settings previously used by a
+        # plain model string. The fallback also supports direct agent creation
+        # in tests and library callers that skip setup_openai_client().
+        native_client = get_default_openai_client()
+        if native_client is None:
+            native_client = AsyncOpenAI(
+                api_key=model_client.get("api_key") or "sk-koder-unconfigured",
+                base_url=model_client.get("base_url"),
+                max_retries=3,
+            )
+        model = PreflightOpenAIResponsesModel(
+            model=effective_model_name,
+            openai_client=native_client,
+            context_window=context_window,
+        )
     else:
         # Use LitellmModel with explicit base_url and api_key
         litellm_kwargs = model_client["litellm_kwargs"]
@@ -656,13 +1078,14 @@ async def create_dev_agent(
             model=litellm_kwargs["model"],
             base_url=litellm_kwargs["base_url"],
             api_key=litellm_kwargs["api_key"],
+            context_window=context_window,
         )
 
     # Build model_settings with reasoning if configured
     model_name_str = effective_model_name
     model_settings = ModelSettings(
         metadata={"source": "koder"},
-        max_tokens=get_maximum_output_tokens(model_name_str),
+        max_tokens=max_output_tokens,
         include_usage=True,
     )
     reasoning_display = normalize_reasoning_display_mode(

@@ -10,14 +10,20 @@ import re
 import subprocess
 import threading
 import urllib.request
-from contextlib import contextmanager
-from contextvars import ContextVar
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from koder_agent.harness.managed_settings import load_managed_settings, managed_settings_path
 from koder_agent.harness.paths import harness_home_dir, settings_path
+from koder_agent.harness.permissions.tool_arguments import (
+    ToolArgumentError,
+    extract_canonical_tool_target,
+    normalize_tool_arguments,
+)
 from koder_agent.harness.session_env import (
     apply_session_env_file_to_process,
     session_env_file,
@@ -234,6 +240,9 @@ class HookScope:
     file_path: Path
     hooks: dict[str, Any]
     skill_root: Path | None = None
+    settings_data: dict[str, Any] | None = None
+    disable_all_hooks: bool = False
+    plugin_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -260,9 +269,30 @@ class HookDispatchResult:
     retry: bool = False
 
 
-_active_skill_hook_scopes: ContextVar[list[HookScope]] = ContextVar(
+@dataclass
+class _DynamicSkillHookRegistry:
+    """Task-shared skill hook scopes for one logical scheduler turn."""
+
+    scopes: list[HookScope] = dataclass_field(default_factory=list)
+    keys: set[tuple[str, str]] = dataclass_field(default_factory=set)
+    lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
+
+    def add(self, skill_name: str, scope: HookScope) -> None:
+        key = (skill_name, str(scope.file_path))
+        with self.lock:
+            if key in self.keys:
+                return
+            self.keys.add(key)
+            self.scopes.append(scope)
+
+    def snapshot(self) -> list[HookScope]:
+        with self.lock:
+            return list(self.scopes)
+
+
+_active_skill_hook_scopes: ContextVar[_DynamicSkillHookRegistry | None] = ContextVar(
     "active_skill_hook_scopes",
-    default=[],
+    default=None,
 )
 _watched_paths: dict[str, float | None] = {}
 
@@ -309,12 +339,26 @@ def _load_json_file(path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _hooks_disabled_level(cwd: str | Path) -> str | None:
+def _hooks_disabled_level(
+    cwd: str | Path,
+    scopes: list[HookScope] | None = None,
+) -> str | None:
     """Return the scope level where ``disableAllHooks`` is set, or None.
 
     Returns ``"managed"`` when set in managed-settings.json (disables everything),
     or ``"user"`` when set in user/project/local settings (managed hooks still run).
     """
+    if scopes is not None:
+        if any(scope.source == "policy_settings" and scope.disable_all_hooks for scope in scopes):
+            return "managed"
+        if any(
+            scope.source in {"user_settings", "project_settings", "local_settings"}
+            and scope.disable_all_hooks
+            for scope in scopes
+        ):
+            return "user"
+        return None
+
     managed = load_managed_settings()
     if managed.exists and managed.valid:
         if managed.data.get("disableAllHooks") is True:
@@ -331,84 +375,151 @@ def _hooks_disabled_level(cwd: str | Path) -> str | None:
     return None
 
 
-def _project_settings_paths(cwd: str | Path) -> list[Path]:
-    paths: list[Path] = []
+def _project_search_roots(cwd: str | Path) -> list[Path]:
+    roots: list[Path] = []
     current = Path(cwd).resolve()
     home = Path.home().resolve()
     while True:
+        roots.append(current)
+        if current == home or current.parent == current:
+            break
+        if (current / ".git").exists():
+            break
+        current = current.parent
+    return roots
+
+
+def resolve_hook_project_root(cwd: str | Path) -> Path:
+    """Resolve the nearest project root that owns hook runtime settings."""
+    project_paths = _project_settings_paths(cwd)
+    if project_paths:
+        return project_paths[0].parent.parent.resolve()
+    search_roots = _project_search_roots(cwd)
+    for root in search_roots:
+        if (root / ".git").exists():
+            return root
+    return Path(cwd).resolve()
+
+
+def _project_settings_paths(cwd: str | Path) -> list[Path]:
+    paths: list[Path] = []
+    for current in _project_search_roots(cwd):
         candidate = settings_path(current)
         if candidate.exists():
             paths.append(candidate)
         local = current / ".koder" / "settings.local.json"
         if local.exists():
             paths.append(local)
-        if current == home or current.parent == current:
-            break
-        if (current / ".git").exists():
-            break
-        current = current.parent
     return paths
 
 
-def load_hook_scopes(cwd: str | Path) -> list[HookScope]:
-    scopes: list[HookScope] = []
-    user_settings = harness_home_dir() / "settings.json"
-    if user_settings.exists():
-        hooks = _load_json_file(user_settings).get("hooks")
-        if isinstance(hooks, dict):
-            scopes.append(HookScope(source="user_settings", file_path=user_settings, hooks=hooks))
-    policy_settings = managed_settings_path()
-    if policy_settings.exists():
-        hooks = load_managed_settings(policy_settings).data.get("hooks")
-        if isinstance(hooks, dict):
-            scopes.append(
-                HookScope(source="policy_settings", file_path=policy_settings, hooks=hooks)
-            )
-    for path in _project_settings_paths(cwd):
-        hooks = _load_json_file(path).get("hooks")
-        if isinstance(hooks, dict):
-            source = "local_settings" if path.name == "settings.local.json" else "project_settings"
-            scopes.append(HookScope(source=source, file_path=path, hooks=hooks))
-    plugin_root = harness_home_dir() / "plugins"
-    if plugin_root.exists():
-        from koder_agent.harness.plugins.manifest import find_manifest
-        from koder_agent.harness.plugins.state import PluginStateStore
-
-        state_store = PluginStateStore(plugin_root / "state.json")
-        for plugin_dir in sorted(path for path in plugin_root.iterdir() if path.is_dir()):
-            manifest_path = find_manifest(plugin_dir)
-            if manifest_path is None:
-                continue
-            try:
-                import json as _json
-
-                manifest_data = _json.loads(manifest_path.read_text(encoding="utf-8"))
-                plugin_name = manifest_data.get("name", "")
-            except Exception:
-                logger.debug("Failed to read plugin manifest", exc_info=True)
-                continue
-            if not plugin_name or not state_store.is_enabled(plugin_name):
-                continue
-            hooks_path = plugin_dir / "hooks" / "hooks.json"
-            if not hooks_path.exists():
-                continue
-            hooks = _load_json_file(hooks_path).get("hooks")
-            if isinstance(hooks, dict):
+@contextmanager
+def load_hook_scopes(cwd: str | Path) -> Iterator[list[HookScope]]:
+    with ExitStack() as plugin_snapshots:
+        scopes: list[HookScope] = []
+        user_settings = harness_home_dir() / "settings.json"
+        if user_settings.exists():
+            settings = _load_json_file(user_settings)
+            hooks = settings.get("hooks")
+            if isinstance(hooks, dict) or settings.get("disableAllHooks") is True:
                 scopes.append(
                     HookScope(
-                        source="plugin",
-                        file_path=hooks_path,
-                        hooks=hooks,
-                        skill_root=plugin_dir,
+                        source="user_settings",
+                        file_path=user_settings,
+                        hooks=hooks if isinstance(hooks, dict) else {},
+                        settings_data=settings,
+                        disable_all_hooks=settings.get("disableAllHooks") is True,
                     )
                 )
-    scopes.extend(_active_skill_hook_scopes.get())
-    return scopes
+        policy_settings = managed_settings_path()
+        if policy_settings.exists():
+            settings = load_managed_settings(policy_settings).data
+            hooks = settings.get("hooks")
+            if isinstance(hooks, dict) or settings.get("disableAllHooks") is True:
+                scopes.append(
+                    HookScope(
+                        source="policy_settings",
+                        file_path=policy_settings,
+                        hooks=hooks if isinstance(hooks, dict) else {},
+                        settings_data=settings,
+                        disable_all_hooks=settings.get("disableAllHooks") is True,
+                    )
+                )
+        for path in _project_settings_paths(cwd):
+            settings = _load_json_file(path)
+            hooks = settings.get("hooks")
+            source = "local_settings" if path.name == "settings.local.json" else "project_settings"
+            scopes.append(
+                HookScope(
+                    source=source,
+                    file_path=path,
+                    hooks=hooks if isinstance(hooks, dict) else {},
+                    settings_data=settings,
+                    disable_all_hooks=settings.get("disableAllHooks") is True,
+                )
+            )
+        plugin_root = harness_home_dir() / "plugins"
+        if plugin_root.exists():
+            try:
+                from koder_agent.harness.plugins.lifecycle import PluginLifecycleService
+                from koder_agent.harness.plugins.path_safety import (
+                    PluginPathError,
+                    open_plugin_component,
+                    snapshot_plugin_tree,
+                )
+
+                lifecycle = PluginLifecycleService(plugin_root)
+                for manifest, state in lifecycle.installed_plugins():
+                    if not state.enabled:
+                        continue
+                    try:
+                        plugin_dir = plugin_snapshots.enter_context(
+                            snapshot_plugin_tree(lifecycle.resolve_plugin_target(manifest.name))
+                        )
+                    except PluginPathError:
+                        continue
+                    hooks_source_path = plugin_dir.joinpath(
+                        *((manifest.hooks or "hooks/hooks.json").split("/"))
+                    )
+                    try:
+                        with open_plugin_component(
+                            plugin_dir,
+                            manifest.hooks,
+                            default="hooks/hooks.json",
+                            field_name="hooks",
+                            expect="file",
+                        ) as hooks_path:
+                            if hooks_path is None:
+                                continue
+                            hooks = _load_json_file(hooks_path).get("hooks")
+                    except PluginPathError:
+                        continue
+                    if isinstance(hooks, dict):
+                        scopes.append(
+                            HookScope(
+                                source="plugin",
+                                file_path=hooks_source_path,
+                                hooks=hooks,
+                                skill_root=plugin_dir,
+                                plugin_name=manifest.name,
+                            )
+                        )
+            except (OSError, ValueError):
+                logger.debug("Plugin hook discovery skipped", exc_info=True)
+        dynamic_registry = _active_skill_hook_scopes.get()
+        if dynamic_registry is not None:
+            scopes.extend(dynamic_registry.snapshot())
+        yield scopes
 
 
 def list_configured_hooks(cwd: str | Path) -> list[HookListing]:
+    with load_hook_scopes(cwd) as scopes:
+        return _list_configured_hooks(scopes)
+
+
+def _list_configured_hooks(scopes: list[HookScope]) -> list[HookListing]:
     listings: list[HookListing] = []
-    for scope in load_hook_scopes(cwd):
+    for scope in scopes:
         for event_name, groups in scope.hooks.items():
             if not isinstance(groups, list):
                 continue
@@ -450,16 +561,18 @@ def _matches_matcher(matcher: str | None, match_value: str | None) -> bool:
 
 def _payload_target(payload: dict[str, Any]) -> str:
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-    for field in ("command", "file_path", "path", "args", "url"):
-        value = tool_input.get(field)
-        if isinstance(value, str) and value:
-            return value
+    tool_name = str(payload.get("tool_name") or "")
+    try:
+        normalized_input = normalize_tool_arguments(tool_name, tool_input)
+    except ToolArgumentError:
+        return ""
+    target = extract_canonical_tool_target(tool_name, normalized_input)
+    if target:
+        return target
     # Fallback: check all string values in tool_input so tools with non-standard
     # parameter names (e.g. "query", "pattern", "selector") can still match `if`
     # conditions rather than silently failing open.
-    for key, value in tool_input.items():
-        if key in ("command", "file_path", "path", "args", "url"):
-            continue  # Already checked above.
+    for value in normalized_input.values():
         if isinstance(value, str) and value:
             return value
     return ""
@@ -593,6 +706,7 @@ def _run_prompt_hook(
     from agents import RunConfig, Runner
 
     from koder_agent.agentic.agent import create_dev_agent
+    from koder_agent.harness.agents.service import _cleanup_agent_mcp_servers
 
     async def _run() -> str:
         hook_prompt = (
@@ -602,8 +716,11 @@ def _run_prompt_hook(
             f"Hook input JSON:\n{payload_text}"
         )
         agent = await create_dev_agent([], name="HookPrompt", model_override=model)
-        result = await Runner.run(agent, hook_prompt, run_config=RunConfig(), max_turns=5)
-        return str(result.final_output or "")
+        try:
+            result = await Runner.run(agent, hook_prompt, run_config=RunConfig(), max_turns=5)
+            return str(result.final_output or "")
+        finally:
+            await _cleanup_agent_mcp_servers(agent)
 
     return _run_coroutine_sync(_run())
 
@@ -617,7 +734,9 @@ def _run_agent_hook(
     from agents import RunConfig, Runner
 
     from koder_agent.agentic.agent import create_dev_agent
+    from koder_agent.harness.agents.service import _cleanup_agent_mcp_servers
     from koder_agent.tools import get_all_tools
+    from koder_agent.tools.skill_context import skill_run_scope
 
     async def _run() -> str:
         hook_prompt = (
@@ -626,9 +745,24 @@ def _run_agent_hook(
             f"Hook prompt:\n{prompt_text}\n\n"
             f"Hook input JSON:\n{payload_text}"
         )
-        agent = await create_dev_agent(get_all_tools(), name="HookAgent", model_override=model)
-        result = await Runner.run(agent, hook_prompt, run_config=RunConfig(), max_turns=10)
-        return str(result.final_output or "")
+        tools = [
+            tool
+            for tool in get_all_tools()
+            if tool.name not in {"task_delegate", "todo_read", "todo_write"}
+        ]
+        agent = await create_dev_agent(tools, name="HookAgent", model_override=model)
+        try:
+            with skill_run_scope() as run_hooks:
+                result = await Runner.run(
+                    agent,
+                    hook_prompt,
+                    run_config=RunConfig(),
+                    hooks=run_hooks,
+                    max_turns=10,
+                )
+            return str(result.final_output or "")
+        finally:
+            await _cleanup_agent_mcp_servers(agent)
 
     return _run_coroutine_sync(_run())
 
@@ -640,14 +774,15 @@ def _run_coroutine_sync(coro):
         return asyncio.run(coro)
 
     holder: dict[str, Any] = {}
+    context = copy_context()
 
     def _target():
         try:
             holder["result"] = asyncio.run(coro)
-        except Exception as exc:  # pragma: no cover - defensive
+        except BaseException as exc:  # pragma: no cover - defensive
             holder["error"] = exc
 
-    thread = threading.Thread(target=_target)
+    thread = threading.Thread(target=lambda: context.run(_target))
     thread.start()
     thread.join()
     if "error" in holder:
@@ -821,6 +956,7 @@ def _run_async_command(
     env: dict[str, str],
     shell: str = "",
     timeout: int | float | None = None,
+    on_complete: Callable[[], None] | None = None,
 ) -> None:
     if shell:
         cmd: str | list[str] = [shell, "-c", command]
@@ -847,9 +983,17 @@ def _run_async_command(
             )
         except subprocess.TimeoutExpired:
             logger.debug("Async hook timed out after %s seconds: %s", effective_timeout, command)
+        finally:
+            if on_complete is not None:
+                on_complete()
 
     thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        if on_complete is not None:
+            on_complete()
+        raise
 
 
 def dispatch_command_hooks(
@@ -882,27 +1026,70 @@ def _dispatch_command_hooks_inner(
     payload: dict[str, Any],
     match_value: str | None = None,
 ) -> HookDispatchResult:
-    # Respect disableAllHooks setting.
-    # "managed" level disables everything; "user" level still allows managed hooks.
-    disabled_level = _hooks_disabled_level(cwd)
-    if disabled_level == "managed":
-        return HookDispatchResult(matched_hooks=0)
+    with load_hook_scopes(cwd) as scopes:
+        # Parse settings once so trust validation and execution share one immutable
+        # dispatch snapshot even if a settings file changes concurrently. The same
+        # scope also keeps plugin snapshots alive through synchronous execution.
+        disabled_level = _hooks_disabled_level(cwd, scopes=scopes)
+        if disabled_level == "managed":
+            return HookDispatchResult(matched_hooks=0)
+        return _dispatch_loaded_hook_scopes(
+            cwd=cwd,
+            event_name=event_name,
+            payload=payload,
+            match_value=match_value,
+            disabled_level=disabled_level,
+            scopes=scopes,
+        )
 
-    scopes = load_hook_scopes(cwd)
+
+def _dispatch_loaded_hook_scopes(
+    *,
+    cwd: str | Path,
+    event_name: str,
+    payload: dict[str, Any],
+    match_value: str | None,
+    disabled_level: str | None,
+    scopes: list[HookScope],
+) -> HookDispatchResult:
     if disabled_level == "user":
         scopes = [s for s in scopes if s.source == "policy_settings"]
     payload_text = json.dumps(payload)
     result = HookDispatchResult(matched_hooks=0)
     seen_hooks: set[str] = set()
+    project_settings_by_root: dict[Path, dict[str, dict[str, Any]]] = {}
+    for project_scope in scopes:
+        if project_scope.source not in ("project_settings", "local_settings"):
+            continue
+        project_root = project_scope.file_path.parent.parent.resolve()
+        project_settings_by_root.setdefault(project_root, {})[project_scope.source] = (
+            project_scope.settings_data or {}
+        )
+    project_approval_errors: dict[Path, str | None] = {}
     for scope in scopes:
         # C1: Project-level hook trust gate — skip untrusted project hooks.
         if scope.source in ("project_settings", "local_settings"):
-            from .project_approval import is_project_hooks_allowed
+            from .project_approval import (
+                is_project_hooks_allowed,
+                project_hooks_approval_error,
+            )
 
             # Project root is the parent of the .koder/ directory containing settings.
-            project_root = scope.file_path.parent.parent
-            if not is_project_hooks_allowed(project_root):
-                logger.debug("Skipping untrusted project hooks from %s", project_root)
+            project_root = scope.file_path.parent.parent.resolve()
+            if project_root not in project_approval_errors:
+                settings_snapshot = project_settings_by_root[project_root]
+                project_approval_errors[project_root] = (
+                    None
+                    if is_project_hooks_allowed(project_root, settings_snapshot)
+                    else project_hooks_approval_error(project_root, settings_snapshot)
+                )
+            approval_error = project_approval_errors[project_root]
+            if approval_error is not None:
+                logger.warning(
+                    "Skipping project hooks from %s: %s.",
+                    project_root,
+                    approval_error,
+                )
                 continue
 
         groups = scope.hooks.get(event_name)
@@ -939,22 +1126,17 @@ def _dispatch_command_hooks_inner(
                 env["KODER_PROJECT_DIR"] = str(Path(cwd).resolve())
                 if scope.skill_root is not None:
                     env["KODER_SKILL_DIR"] = str(scope.skill_root)
-                # Inject plugin env vars for plugin-sourced hooks
-                if scope.source == "plugin" and scope.skill_root is not None:
+                if (
+                    scope.source == "plugin"
+                    and scope.skill_root is not None
+                    and scope.plugin_name is not None
+                ):
                     from koder_agent.harness.plugins.env import plugin_env_vars
-                    from koder_agent.harness.plugins.manifest import find_manifest
 
-                    _mp = find_manifest(scope.skill_root)
-                    if _mp is not None:
-                        try:
-                            import json as _json2
-
-                            _md = _json2.loads(_mp.read_text(encoding="utf-8"))
-                            _pname = _md.get("name", "")
-                            if _pname:
-                                env.update(plugin_env_vars(_pname, scope.skill_root))
-                        except Exception:
-                            logger.debug("Failed to load plugin env vars", exc_info=True)
+                    try:
+                        env.update(plugin_env_vars(scope.plugin_name, scope.skill_root))
+                    except Exception:
+                        logger.debug("Failed to load plugin env vars", exc_info=True)
                 if isinstance(payload.get("session_id"), str):
                     env["KODER_SESSION_ID"] = str(payload["session_id"])
                     if event_name in _ENV_FILE_EVENTS:
@@ -977,14 +1159,35 @@ def _dispatch_command_hooks_inner(
                     if not isinstance(command, str) or not command.strip():
                         continue
                     if hook.get("async") is True:
+                        async_cwd = scope.skill_root or Path(cwd).resolve()
+                        async_env = env
+                        async_cleanup: Callable[[], None] | None = None
+                        if scope.source == "plugin" and scope.skill_root is not None:
+                            from koder_agent.harness.plugins.env import plugin_env_vars
+                            from koder_agent.harness.plugins.path_safety import snapshot_plugin_tree
+
+                            snapshot_context = snapshot_plugin_tree(scope.skill_root)
+                            async_cwd = snapshot_context.__enter__()
+                            async_env = dict(env)
+                            async_env["KODER_SKILL_DIR"] = str(async_cwd)
+                            if scope.plugin_name:
+                                async_env.update(plugin_env_vars(scope.plugin_name, async_cwd))
+
+                            def close_async_snapshot(
+                                context=snapshot_context,
+                            ) -> None:
+                                context.__exit__(None, None, None)
+
+                            async_cleanup = close_async_snapshot
                         result = HookDispatchResult(matched_hooks=result.matched_hooks + 1)
                         _run_async_command(
                             command=command,
                             payload_text=payload_text,
-                            cwd=scope.skill_root or Path(cwd).resolve(),
-                            env=env,
+                            cwd=async_cwd,
+                            env=async_env,
                             shell=hook_shell,
                             timeout=hook_timeout,
+                            on_complete=async_cleanup,
                         )
                         continue
                     result = HookDispatchResult(matched_hooks=result.matched_hooks + 1)
@@ -1034,23 +1237,14 @@ def _dispatch_command_hooks_inner(
                 parsed = _parse_hook_output(stdout)
                 result = _merge_dispatch_result(result, parsed)
                 block_reason = _extract_block(stdout)
-                if code == 2:
+                if code == 2 or block_reason:
+                    if code == 2:
+                        block_reason = stderr or block_reason or "Blocked by hook"
                     return HookDispatchResult(
                         matched_hooks=result.matched_hooks,
                         blocked=True,
                         # Cap the reason injected into model context so a runaway
                         # hook cannot flood the conversation.
-                        block_reason=_cap_output(stderr or block_reason or "Blocked by hook"),
-                        permission_request_result=result.permission_request_result,
-                        watch_paths=result.watch_paths,
-                        worktree_path=result.worktree_path,
-                        elicitation_action=result.elicitation_action,
-                        elicitation_content=result.elicitation_content,
-                    )
-                if block_reason:
-                    return HookDispatchResult(
-                        matched_hooks=result.matched_hooks,
-                        blocked=True,
                         block_reason=_cap_output(block_reason),
                         permission_request_result=result.permission_request_result,
                         watch_paths=result.watch_paths,
@@ -1093,8 +1287,40 @@ async def dispatch_command_hooks_async(
 def active_skill_hooks(
     skill_name: str, hooks: dict[str, Any] | None, skill_root: Path | None
 ) -> Iterator[None]:
-    if not hooks:
+    token = None
+    if _active_skill_hook_scopes.get() is None:
+        token = begin_skill_hook_scope()
+    register_skill_hooks(skill_name, hooks, skill_root)
+    try:
         yield
+    finally:
+        if token is not None:
+            reset_skill_hook_scope(token)
+
+
+def begin_skill_hook_scope() -> Token:
+    """Seed a mutable hook registry shared by SDK child tasks."""
+    current = _active_skill_hook_scopes.get()
+    registry = _DynamicSkillHookRegistry()
+    if current is not None:
+        for scope in current.snapshot():
+            registry.add(scope.source, scope)
+    return _active_skill_hook_scopes.set(registry)
+
+
+def reset_skill_hook_scope(token: Token) -> None:
+    """Restore the dynamic skill-hook registry captured before a turn."""
+    try:
+        _active_skill_hook_scopes.reset(token)
+    except (ValueError, LookupError):
+        _active_skill_hook_scopes.set(None)
+
+
+def register_skill_hooks(
+    skill_name: str, hooks: dict[str, Any] | None, skill_root: Path | None
+) -> None:
+    """Install a skill's hooks for the remainder of the logical turn."""
+    if not hooks:
         return
     scope = HookScope(
         source="skills",
@@ -1102,9 +1328,8 @@ def active_skill_hooks(
         hooks=hooks,
         skill_root=skill_root,
     )
-    current = list(_active_skill_hook_scopes.get())
-    token = _active_skill_hook_scopes.set([*current, scope])
-    try:
-        yield
-    finally:
-        _active_skill_hook_scopes.reset(token)
+    registry = _active_skill_hook_scopes.get()
+    if registry is None:
+        registry = _DynamicSkillHookRegistry()
+        _active_skill_hook_scopes.set(registry)
+    registry.add(skill_name, scope)

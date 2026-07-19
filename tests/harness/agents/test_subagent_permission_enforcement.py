@@ -23,10 +23,18 @@ if "litellm" not in sys.modules:
     sys.modules["litellm"] = litellm_stub
 
 import asyncio
+import json
 
 from koder_agent.harness.agents import service as service_mod
 from koder_agent.harness.agents.definitions import AgentDefinition
 from koder_agent.tools.permission_context import get_tool_permission_context
+from koder_agent.tools.todo import (
+    TodoRuntimeIdentity,
+    TodoStore,
+    get_todo_store,
+    reset_todo_state_for_tests,
+    todo_write,
+)
 
 
 def _agent_def() -> AgentDefinition:
@@ -36,6 +44,10 @@ def _agent_def() -> AgentDefinition:
         system_prompt="You are a worker.",
         source="built-in",
     )
+
+
+def _todo_store(session_id: str) -> TodoStore:
+    return TodoStore(TodoRuntimeIdentity(session_id, "worker", f"test:{session_id}"))
 
 
 def test_execute_agent_run_publishes_permission_context(monkeypatch):
@@ -82,6 +94,7 @@ def test_execute_agent_run_publishes_permission_context(monkeypatch):
             seed_items=None,
             cwd=None,
             permission_service=sentinel_service,
+            todo_store=_todo_store("s1"),
         )
     )
 
@@ -128,11 +141,90 @@ def test_execute_agent_run_context_resets_after_run(monkeypatch):
             seed_items=None,
             cwd=None,
             permission_service=sentinel_service,
+            todo_store=_todo_store("s1"),
         )
         # After the subagent run, the caller's context must be unchanged (None here).
         return get_tool_permission_context()
 
     assert asyncio.run(scenario()) is None
+
+
+def test_parallel_subagents_receive_isolated_todo_runtime_scopes(monkeypatch):
+    observed = {}
+
+    async def fake_create_dev_agent(*args, **kwargs):
+        return object()
+
+    class _Result:
+        final_output = "done"
+
+    async def fake_run(*args, **kwargs):
+        session_id = kwargs["session"].session_id
+        store = get_todo_store()
+        await todo_write.on_invoke_tool(
+            None,
+            json.dumps(
+                {
+                    "todos": [
+                        {
+                            "content": f"todo-{session_id}",
+                            "status": "in_progress",
+                            "priority": "high",
+                            "id": session_id,
+                        }
+                    ]
+                }
+            ),
+        )
+        await asyncio.sleep(0)
+        observed[session_id] = (store.identity, store.todos)
+        return _Result()
+
+    monkeypatch.setattr(service_mod, "create_dev_agent", fake_create_dev_agent)
+    monkeypatch.setattr(service_mod, "get_all_tools", lambda: [])
+    monkeypatch.setattr(service_mod.Runner, "run", staticmethod(fake_run))
+
+    class _FakeSession:
+        def __init__(self, session_id, *args, **kwargs):
+            self.session_id = session_id
+
+        async def get_items(self):
+            return []
+
+        async def add_items(self, items):
+            return None
+
+    monkeypatch.setattr(service_mod, "EnhancedSQLiteSession", _FakeSession)
+    reset_todo_state_for_tests()
+
+    async def scenario():
+        await asyncio.gather(
+            service_mod._execute_agent_run(
+                agent_definition=_agent_def(),
+                prompt="first",
+                session_id="subagent-a",
+                seed_items=None,
+                cwd=None,
+                todo_store=_todo_store("subagent-a"),
+            ),
+            service_mod._execute_agent_run(
+                agent_definition=_agent_def(),
+                prompt="second",
+                session_id="subagent-b",
+                seed_items=None,
+                cwd=None,
+                todo_store=_todo_store("subagent-b"),
+            ),
+        )
+
+    asyncio.run(scenario())
+
+    identity_a, todos_a = observed["subagent-a"]
+    identity_b, todos_b = observed["subagent-b"]
+    assert identity_a.session_id == "subagent-a"
+    assert identity_b.session_id == "subagent-b"
+    assert todos_a[0]["content"] == "todo-subagent-a"
+    assert todos_b[0]["content"] == "todo-subagent-b"
 
 
 def test_interactive_handler_wires_permission_service_into_agent_service():
@@ -234,6 +326,7 @@ def test_subagent_uses_deny_approver_not_fail_open_none(monkeypatch):
             seed_items=None,
             cwd=None,
             permission_service=object(),
+            todo_store=_todo_store("s"),
         )
     )
     approver = captured["approver"]
@@ -295,6 +388,7 @@ def test_subagent_falls_back_to_inherited_service_when_none_passed(monkeypatch):
                 seed_items=None,
                 cwd=None,
                 permission_service=None,  # none passed explicitly
+                todo_store=_todo_store("s"),
             )
         finally:
             reset_tool_permission_context(tok)
